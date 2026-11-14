@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v89'
+local BUILD = 'forge-tools-v91'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -2342,10 +2342,17 @@ end
 -- Auto equip: put on any forged item that beats what's in its slot (empty slot, more ores, or
 -- same ores with higher quality).
 -- Rank items by what they actually do: the game's own damage (weapons) / health (armor) maths,
--- including ore multiplier, quality and enhancement.
+-- including ore multiplier and quality, but NOT enhancement: items are compared as if both were
+-- +0, so a better freshly forged piece is not hidden behind an old one's upgrade levels (the
+-- new one can be enhanced too).
 local function itemScore(e)
 	if type(e) ~= 'table' then
 		return 0
+	end
+	if (tonumber(e.Upgrade) or 0) ~= 0 then
+		local c = table.clone(e)
+		c.Upgrade = 0
+		e = c
 	end
 	local v = 0
 	pcall(function()
@@ -5039,7 +5046,12 @@ end)
 bindToggle(MobBox, 'FTAutoMobs', 'autoMobs', 'Auto kill mobs', 'Tweens to the nearest mob and fights it with your Weapon.')
 local mobDD = bindDropdown(MobBox, 'FTMobFilter', 'mobFilter', 'Target', mobNames())
 bindSlider(MobBox, 'FTRetreatHp', 'retreatHp', 'Retreat to spawn below % health', 0, 90, 'Goes back to spawn and waits until health is 90% before fighting again.')
-bindSlider(MobBox, 'FTMaxMobHp', 'maxMobHp', 'Only fight mobs with max HP up to', 0, 2000, '0 = any mob. Keep this low until your gear is better.')
+-- The slider used to stop at 2000, which silently hid every bigger mob (island 3: Elite Orc,
+-- Crystal Golem, Yeti, Demonic / Prismarine Spider...). Left at that old maximum = no limit.
+if tonumber(settings.maxMobHp) == 2000 then
+	settings.maxMobHp = 0
+end
+bindSlider(MobBox, 'FTMaxMobHp', 'maxMobHp', 'Only fight mobs with max HP up to', 0, 20000, '0 = any mob. Mobs above this are ignored completely (not fought, not in quests).')
 -- (a safety setting, not a feature toggle: it keeps its saved value across loads, default on)
 settings.fleeDeadly = settings.fleeDeadly ~= false
 MobBox:AddToggle('FTFleeDeadly', { Text = 'Avoid mobs that killed me', Default = settings.fleeDeadly, Tooltip = 'Any mob type that kills you, or takes about half your health in one hit, goes on a list. The script then never fights that type, skips rocks near it and moves away when one comes close. Turn off (or use the button below) once your gear is better.' }):OnChanged(function(v)
@@ -5248,7 +5260,7 @@ bindToggle(QuestBox, 'FTAutoCodes', 'autoCodes', 'Auto redeem codes', 'Tries eac
 bindToggle(ForgeBox, 'FTAutoEnhance', 'autoEnhance', 'Auto enhance equipped gear', 'Spends essences and gold to enhance the weapon and armor you are wearing, one level at a time. Only tries when the success chance is at least the number below: a failed enhance drops the item a level and can cost a rune slot. Never uses medallions.')
 bindSlider(ForgeBox, 'FTEnhanceMinChance', 'enhanceMinChance', 'Only enhance at this chance or better (%)', 50, 100, 'At 100 an enhance can never fail.')
 bindSlider(ForgeBox, 'FTEnhanceMaxLevel', 'enhanceMaxLevel', 'Stop enhancing at +', 1, 9, 'Items already at this level are left alone.')
-bindToggle(ForgeBox, 'FTAutoEquip', 'autoEquip', 'Auto equip better gear', 'After forging, equips the item if its slot is empty or it beats what you have on (more ores, then quality).')
+bindToggle(ForgeBox, 'FTAutoEquip', 'autoEquip', 'Auto equip better gear', 'After forging, equips the item if its slot is empty or its base stats beat what you have on. Enhancement levels are ignored, so a better new piece replaces an upgraded old one.')
 MobBox:AddButton('Refresh lists', function()
 	pcall(function()
 		mobDD:SetValues(mobNames())
