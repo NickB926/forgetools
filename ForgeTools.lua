@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v122'
+local BUILD = 'forge-tools-v130'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -101,6 +101,8 @@ local defaults = {
 	forgePiece = 'Any',
 	fleeDeadly = true,
 	forgeOres = 3,
+	forgeTraits = false,
+	forgeTraitOres = {},
 	forgeKeep = 0,
 	switchMins = 3,
 	autoAcceptQuests = false,
@@ -1392,6 +1394,23 @@ local function oreCounts()
 	return out, total
 end
 
+-- What the forge may use: everything oreCounts allows, narrowed to "Ores to use" when any are picked.
+local function forgeCounts()
+	local all, total = oreCounts()
+	local only = type(settings.forgeOnlyOres) == 'table' and next(settings.forgeOnlyOres) and settings.forgeOnlyOres or nil
+	if not only then
+		return all, total
+	end
+	local out, n = {}, 0
+	for k, v in pairs(all) do
+		if only[k] then
+			out[k] = v
+			n += v
+		end
+	end
+	return out, n
+end
+
 local function bagCapacity()
 	-- The game's own numbers for the ore / material bag ("Stash"). (The "Capacity (3/39)" label
 	-- on the hotbar is the EQUIPMENT bag - reading that one made auto sell never trigger.)
@@ -2251,6 +2270,7 @@ local function forgeNeeded()
 	if not settings.autoForge then
 		return false
 	end
+	_, total = forgeCounts() -- (only the ores picked under "Ores to use" count from here on)
 	if os.clock() < (G.FTForgeFailUntil or 0) then
 		return false -- the forge refused twice in a row: mine for a while instead of standing at it
 	end
@@ -2279,7 +2299,7 @@ local function forgeNeeded()
 		return n ~= nil and total >= n
 	end
 	local need = math.max(3, tonumber(settings.forgeOres) or 3)
-	if settings.forgeBest and need <= 3 then
+	if (settings.forgeBest or settings.forgeTraits) and need <= 3 then
 		need = 20 -- wait for enough ores to make something bigger than a dagger
 	end
 	return total >= need
@@ -2409,7 +2429,7 @@ do
 	-- every set of up to 4 of your best ore types and every ore count, and keep the best score.
 	function Best.pick(itemType, maxOres, exactN)
 		local types = {}
-		for name, n in pairs((oreCounts())) do
+		for name, n in pairs((forgeCounts())) do
 			local m, neu = oreMult(name)
 			if not neu and n > 0 then
 				types[#types + 1] = { name = name, m = m, n = n }
@@ -2482,6 +2502,122 @@ do
 		end
 		return best.pick, best.n, best.score
 	end
+
+	-- Traits. Measured with the game's own maths (Runes:GetRunesFromItem on a made-up item): an
+	-- ore's traits switch on at 10% of the mix and climb in a straight line to full strength at
+	-- 30%; more than 30% adds nothing. So the strongest item is three trait ores at 30%+ each
+	-- (three full sets of traits), with whatever is left over as filler.
+	local traitCache
+	function Best.traitOres(itemType)
+		if not traitCache then
+			traitCache = {}
+			pcall(function()
+				for _, o in pairs(require(RS.Shared.Data.Ore)) do
+					if type(o) == 'table' and o.Name and type(o.Traits) == 'table' then
+						for _, t in ipairs(o.Traits) do
+							for _, w in ipairs(type(t) == 'table' and type(t.Whitelist) == 'table' and t.Whitelist or {}) do
+								traitCache[w] = traitCache[w] or {}
+								traitCache[w][o.Name] = true
+							end
+						end
+					end
+				end
+			end)
+		end
+		return traitCache[itemType] or {}
+	end
+	-- Returns pick {ore = n}, count, how many ores are at full trait strength.
+	function Best.traitPick(itemType, maxOres, exactN)
+		local has = Best.traitOres(itemType)
+		local counts = forgeCounts()
+		local cands, others = {}, {}
+		for name, n in pairs(counts) do
+			local m, neu = oreMult(name)
+			if has[name] then
+				cands[#cands + 1] = { name = name, m = m, n = n }
+			elseif not neu then
+				others[#others + 1] = { name = name, m = m, n = n }
+			end
+		end
+		table.sort(cands, function(a, b)
+			return a.m > b.m
+		end)
+		table.sort(others, function(a, b)
+			return a.m > b.m
+		end)
+		while #cands > 10 do
+			table.remove(cands)
+		end
+		local best = { k = 0, score = -1 }
+		local function try(set, n)
+			local need = math.ceil(n * 0.3 - 1e-6)
+			local pick, used, sum = {}, 0, 0
+			for _, t in ipairs(set) do
+				if t.n < need then
+					return
+				end
+				pick[t.name] = need
+				used += need
+				sum += need * t.m
+			end
+			if used > n then
+				return
+			end
+			-- what is left over: more of the same ores first (no new type), then one filler type
+			local left = n - used
+			for _, t in ipairs(set) do
+				local add = math.min(left, t.n - pick[t.name])
+				if add > 0 then
+					pick[t.name] += add
+					left -= add
+					sum += add * t.m
+				end
+			end
+			if left > 0 then
+				for _, t in ipairs(#set < 4 and cands or {}) do
+					if not pick[t.name] and t.n >= left then
+						pick[t.name] = left
+						sum += left * t.m
+						left = 0
+						break
+					end
+				end
+			end
+			if left > 0 then
+				for _, t in ipairs(#set < 4 and others or {}) do
+					if t.n >= left then
+						pick[t.name] = left
+						sum += left * t.m
+						left = 0
+						break
+					end
+				end
+			end
+			if left > 0 then
+				return
+			end
+			local score = (sum / n) * (exactN and 1 or expectedBase(itemType, n))
+			if #set > best.k or (#set == best.k and score > best.score) then
+				best = { k = #set, score = score, pick = pick, n = n }
+			end
+		end
+		local lo, hi = exactN or 3, exactN or math.max(3, maxOres)
+		for n = lo, hi do
+			for i = 1, #cands do
+				try({ cands[i] }, n)
+				for j = i + 1, #cands do
+					try({ cands[i], cands[j] }, n)
+					for l = j + 1, #cands do
+						try({ cands[i], cands[j], cands[l] }, n)
+					end
+				end
+			end
+		end
+		if not best.pick then
+			return {}, 0, 0
+		end
+		return best.pick, best.n, best.k
+	end
 end
 
 local function pickForgeOres(itemType)
@@ -2498,7 +2634,7 @@ local function pickForgeOres(itemType)
 				mult[o.Name] = tonumber(o.Multiplier) or 0
 			end
 		end
-		for name, n in pairs((oreCounts())) do
+		for name, n in pairs((forgeCounts())) do
 			for _ = 1, n do
 				units[#units + 1] = { name = name, m = mult[name] or 0 }
 			end
@@ -2515,7 +2651,7 @@ local function pickForgeOres(itemType)
 	end
 	local function plentiful(want)
 		local list = {}
-		for name, n in pairs((oreCounts())) do
+		for name, n in pairs((forgeCounts())) do
 			list[#list + 1] = { name = name, n = n }
 		end
 		table.sort(list, function(a, b)
@@ -2541,7 +2677,12 @@ local function pickForgeOres(itemType)
 			return {}, 0
 		end
 		local pick, got
-		if settings.forgeBest then
+		if settings.forgeTraits then
+			pick, got = Best.traitPick(itemType or settings.forgeType, n, n)
+		end
+		if got == n then
+			-- (traits first: three ores at 30% each)
+		elseif settings.forgeBest then
 			pick, got = Best.pick(itemType or settings.forgeType, n, n)
 			if got ~= n then
 				pick, got = plentiful(n)
@@ -2557,6 +2698,14 @@ local function pickForgeOres(itemType)
 		end
 		return pick, got
 	end
+	if settings.forgeTraits then
+		local cap = tonumber(settings.forgeOres) or 3
+		cap = cap > 3 and cap or 60
+		local pick, got = Best.traitPick(itemType or settings.forgeType, cap)
+		if got >= 3 then
+			return pick, got
+		end
+	end
 	if settings.forgeBest then
 		-- Slider left at the old default (3) would cap "best" at a dagger: treat <=3 as "no cap" (60).
 		local cap = tonumber(settings.forgeOres) or 3
@@ -2567,7 +2716,7 @@ local function pickForgeOres(itemType)
 		end
 	end
 	local want = math.max(3, tonumber(settings.forgeOres) or 3)
-	local ores = oreCounts()
+	local ores = forgeCounts()
 	local list = {}
 	for name, n in pairs(ores) do
 		list[#list + 1] = { name = name, n = n }
@@ -5874,64 +6023,192 @@ bindToggle(FarmBox, 'FTAutoSellGear', 'autoSellGear', 'Auto sell spare gear', 'S
 FarmBox:AddButton('Sell ores now', function()
 	sellOres()
 end)
+-- The ore craft menu, from anywhere (the game has an "Anywhere" station of its own: opening
+-- with no station uses it). The game's code must run at its own thread identity - at ours it
+-- stops half way ("Cannot require a non-RobloxScript module") with the player left frozen.
+FarmBox:AddButton('Open / close craft menu', function()
+	task.spawn(function()
+		pcall(function()
+			local setid = setthreadidentity or setidentity
+			if setid then
+				setid(2)
+			end
+			local UI = controller('UIController')
+			local gui = LocalPlayer.PlayerGui:FindFirstChild('Craft')
+			if gui and gui.Enabled then
+				UI:Close('OreCraft')
+				pcall(function()
+					controller('OreCraftController'):EndCrafting()
+				end)
+				return
+			end
+			UI:Open('OreCraft')
+			-- (the game roots you to the spot while this is open: fine at a station, not in a raid)
+			task.wait(0.5)
+			local _, _, hum = char()
+			local st = hum and hum.Parent:FindFirstChild('Status')
+			local tag = st and st:FindFirstChild('NoMovement')
+			if tag then
+				tag:Destroy()
+			end
+		end)
+	end)
+end)
 -- The bag: the game's own opener does nothing in a raid (the window stays parked below the
 -- screen), so if it has not come up we put it there ourselves.
-FarmBox:AddButton('Open / close bag', function()
-	pcall(function()
-		local gui = LocalPlayer.PlayerGui:FindFirstChild('Menu')
-		local inner = gui and gui:FindFirstChild('Frame') and gui.Frame:FindFirstChild('Frame')
-		if not inner then
-			return
-		end
-		local UI = controller('UIController')
-		local M = UI and UI.Modules and UI.Modules.Menu
-		local function shown()
-			return inner.Visible and inner.Position.Y.Scale < 1
-		end
-		if shown() then
-			pcall(function()
-				UI:Close('Menu')
-			end)
-			task.wait(0.6)
-			if shown() then
-				inner.Position = UDim2.new(0.5, 0, 1.5, 0)
-				inner.Visible = false
-			end
-			return
-		end
+local function menuTab(tab)
+	task.spawn(function()
 		pcall(function()
-			M:Open()
-		end)
-		task.wait(0.7)
-		if not shown() then
-			gui.Enabled = true
-			inner.Visible = true
-			inner.Position = UDim2.new(0.5, 0, 0.5, 0)
+			-- (the game's own code has to run at its thread identity, or its requires fail)
+			local setid = setthreadidentity or setidentity
+			if setid then
+				setid(2)
+			end
+			local gui = LocalPlayer.PlayerGui:FindFirstChild('Menu')
+			local inner = gui and gui:FindFirstChild('Frame') and gui.Frame:FindFirstChild('Frame')
+			local UI = controller('UIController')
+			local M = UI and UI.Modules and UI.Modules.Menu
+			if not inner or not M then
+				return
+			end
+			local menus
 			for _, c in ipairs(inner:GetDescendants()) do
 				if c.Name == 'Menus' then
-					for _, t in ipairs(c:GetChildren()) do
-						if t:IsA('GuiObject') then
-							t.Visible = t.Name == 'Stash'
-						end
-					end
+					menus = c
 					break
 				end
 			end
+			local function shown()
+				return inner.Visible and inner.Position.Y.Scale < 1
+			end
+			local page = menus and menus:FindFirstChild(tab)
+			if shown() and page and page.Visible then
+				-- already showing this tab: the button closes it
+				pcall(function()
+					UI:Close('Menu')
+				end)
+				task.wait(0.6)
+				if shown() then
+					inner.Position = UDim2.new(0.5, 0, 1.5, 0)
+					inner.Visible = false
+					M.IsOpen = false
+				end
+				return
+			end
+			if not shown() then
+				pcall(function()
+					M:Open()
+				end)
+				task.wait(0.7)
+				if not shown() then
+					gui.Enabled = true
+					inner.Visible = true
+					inner.Position = UDim2.new(0.5, 0, 0.5, 0)
+					M.IsOpen = true
+				end
+			end
+			-- OpenTab switches pages the game's way (so its own tab buttons keep working after);
+			-- if it was already on this tab it does nothing, so its contents are rebuilt by hand.
+			local before = page and page.Visible
 			pcall(function()
-				M:Update()
+				M:OpenTab(tab)
 			end)
-		end
+			task.wait(0.2)
+			if before or (page and not page.Visible) then
+				pcall(function()
+					M:OpenModule(tab, true)
+				end)
+			end
+		end)
 	end)
+end
+FarmBox:AddButton('Open / close bag', function()
+	menuTab('Stash')
+end)
+FarmBox:AddButton('Open / close equipment', function()
+	menuTab('Tools')
 end)
 
 bindToggle(ForgeBox, 'FTAutoForge', 'autoForge', 'Auto forge', 'When you have enough ores: tweens to the forge, puts them in and plays every minigame perfectly.')
 bindToggle(ForgeBox, 'FTForgeWhenFull', 'forgeWhenFull', 'Only forge when the stash is full', 'With Auto forge on: keeps mining until the stash is full, then forges until the stash is used up before mining again.')
-bindDropdown(ForgeBox, 'FTForgeType', 'forgeType', 'Forge', { 'Weapon', 'Armor' })
-bindToggle(ForgeBox, 'FTForgeAlternate', 'forgeAlternate', 'Alternate weapon / armor', 'Starts with the type picked above, then switches after every item it makes.')
+-- The Forge box, kept short: what to make, how to pick the ores, which ores, how many.
+do
+	local MODES = { 'Traits (30% each)', 'Best stats', 'Most plentiful' }
+	if type(settings.forgeWhat) ~= 'string' then
+		settings.forgeWhat = settings.forgeType == 'Armor' and 'Armor' or 'Weapon'
+	end
+	if type(settings.forgeMode) ~= 'string' or not table.find(MODES, settings.forgeMode) then
+		settings.forgeMode = MODES[1]
+	end
+	local function applyForge()
+		settings.forgeAlternate = settings.forgeWhat == 'Alternate'
+		if settings.forgeWhat ~= 'Alternate' then
+			settings.forgeType = settings.forgeWhat
+		elseif settings.forgeType ~= 'Armor' then
+			settings.forgeType = 'Weapon'
+		end
+		settings.forgeTraits = settings.forgeMode == MODES[1]
+		settings.forgeBest = settings.forgeMode ~= MODES[3]
+	end
+	applyForge()
+	ForgeBox:AddDropdown('FTForgeWhat', { Text = 'Make', Values = { 'Weapon', 'Armor', 'Alternate' }, Default = settings.forgeWhat, AllowNull = false,
+		Tooltip = 'Alternate = a weapon, then an armor piece, and so on.' }):OnChanged(function(v)
+		if type(v) == 'string' then
+			settings.forgeWhat = v
+			applyForge()
+			save()
+		end
+	end)
+	ForgeBox:AddDropdown('FTForgeMode', { Text = 'Ore pick', Values = MODES, Default = settings.forgeMode, AllowNull = false,
+		Tooltip = 'Traits: up to three trait ores at 30% or more each, so the item gets all their traits at full strength (an ore gives traits from 10% of the mix, full at 30%). Best stats: your strongest ores and the ore count with the best expected item. Most plentiful: uses up whatever you have most of.' }):OnChanged(function(v)
+		if type(v) == 'string' then
+			settings.forgeMode = v
+			applyForge()
+			save()
+		end
+	end)
+	if type(settings.forgeOnlyOres) ~= 'table' then
+		settings.forgeOnlyOres = type(settings.forgeTraitOres) == 'table' and settings.forgeTraitOres or {}
+	end
+	local function oreChoices()
+		-- what you hold now (trait ores marked), plus anything already picked
+		local names, seen = {}, {}
+		local d = data()
+		for k, v in pairs(d and type(d.Inventory) == 'table' and d.Inventory or {}) do
+			if ORE_NAMES[k] and type(v) == 'number' and v > 0 then
+				seen[k] = true
+				names[#names + 1] = k
+			end
+		end
+		for k in pairs(settings.forgeOnlyOres) do
+			if not seen[k] then
+				names[#names + 1] = k
+			end
+		end
+		table.sort(names)
+		return names
+	end
+	local onlyDD = ForgeBox:AddDropdown('FTForgeOnly', { Text = 'Ores to use', Values = oreChoices(), Multi = true, Default = settings.forgeOnlyOres, AllowNull = true,
+		Tooltip = 'Pick ores and the forge uses only those. Nothing picked = any ore you have. The list is the ores in your stash; press "Refresh ore list" after mining new kinds.' })
+	onlyDD:OnChanged(function(v)
+		local out = {}
+		for k, on in pairs(type(v) == 'table' and v or {}) do
+			if on then
+				out[k] = true
+			end
+		end
+		settings.forgeOnlyOres = out
+		save()
+	end)
+	ForgeBox:AddButton('Refresh ore list', function()
+		pcall(function()
+			onlyDD:SetValues(oreChoices())
+		end)
+	end)
+end
 bindDropdown(ForgeBox, 'FTForgePiece', 'forgePiece', 'Aim for piece', Piece.names(), 'The game rolls the piece from how many ores go in, so it cannot be forced. This waits for the ore count with the best odds for the piece you pick, forges with exactly that many, and repeats. Overrides Weapon / Armor above. "Ores per forge (max)" still caps it.')
-bindSlider(ForgeBox, 'FTForgeOres', 'forgeOres', 'Ores per forge (max)', 3, 60, 'With "Best gear" on this is the most it will use; otherwise it uses exactly this many, most plentiful ores first.')
-bindToggle(ForgeBox, 'FTForgeBest', 'forgeBest', 'Best gear (smart ore pick)', 'Uses your highest-multiplier ores and the ore count that gives the strongest expected item (bigger weapon/armor types vs. keeping the average multiplier high).')
-bindSlider(ForgeBox, 'FTForgeKeep', 'forgeKeep', 'Keep of each ore (auto sell)', 0, 20, 'With auto forge on, auto sell leaves this many of each ore for forging.')
+bindSlider(ForgeBox, 'FTForgeOres', 'forgeOres', 'Ores per forge (max)', 3, 60, 'The most ores one item may use. Left at 3, the smart picks treat it as no limit.')
+bindSlider(FarmBox, 'FTForgeKeep', 'forgeKeep', 'Keep of each ore (auto sell)', 0, 20, 'With auto forge on, auto sell leaves this many of each ore for forging.')
 do
 	local oreList = {}
 	for name in pairs(ORE_NAMES) do
@@ -5941,7 +6218,7 @@ do
 	if type(settings.keepOres) ~= 'table' then
 		settings.keepOres = {}
 	end
-	local keepDD = ForgeBox:AddDropdown('FTKeepOres', { Text = 'Save these ores (never sell / forge)', Values = oreList, Multi = true, Default = settings.keepOres, AllowNull = true, Tooltip = 'Picked ores are kept: auto sell and auto forge leave them alone (e.g. Galgite, Heavenite).' })
+	local keepDD = FarmBox:AddDropdown('FTKeepOres', { Text = 'Save these ores (never sell / forge)', Values = oreList, Multi = true, Default = settings.keepOres, AllowNull = true, Tooltip = 'Picked ores are kept: auto sell and auto forge leave them alone (e.g. Galgite, Heavenite).' })
 	keepDD:OnChanged(function(v)
 		local out = {}
 		for k, on in pairs(type(v) == 'table' and v or {}) do
@@ -6166,6 +6443,7 @@ do
 			end
 		end
 		G.FTSettings = settings -- (for live tests)
+		G.FTBest = Best
 		local SwapBox = Tab:AddLeftGroupbox('Race swap')
 		bindDropdown(SwapBox, 'FTRaceMine', 'raceMine', 'Race while mining', vals, 'Switches to this race (one of your slots) whenever the bot is mining. Free and instant.')
 		bindDropdown(SwapBox, 'FTRaceFight', 'raceFight', 'Race while fighting', vals, 'Switches to this race whenever the bot is fighting or dodging a mob, and back to the mining one afterwards.')
@@ -6227,6 +6505,191 @@ do
 			end
 		end)
 	end
+end
+-- Runes onto gear, from anywhere (the Runemaker's own calls answer at any distance: measured, a
+-- price came back from 335 studs). Attaching costs gold and uses the rune up, so it only ever
+-- happens on a button press. The lists follow the inventory by themselves and the choice stays
+-- put after an attach, so several runes can go on one piece press after press.
+do
+	local RuneBox = Tab:AddRightGroupbox('Runes')
+	local gearMap, runeMap = {}, {} -- label -> gear id / label -> rune kind
+	local runeGuid = {} -- rune kind -> one GUID of it
+	local gearId, runeKind
+	local function gearList()
+		local names, seen = {}, {}
+		table.clear(gearMap)
+		local d = data()
+		for _, e in pairs(d and d.Inventory and d.Inventory.Equipments or {}) do
+			-- (pickaxes have no GUID: the game knows them by name)
+			local id = type(e) == 'table' and (e.GUID or e.Name)
+			if id and type(e.Runes) == 'table' and #e.Runes > 0 then
+				local free = 0
+				for _, r in ipairs(e.Runes) do
+					if type(r) == 'table' and r.IsEmpty then
+						free += 1
+					end
+				end
+				local label = e.GUID and ('%s +%d (%d of %d free)'):format(tostring(e.Type), tonumber(e.Upgrade) or 0, free, #e.Runes)
+					or ('%s (%d of %d free)'):format(tostring(e.Name), free, #e.Runes)
+				local base, i = label, 1
+				while seen[label] do
+					i += 1
+					label = base .. ' #' .. i
+				end
+				seen[label] = true
+				gearMap[label] = id
+				names[#names + 1] = label
+			end
+		end
+		table.sort(names)
+		return names
+	end
+	local function runeList()
+		local names, count = {}, {}
+		table.clear(runeMap)
+		table.clear(runeGuid)
+		local d = data()
+		local okR, R = pcall(function()
+			return require(RS.Shared.Data.Runes).Runes
+		end)
+		for _, it in pairs(d and d.Inventory and d.Inventory.Misc or {}) do
+			local def = okR and type(it) == 'table' and it.GUID and it.Id and R[it.Id]
+			if def then
+				local n = tostring(def.Name or it.Id)
+				count[n] = (count[n] or 0) + 1
+				runeGuid[n] = runeGuid[n] or it.GUID
+			end
+		end
+		for n, c in pairs(count) do
+			local label = ('%s (x%d)'):format(n, c)
+			runeMap[label] = n
+			names[#names + 1] = label
+		end
+		table.sort(names)
+		return names
+	end
+	local gearDD = RuneBox:AddDropdown('FTRuneGear', { Text = 'Gear', Values = gearList(), Multi = false, AllowNull = true })
+	local runeDD = RuneBox:AddDropdown('FTRuneRune', { Text = 'Rune', Values = runeList(), Multi = false, AllowNull = true })
+	local syncing = false
+	gearDD:OnChanged(function(v)
+		if not syncing then
+			gearId = type(v) == 'string' and gearMap[v] or nil
+		end
+	end)
+	runeDD:OnChanged(function(v)
+		if not syncing then
+			runeKind = type(v) == 'string' and runeMap[v] or nil
+		end
+	end)
+	-- Rebuild both lists and put the choice back on the same piece / same kind of rune (their
+	-- labels change with every attach: "2 of 2 free" becomes "1 of 2 free", "x4" becomes "x3").
+	local lastKey
+	local function sync(force)
+		local g, r = gearList(), runeList()
+		local key = table.concat(g, '|') .. '//' .. table.concat(r, '|')
+		if key == lastKey and not force then
+			return
+		end
+		lastKey = key
+		syncing = true
+		pcall(function()
+			gearDD:SetValues(g)
+			runeDD:SetValues(r)
+			local gl, rl
+			for label, id in pairs(gearMap) do
+				if id == gearId then
+					gl = label
+				end
+			end
+			for label, kind in pairs(runeMap) do
+				if kind == runeKind then
+					rl = label
+				end
+			end
+			gearDD:SetValue(gl)
+			runeDD:SetValue(rl)
+			if not gl then
+				gearId = nil
+			end
+			if not rl then
+				runeKind = nil -- (that was the last one of its kind)
+			end
+		end)
+		syncing = false
+	end
+	task.spawn(function()
+		while alive and G.SB2ForgeToolsToken == nil do
+			task.wait(0.5)
+		end
+		local mine = G.SB2ForgeToolsToken
+		while alive and G.SB2ForgeToolsToken == mine do
+			task.wait(1)
+			pcall(sync)
+		end
+	end)
+	bindToggle(RuneBox, 'FTRuneAsk', 'runeAskPrice', 'Show the price first (press twice)', 'On: the first press only shows what the attach costs, the second does it. Off: one press attaches straight away, and the price paid is shown after.')
+	local armed = { key = nil, at = 0 }
+	local busy = false
+	RuneBox:AddButton('Attach rune', function()
+		if busy then
+			return
+		end
+		busy = true
+		task.spawn(function()
+			pcall(function()
+				pcall(sync)
+				local eg, kind = gearId, runeKind
+				local rg = kind and runeGuid[kind]
+				if not eg or not rg then
+					setStatus('runes: pick a piece of gear and a rune first')
+					return
+				end
+				local svc = service('RuneService')
+				if not svc then
+					setStatus('runes: rune service not found')
+					return
+				end
+				local price
+				pcall(function()
+					local _, v = svc:GetPriceInfo(eg, rg, 'Attach'):await()
+					price = v
+				end)
+				if type(price) ~= 'number' then
+					armed.key = nil
+					setStatus(('runes: %s cannot go on that item (the game gave no price)'):format(tostring(kind)))
+					return
+				end
+				local key = tostring(eg) .. kind
+				if settings.runeAskPrice and (armed.key ~= key or os.clock() - armed.at > 15) then
+					armed.key, armed.at = key, os.clock()
+					setStatus(('runes: %s costs %d gold to attach — press again within 15s'):format(kind, price))
+					return
+				end
+				armed.at = os.clock() -- (same piece, same kind: the next press goes straight through)
+				local okA, got = pcall(function()
+					local _, v = svc:PurchaseAttach(eg, rg):await()
+					return v
+				end)
+				if okA and got then
+					setStatus(('runes: attached %s for %d gold'):format(kind, price))
+				else
+					setStatus('runes: the game refused the attach (' .. tostring(got):sub(1, 60) .. ')')
+				end
+				-- the inventory catches up a moment later: wait for that rune to be gone
+				local t0 = os.clock()
+				while os.clock() - t0 < 2 do
+					runeList()
+					if runeGuid[kind] ~= rg then
+						break
+					end
+					task.wait(0.1)
+				end
+				pcall(sync, true)
+			end)
+			busy = false
+		end)
+	end)
+	RuneBox:AddLabel('Costs gold and uses the rune. Lists update by themselves.', true)
 end
 bindToggle(QuestBox, 'FTAutoAccept', 'autoAcceptQuests', 'Auto accept quests', 'Visits NPCs and takes any quest they offer (repeatable ones again when they come back).')
 bindToggle(QuestBox, 'FTAutoComplete', 'autoCompleteQuests', 'Auto complete quests', 'Works the objectives (forge, sell, equip, talk, kill, mine, buy) and turns quests in at the NPC.')
