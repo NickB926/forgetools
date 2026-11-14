@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v91'
+local BUILD = 'forge-tools-v93'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -87,7 +87,7 @@ local defaults = {
 	forgeWhenFull = false,
 	forgeAlternate = false,
 	autoEnhance = false,
-	enhanceMinChance = 100,
+	enhanceMinChance = 0,
 	enhanceMaxLevel = 9,
 	raceStop = 'Legendary',
 	raceKeepSpins = 0,
@@ -1221,6 +1221,91 @@ local function standNear(part, gap)
 	return CFrame.lookAt(pos, Vector3.new(p.X, pos.Y, p.Z))
 end
 
+-- Stranded. Some places have no walkable way out for the pathfinder (measured on island 3: the
+-- sand below an altar - the way up is a ledge too high for its jump and a path too narrow for it;
+-- every rock on the island came back "no route" from there, forever). The way out a player would
+-- take is "up and over", so: rise straight up through open air, cross to above the nearest spot
+-- we know we can walk from, and come down on it. Only clear air is crossed, never a wall.
+function Nav.escape()
+	local _, hrp, hum = char()
+	if not hrp or not hum or hum.Health <= 0 or os.clock() - (Nav.escapeAt or -1e9) < 45 then
+		return false
+	end
+	Nav.escapeAt = os.clock()
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { LocalPlayer.Character, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+	local me = hrp.Position
+	local nodes = {}
+	for _, n in ipairs(Nav.nodes) do
+		local d = (n - me).Magnitude
+		if d > 15 then
+			nodes[#nodes + 1] = { n = n, d = d }
+		end
+	end
+	table.sort(nodes, function(a, b)
+		return a.d < b.d
+	end)
+	local function clear(a, b)
+		-- (the body is about 4 studs wide: the line and one either side of it)
+		local side = (b - a):Cross(Vector3.yAxis)
+		side = side.Magnitude > 0.1 and side.Unit * 2 or Vector3.new(2, 0, 0)
+		return not workspace:Raycast(a, b - a, rp) and not workspace:Raycast(a + side, b - a, rp)
+			and not workspace:Raycast(a - side, b - a, rp)
+	end
+	for _, lift in ipairs({ 10, 20, 35, 55, 90, 140 }) do
+		if workspace:Raycast(me, Vector3.new(0, lift + 4, 0), rp) then
+			break -- a roof: no higher than this
+		end
+		for i = 1, math.min(#nodes, 20) do
+			local n = nodes[i].n
+			if n.Y + 8 <= me.Y + lift then
+				local alt = me.Y + lift
+				local top = Vector3.new(me.X, alt, me.Z)
+				local over = Vector3.new(n.X, alt, n.Z)
+				local land = n + Vector3.new(0, 1, 0)
+				if clear(top, over) and clear(over, land) then
+					setStatus(('no way out on foot from here — going up and over to a known spot (%.0f studs)'):format(nodes[i].d))
+					local function leg(pos)
+						local _, h = char()
+						if not h then
+							return false
+						end
+						stopTween()
+						noclip = true
+						local dist = (pos - h.Position).Magnitude
+						local speed = math.max(10, tonumber(settings.tweenSpeed) or 55)
+						local tw = TweenService:Create(h, TweenInfo.new(dist / speed, Enum.EasingStyle.Linear), { CFrame = CFrame.new(pos) })
+						currentTween = tw
+						local hold = RunService.Heartbeat:Connect(function()
+							if h.Parent then
+								h.AssemblyLinearVelocity = Vector3.zero
+							end
+						end)
+						tw:Play()
+						local deadline = os.clock() + dist / speed + 2
+						while alive and os.clock() < deadline and (h.Position - pos).Magnitude > 1 do
+							task.wait()
+						end
+						hold:Disconnect()
+						pcall(function()
+							tw:Cancel()
+						end)
+						currentTween = nil
+						noclip = false
+						return (h.Position - pos).Magnitude <= 3
+					end
+					local ok = leg(top) and leg(over) and leg(land)
+					G.FTEscapes = (G.FTEscapes or 0) + (ok and 1 or 0)
+					return ok
+				end
+			end
+		end
+	end
+	setStatus('no way out on foot from here, and no clear way over either')
+	return false
+end
+
 local function equip(toolName)
 	local c, _, hum = char()
 	if not c or not hum then
@@ -1617,6 +1702,22 @@ local function mineOnce()
 			local fails = (unreachFails[target.m] or 0) + 1
 			unreachFails[target.m] = fails
 			if why == 'nopath' then
+				-- Third rock in a row with no route at all, from the same place: it is not the rocks,
+				-- it is where we are standing. Get out, and forget what was ruled out from in here.
+				local sp = MineHooks.strandPos
+				if sp and (myh.Position - sp).Magnitude < 25 then
+					MineHooks.strandN = (MineHooks.strandN or 0) + 1
+				else
+					MineHooks.strandPos, MineHooks.strandN = myh.Position, 1
+				end
+				if MineHooks.strandN >= 3 and Nav.escape() then
+					MineHooks.strandPos, MineHooks.strandN = nil, 0
+					table.clear(unreachable)
+					table.clear(unreachFails)
+					table.clear(zoneNoPath)
+					table.clear(zoneBlocked)
+					return true
+				end
 				-- No walkable route at all (walled off / different cave): don't keep coming back.
 				unreachable[target.m] = os.clock() + 600
 				local z = zoneNoPath[target.zone]
@@ -3018,6 +3119,129 @@ local function clearDist(pos)
 	return math.max(tonumber(settings.dodgeDist) or 16, 30 - d)
 end
 
+-- Projectiles and ground markers. The game draws both on the client as objects in workspace.Debris
+-- (read from its effect scripts): a thrown rock / spider spit / crystal shard is a part flying at
+-- 75-100 studs/s, and an area attack first shows a "GroundIndicator" / "rangeIndicator" marker on
+-- the floor for about a second. So: anything in Debris that starts away from us and is flying at
+-- us gets side-stepped, and we never stay standing inside a marker.
+local Hazard = { seen = {}, n = { proj = 0, ground = 0 }, last = 0 }
+G.FTHazard = Hazard.n
+pcall(function()
+	if G.FTHazardConn then
+		G.FTHazardConn:Disconnect()
+	end
+	G.FTHazardConn = workspace:WaitForChild('Debris', 10).ChildAdded:Connect(function(x)
+		if x:IsA('BasePart') or x:IsA('Model') then
+			Hazard.seen[x] = { t = os.clock() }
+		end
+	end)
+end)
+-- Step off a projectile's line. (Not dodgeFrom: that picks whichever direction ends up furthest
+-- from mobs, which can be straight along the line - measured: a 12 stud "dodge" that still let the
+-- shot pass 2.4 studs from us.)
+function Hazard.sidestep(hrp, perp)
+	local c = char()
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { c, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+	for _, try in ipairs({ { 1, 12 }, { -1, 12 }, { 1, 8 }, { -1, 8 } }) do
+		local move = perp * try[1] * try[2]
+		local target = hrp.Position + move
+		local wall = workspace:Raycast(hrp.Position, move, rp)
+		local floor = workspace:Raycast(target + Vector3.new(0, 8, 0), Vector3.new(0, -30, 0), rp)
+		if not wall and floor and not Lava.at(floor.Position + Vector3.new(0, 3, 0)) then
+			hrp.CFrame = hrp.CFrame.Rotation + (floor.Position + Vector3.new(0, 3, 0))
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			return true
+		end
+	end
+	return false
+end
+function Hazard.step()
+	local _, hrp, hum = char()
+	if not hrp or not hum or hum.Health <= 0 then
+		return
+	end
+	local now = os.clock()
+	local me = hrp.Position
+	for x, e in pairs(Hazard.seen) do
+		if not x.Parent or now - e.t > 6 then
+			Hazard.seen[x] = nil
+		elseif x.Name == 'GroundIndicator' or x.Name == 'rangeIndicator' then
+			if now - Hazard.last > 0.3 then
+				local ok, cf, size = pcall(function()
+					if x:IsA('Model') then
+						return x:GetBoundingBox()
+					end
+					return x.CFrame, x.Size
+				end)
+				if ok and cf and size then
+					local rad = math.max(size.X, size.Y, size.Z) / 2
+					local flat = (me - cf.Position) * Vector3.new(1, 0, 1)
+					if flat.Magnitude < rad + 2 and math.abs(me.Y - cf.Position.Y) < 20 then
+						Hazard.last = now
+						if dodgeFrom(cf.Position, math.max(10, rad + 6 - flat.Magnitude)) then
+							Hazard.n.ground += 1
+							setStatus('stepping out of an attack marker')
+						end
+					end
+				end
+			end
+		else
+			local ok, pos = pcall(function()
+				return x:IsA('Model') and x:GetPivot().Position or x.Position
+			end)
+			if ok and pos then
+				e.from = e.from or pos
+				if e.p and now > e.at and not e.done then
+					local v = (pos - e.p) / (now - e.at)
+					local sp = v.Magnitude
+					-- (40+: our own and other players' slash effects drift at 15-35; 400+: a teleport, not a flight)
+					if sp >= 40 and sp < 400 and (e.from - me).Magnitude > 10 and (pos - e.from).Magnitude >= 6 and (pos - e.from).Unit:Dot(v.Unit) > 0.9 then -- (really flying in a line: sparks and roar rings only jump for a frame)
+						local dir = v.Unit
+						local rel = me - pos
+						local along = rel:Dot(dir)
+						if along > 0 and along / sp < 0.5 and (rel - dir * along).Magnitude < 7 and now - Hazard.last > 0.15 then
+							-- step sideways off its line (to the side we are already on)
+							local perp = dir:Cross(Vector3.yAxis)
+							if perp.Magnitude < 0.1 then
+								perp = hrp.CFrame.RightVector -- (falling straight down on us: any way out)
+							end
+							perp = (perp * Vector3.new(1, 0, 1)).Unit
+							if rel:Dot(perp) < 0 then
+								perp = -perp
+							end
+							Hazard.last = now
+							e.done = true
+							if Hazard.sidestep(hrp, perp) then
+								Hazard.n.proj += 1
+								setStatus(('dodged a projectile (%s)'):format(x.Name))
+							end
+						end
+					end
+				end
+				e.p, e.at = pos, now
+			end
+		end
+	end
+end
+task.spawn(function()
+	local forging, checked = false, 0
+	while alive do
+		task.wait()
+		local now = os.clock()
+		if now - checked > 0.5 then
+			checked = now
+			local FC = controller('ForgeController')
+			forging = (FC and FC.ForgeActive) and true or false
+		end
+		if not forging and next(Hazard.seen) and (settings.autoMine or settings.autoMobs or settings.autoAbyss
+			or settings.autoCompleteQuests or QS.wantMobs or QS.wantMine) then
+			pcall(Hazard.step)
+		end
+	end
+end)
+
 -- Bombers run up to you and explode (measured: 91 of 116 health in one blast, while the bot was
 -- just walking to a quest NPC). Whatever the bot is doing, it steps away when one gets close.
 task.spawn(function()
@@ -3198,9 +3422,45 @@ local function fightOnce(forced)
 			pend = nil
 		end
 	end
+	-- In a group, where we stand decides the fight: on the side of the target facing away from the
+	-- rest, every other mob is behind the target - in front of our swing and further from us -
+	-- instead of all around us. Alone (or if that spot is a wall / a drop / lava) it is the old spot:
+	-- the side we are already on.
+	local function standFor(gap)
+		local base = standNear(target.r, gap)
+		local tp = target.r.Position
+		local _, others = mobsNear(tp, 25)
+		local sum, n = Vector3.zero, 0
+		for _, e in ipairs(others) do
+			if e.m ~= target.m then
+				sum += e.r.Position
+				n += 1
+			end
+		end
+		if n == 0 then
+			return base
+		end
+		local away = (tp - sum / n) * Vector3.new(1, 0, 1)
+		if away.Magnitude < 1 then
+			return base
+		end
+		local r = math.max(target.r.Size.X, target.r.Size.Z) / 2 + (gap or 2)
+		local spot = tp + away.Unit * r
+		local c = char()
+		local rp = RaycastParams.new()
+		rp.FilterType = Enum.RaycastFilterType.Exclude
+		rp.FilterDescendantsInstances = { c, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+		local floor = workspace:Raycast(spot + Vector3.new(0, 6, 0), Vector3.new(0, -20, 0), rp)
+		if not floor or math.abs(floor.Position.Y + 3 - base.Position.Y) > 6 or Lava.at(floor.Position + Vector3.new(0, 3, 0))
+			or workspace:Raycast(tp, spot - tp, rp) then
+			return base
+		end
+		spot = Vector3.new(spot.X, floor.Position.Y + 3, spot.Z)
+		return CFrame.lookAt(spot, Vector3.new(tp.X, spot.Y, tp.Z))
+	end
 	local function hopIn(h, reach)
 		-- The hitbox only reaches ~reach studs in front of us: stand well inside it, facing the mob.
-		local cf = standNear(target.r, math.clamp(reach - 3.5, 1.5, 4))
+		local cf = standFor(math.clamp(reach - 3.5, 1.5, 4))
 		if Lava.at(groundAt(cf.Position)) then
 			-- that side of the mob is lava: any dry side will do
 			local tp = target.r.Position
@@ -3282,10 +3542,23 @@ local function fightOnce(forced)
 		track(true) -- (close the books on the previous swing)
 		pend = { at = now + ht, hd = hd, ht = ht, idx = idx, reach = reach, hp = target.h.Health }
 	end
+	local retargetAt, regroupAt = os.clock() + 1, 0
 	while alive and allowed() and target.m.Parent and target.h.Health > 0 and os.clock() - t0 < 45 do
 		if lowHp() then
 			retreatAndHeal()
 			return true
+		end
+		-- Several mobs: do not chase the one we started on while another is right on top of us.
+		-- (only between swings, so a swing in flight still lands on what it was aimed at)
+		if not forced and not strikeAt and os.clock() >= retargetAt then
+			retargetAt = os.clock() + 0.5
+			local _, h0 = char()
+			local near = mobList()[1]
+			if h0 and near and near.m ~= target.m and near.d + 8 < (h0.Position - target.r.Position).Magnitude then
+				target = near
+				pend = nil
+				setStatus(('fighting %s (%.0f studs) — it was closer'):format(target.m.Name, target.d))
+			end
 		end
 		if forced then
 			local _, _, fh = char()
@@ -3379,13 +3652,23 @@ local function fightOnce(forced)
 				end
 			else
 				-- (hit & run: stop short of the mob; the hop above takes us in when it is safe)
-				tweenTo(standNear(target.r, hitRun and 14 or math.clamp(reach - 3.5, 1.5, 4)), { abort = function()
+				tweenTo(standFor(hitRun and 14 or math.clamp(reach - 3.5, 1.5, 4)), { abort = function()
 					return not allowed() or not target.m.Parent or target.h.Health <= 0
 				end })
 			end
 			tool = equip('Weapon')
 		else
 			if hrp then
+				if not hitRun and os.clock() >= regroupAt then
+					regroupAt = os.clock() + 1.5
+					if mobsNear(hrp.Position, 14) >= 3 then
+						local cf = standFor(math.clamp(reach - 3.5, 1.5, 4))
+						if (cf.Position - hrp.Position).Magnitude > 6 then
+							hrp.CFrame = cf
+							hrp.AssemblyLinearVelocity = Vector3.zero
+						end
+					end
+				end
 				-- keep facing the mob every frame: the hitbox comes out in front of us a moment after the swing
 				hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.r.Position.X, hrp.Position.Y, target.r.Position.Z))
 			end
@@ -5257,8 +5540,16 @@ bindToggle(QuestBox, 'FTAutoMail', 'autoMail', 'Auto claim mail & rewards', 'Eve
 bindToggle(QuestBox, 'FTAutoOffer', 'autoOffer', 'Auto offer altar shards', 'Twilight War altar: spends your side\'s shards on offers (x10 while you can, then x1) and takes the free daily gifts.')
 bindToggle(QuestBox, 'FTAutoDaily', 'autoDaily', 'Auto claim daily login', 'Claims the daily login reward when it is ready.')
 bindToggle(QuestBox, 'FTAutoCodes', 'autoCodes', 'Auto redeem codes', 'Tries each known code once per account. Add new codes to PlayerTools/forgecodes.txt (one per line).')
-bindToggle(ForgeBox, 'FTAutoEnhance', 'autoEnhance', 'Auto enhance equipped gear', 'Spends essences and gold to enhance the weapon and armor you are wearing, one level at a time. Only tries when the success chance is at least the number below: a failed enhance drops the item a level and can cost a rune slot. Never uses medallions.')
-bindSlider(ForgeBox, 'FTEnhanceMinChance', 'enhanceMinChance', 'Only enhance at this chance or better (%)', 50, 100, 'At 100 an enhance can never fail.')
+bindToggle(ForgeBox, 'FTAutoEnhance', 'autoEnhance', 'Auto enhance equipped gear', 'Spends essences and gold to enhance the weapon and armor you are wearing, one level at a time. A failed enhance drops the item a level and can cost a rune slot; use the chance slider below to only take safer rolls. Never uses medallions.')
+-- The limit used to default to 100%, which stopped every item at +3 (+3 -> +4 is a 70% roll).
+-- No limit by default now; whatever was saved before (the slider could not go under 50) is
+-- cleared once.
+if not settings.enhanceNoLimitV2 then
+	settings.enhanceNoLimitV2 = true
+	settings.enhanceMinChance = 0
+	save()
+end
+bindSlider(ForgeBox, 'FTEnhanceMinChance', 'enhanceMinChance', 'Only enhance at this chance or better (%)', 0, 100, '0 = no limit: keeps trying whatever the odds. At 100 an enhance can never fail, which stops at +3.')
 bindSlider(ForgeBox, 'FTEnhanceMaxLevel', 'enhanceMaxLevel', 'Stop enhancing at +', 1, 9, 'Items already at this level are left alone.')
 bindToggle(ForgeBox, 'FTAutoEquip', 'autoEquip', 'Auto equip better gear', 'After forging, equips the item if its slot is empty or its base stats beat what you have on. Enhancement levels are ignored, so a better new piece replaces an upgraded old one.')
 MobBox:AddButton('Refresh lists', function()
@@ -5487,7 +5778,7 @@ task.spawn(function()
 					end
 				end
 				local maxLv = math.clamp(tonumber(settings.enhanceMaxLevel) or 9, 1, 9)
-				local minCh = math.clamp(tonumber(settings.enhanceMinChance) or 100, 50, 100)
+				local minCh = math.clamp(tonumber(settings.enhanceMinChance) or 0, 0, 100)
 				-- (d.Equipped is a copy that does not follow enhances: levels come from the inventory list)
 				local fresh = {}
 				for _, e in ipairs((d.Inventory or {}).Equipments or {}) do
