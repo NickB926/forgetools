@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v162'
+local BUILD = 'forge-tools-v163'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -7245,7 +7245,7 @@ do
 	if type(settings.keepOres) ~= 'table' then
 		settings.keepOres = {}
 	end
-	local keepDD = FarmBox:AddDropdown('FTKeepOres', { Text = 'Save these ores (never sell / forge)', Values = oreList, Multi = true, Default = settings.keepOres, AllowNull = true, Tooltip = 'Picked ores are kept: auto sell and auto forge leave them alone (e.g. Galgite, Heavenite).' })
+	local keepDD = FarmBox:AddDropdown('FTKeepOres', { Text = 'Save these ores (never sell / forge)', Values = oreList, Multi = true, Searchable = true, Default = settings.keepOres, AllowNull = true, Tooltip = 'Picked ores are kept: auto sell and auto forge leave them alone (e.g. Galgite, Heavenite).' })
 	keepDD:OnChanged(function(v)
 		local out = {}
 		for k, on in pairs(type(v) == 'table' and v or {}) do
