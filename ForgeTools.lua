@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v93'
+local BUILD = 'forge-tools-v99'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -1132,7 +1132,7 @@ local function walkDirect(cf, opts)
 	return reached
 end
 
-local function tweenTo(cf, opts)
+local function tweenToRaw(cf, opts)
 	opts = opts or {}
 	local _, hrp, hum = char()
 	if not hrp or not hum or hum.Health <= 0 then
@@ -1209,6 +1209,19 @@ local function tweenTo(cf, opts)
 		G.FTNavDbg = ('straight move cut off %.1f from the target'):format((cf.Position - hrp.Position).Magnitude)
 	end
 	return done
+end
+
+-- While we are on our way somewhere, G.FTTravel is where to. Dodges read it: a step away from a mob
+-- that is ahead of us used to throw us 16-30 studs back down the route, again and again.
+local function tweenTo(cf, opts)
+	local prev = G.FTTravel
+	G.FTTravel = typeof(cf) == 'CFrame' and cf.Position or cf
+	local ok, a, b = pcall(tweenToRaw, cf, opts)
+	G.FTTravel = prev
+	if not ok then
+		error(a, 0)
+	end
+	return a, b
 end
 
 local function standNear(part, gap)
@@ -1473,16 +1486,27 @@ do
 	end
 	-- nearest deadly mob within `radius` of pos (or nil)
 	function Deadly.near(pos, radius)
-		if settings.fleeDeadly == false or next(Deadly.names) == nil then
-			return nil
-		end
-		local _, list = mobsNear(pos, radius or Deadly.RANGE)
+		radius = radius or Deadly.RANGE
+		local listed = settings.fleeDeadly ~= false and next(Deadly.names) ~= nil
+		local _, list = mobsNear(pos, radius + 15)
 		for _, e in ipairs(list) do
-			if Deadly.names[kind(e.m)] then
+			local d = (e.r.Position - pos).Magnitude
+			if (listed and d <= radius and Deadly.names[kind(e.m)]) or Deadly.big(e.h) then
 				return e
 			end
 		end
 		return nil
+	end
+	-- A mini boss (more than 12x our own health - island 3 on a 342 hp character: Prismarine Spider
+	-- 7000, Yeti 11000): wide slams with no warning and shots from range. While mining these are
+	-- kept away from like a mob that has killed us - and from 15 studs further out - whether or not
+	-- "Avoid mobs that killed me" is on.
+	function Deadly.big(h)
+		local _, _, hum = char()
+		return hum ~= nil and h ~= nil and h.MaxHealth < 1e8 and h.MaxHealth > hum.MaxHealth * 12
+	end
+	function Deadly.avoid(m)
+		return Deadly.is(m) or Deadly.big(m:FindFirstChildOfClass('Humanoid'))
 	end
 	local function blame(pos, why, minHp)
 		local _, list = mobsNear(pos, minHp and 30 or 12)
@@ -1647,8 +1671,21 @@ local function mineOnce()
 			alt[#alt + 1] = hb.Position + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
 		end
 	end
-	local function handleThreat()
+	-- On the way to a rock (more than 30 studs out) mobs are not a reason to stop: we walk faster
+	-- than they run, and stopping for each one turned every trip into a string of fights. Only a
+	-- kind that has killed us before still gets a wide berth. At the rock itself they are dealt with.
+	local function threatNow()
 		local th = mineThreat()
+		if th and not Deadly.avoid(th.m) then
+			local _, me = char()
+			if me and (me.Position - target.hb.Position).Magnitude > 30 then
+				return nil
+			end
+		end
+		return th
+	end
+	local function handleThreat()
+		local th = threatNow()
 		if not th then
 			return false
 		end
@@ -1684,7 +1721,7 @@ local function mineOnce()
 		return takenNow
 	end
 	local okGo, why = tweenTo(standNear(target.hb, 2), { alt = alt, abort = function()
-		return not (settings.autoMine or G.FTQuestWantsOre) or not target.m.Parent or mineThreat() ~= nil or takenByOther()
+		return not (settings.autoMine or G.FTQuestWantsOre) or not target.m.Parent or threatNow() ~= nil or takenByOther()
 	end, onRelay = function()
 		setStatus(('mining %s (%.0f studs) — long route, walking via known spots'):format(target.m.Name, target.d))
 	end })
@@ -2692,6 +2729,8 @@ end
 -- "ParryWindow" attachment ~0.35s before). Tested on island 2 slimes: stepping out when "Attacking"
 -- appears and coming back ~1s later took 0 damage over 6 attacks in a row.
 local attackWarn = {} -- [mob model] = os.clock() when its attack started
+G.FTAtkDur = G.FTAtkDur or {}
+local Attack = { flag = setmetatable({}, { __mode = 'k' }), off = setmetatable({}, { __mode = 'k' }), dur = G.FTAtkDur }
 pcall(function()
 	if G.FTAttackWarnConn then
 		G.FTAttackWarnConn:Disconnect()
@@ -2705,12 +2744,39 @@ pcall(function()
 			-- (players live in workspace.Living too and get the same flag when THEY swing: counting our
 			-- own made the bot dodge away from itself after every swing of its weapon or pickaxe)
 			if m and m:GetAttribute('IsNpc') and not Players:GetPlayerFromCharacter(m) then
-				attackWarn[m] = os.clock()
+				local t0 = os.clock()
+				attackWarn[m] = t0
+				Attack.flag[m] = d
+				Attack.off[m] = nil
+				d.AncestryChanged:Once(function()
+					if Attack.flag[m] == d then
+						Attack.flag[m] = nil
+						Attack.off[m] = os.clock()
+					end
+					local dur = os.clock() - t0
+					if dur > 0.3 and dur < 6 then
+						local k = (string.gsub(m.Name, '%d+$', ''))
+						Attack.dur[k] = math.max(Attack.dur[k] or 0, dur)
+					end
+				end)
 			end
 		end
 	end)
 end)
-local ATTACK_WINDOW = 1.0 -- seconds from "Attacking" until the swing is over
+local ATTACK_WINDOW = 1.0 -- seconds from "Attacking" until the swing is over (when nothing better is known)
+-- When is mob m's current attack over? Measured on island 3: a Crystal Spider's flag lasts ~1.0s
+-- and its hit lands at 0.6-0.8s, but a Diamond Spider's lasts up to 1.65s with the hit at ~1.3s,
+-- and a Prismarine Spider's up to 4s. Going back in after a flat 1.0s walked into every Diamond
+-- Spider hit. So: while the flag is up, the longest this kind has ever kept it up; once it is
+-- gone, a moment after it went.
+function Attack.ends(m, t)
+	local off = Attack.off[m]
+	if off and off >= t then
+		return off + 0.15
+	end
+	local k = (string.gsub(m.Name, '%d+$', ''))
+	return t + math.max(ATTACK_WINDOW, Attack.dur[k] or 0) + 0.15
+end
 local function mobRoot(m)
 	return m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart or m:FindFirstChild('Head')
 		or m:FindFirstChild('Torso') or m:FindFirstChildWhichIsA('BasePart')
@@ -2724,13 +2790,14 @@ local function attackThreat(radius)
 	local now = os.clock()
 	local bestPos, bestEnd, bestD
 	for m, t in pairs(attackWarn) do
-		if now - t > ATTACK_WINDOW or not m.Parent then
+		local ends = m.Parent and Attack.ends(m, t)
+		if not ends or now > ends then
 			attackWarn[m] = nil
 		else
 			local r = mobRoot(m)
 			local d = r and (r.Position - hrp.Position).Magnitude
 			if d and d <= radius and (not bestD or d < bestD) then
-				bestPos, bestEnd, bestD = r.Position, t + ATTACK_WINDOW, d
+				bestPos, bestEnd, bestD = r.Position, ends, d
 			end
 		end
 	end
@@ -2774,6 +2841,15 @@ local function mobMatches(name, filter)
 	return true
 end
 
+-- A mob with more than 12x our own health (island 3 on a 342 hp character: Prismarine Spider 7000,
+-- Yeti 11000) is a mini boss: area slams with no warning to step out of, and minutes of trading
+-- hits to bring it down. Left alone unless it is the only thing to fight (a tower wave's boss) or
+-- it is picked by name as the Target.
+local function mobTooBig(h)
+	local _, _, hum = char()
+	return hum ~= nil and h.MaxHealth > hum.MaxHealth * 12
+end
+
 local function mobList()
 	local _, hrp = char()
 	local living = workspace:FindFirstChild('Living')
@@ -2815,8 +2891,19 @@ local function mobList()
 				and not string.find(m.Name, 'Bomber', 1, true) -- (they explode in melee range)
 				and not Lava.at(r.Position) -- (standing in lava: we would have to stand in it too)
 			then
-				list[#list + 1] = { m = m, h = h, r = r, d = (r.Position - hrp.Position).Magnitude }
+				list[#list + 1] = { m = m, h = h, r = r, d = (r.Position - hrp.Position).Magnitude, big = mobTooBig(h) }
 			end
+		end
+	end
+	if filter == 'Any' then
+		local small = {}
+		for _, e in ipairs(list) do
+			if not e.big then
+				small[#small + 1] = e
+			end
+		end
+		if #small > 0 then
+			list = small
 		end
 	end
 	table.sort(list, function(a, b)
@@ -3073,19 +3160,31 @@ local function dodgeOnce(fromPos, distOverride)
 	away = away.Unit
 	local _, near = mobsNear(hrp.Position, 40)
 	local best, bestScore
-	for _, ang in ipairs({ 0, 30, -30, 60, -60, 90, -90, 135, -135 }) do
+	-- On the way somewhere (30+ studs still to go): never step back down the route - sideways or
+	-- onward only, onward preferred.
+	local toDest = G.FTTravel and (G.FTTravel - hrp.Position) * Vector3.new(1, 0, 1)
+	toDest = toDest and toDest.Magnitude >= 30 and toDest.Unit or nil
+	for _, ang in ipairs({ 0, 30, -30, 60, -60, 90, -90, 135, -135, 165, -165 }) do
 		local a = math.rad(ang)
 		local dir = Vector3.new(away.X * math.cos(a) - away.Z * math.sin(a), 0, away.X * math.sin(a) + away.Z * math.cos(a))
 		local target = hrp.Position + dir * dist
+		if toDest and dir:Dot(toDest) < -0.1 then
+			target = nil
+		end
 		-- clear path (no wall) and floor under the landing spot
-		local wall = workspace:Raycast(hrp.Position, dir * dist, dodgeParams)
-		local floor = workspace:Raycast(target + Vector3.new(0, 8, 0), Vector3.new(0, -30, 0), dodgeParams)
-		if not wall and floor and not Lava.at(floor.Position + Vector3.new(0, 3, 0)) then
+		local wall = target and workspace:Raycast(hrp.Position, dir * dist, dodgeParams)
+		local floor = target and workspace:Raycast(target + Vector3.new(0, 8, 0), Vector3.new(0, -30, 0), dodgeParams)
+		if target and not wall and floor and not Lava.at(floor.Position + Vector3.new(0, 3, 0)) then
 			local score = math.huge
 			for _, e in ipairs(near) do
 				score = math.min(score, (e.r.Position - target).Magnitude)
 			end
-			score -= math.abs(ang) * 0.02 -- prefer straight back
+			score = math.min(score, 60)
+			if toDest then
+				score += dir:Dot(toDest) * 8
+			else
+				score -= math.abs(ang) * 0.02 -- prefer straight back
+			end
 			if not bestScore or score > bestScore then
 				best, bestScore = floor.Position + Vector3.new(0, 3, 0), score
 			end
@@ -3197,7 +3296,14 @@ function Hazard.step()
 					local v = (pos - e.p) / (now - e.at)
 					local sp = v.Magnitude
 					-- (40+: our own and other players' slash effects drift at 15-35; 400+: a teleport, not a flight)
-					if sp >= 40 and sp < 400 and (e.from - me).Magnitude > 10 and (pos - e.from).Magnitude >= 6 and (pos - e.from).Unit:Dot(v.Unit) > 0.9 then -- (really flying in a line: sparks and roar rings only jump for a frame)
+					if e.mob == nil and sp >= 40 then
+						-- (a shot starts at the mob that fired it, and is built like one: the game's shots are parts
+						-- pushed by a BodyVelocity, thrown weapons are models, attack volumes are "Hitbox<n>".
+						-- Measured over 5 minutes of mining: bare parts - sparks, ore drops - made 3 of 8 dodges.)
+						e.mob = mobsNear(e.from, 18) > 0 and (x:IsA('Model') or string.sub(x.Name, 1, 6) == 'Hitbox'
+							or x:FindFirstChildWhichIsA('BodyMover', true) ~= nil)
+					end
+					if e.mob and sp >= 40 and sp < 400 and (e.from - me).Magnitude > 10 and (pos - e.from).Magnitude >= 6 and (pos - e.from).Unit:Dot(v.Unit) > 0.9 then -- (really flying in a line: sparks and roar rings only jump for a frame)
 						local dir = v.Unit
 						local rel = me - pos
 						local along = rel:Dot(dir)
@@ -3268,7 +3374,10 @@ task.spawn(function()
 			end
 			-- mining: a mob near us started its attack - be gone before it lands
 			if string.sub(_statusText, 1, 6) == 'mining' then
-				local wPos = attackThreat(22)
+				-- (not on the way there: that status is up for the whole walk, and each of these steps
+				-- threw us back down the route - we outrun the hit by just keeping going)
+				local onTheWay = G.FTTravel and (G.FTTravel - hrp.Position).Magnitude > 30
+				local wPos = not onTheWay and attackThreat(22)
 				if wPos then
 					dodgeFrom(wPos, clearDist(wPos))
 				end
@@ -3380,7 +3489,7 @@ local function fightOnce(forced)
 			local r = m.Parent and mobRoot(m)
 			if r and target.r.Parent and (r.Position - target.r.Position).Magnitude <= math.max(reach + 10, 22) then
 				local age = at - t
-				if age > UNSAFE_FROM and age < UNSAFE_TO then
+				if age > UNSAFE_FROM and at < math.max(t + UNSAFE_TO, Attack.ends(m, t)) then
 					return false
 				end
 			end
@@ -3511,25 +3620,40 @@ local function fightOnce(forced)
 		if hitRun and not (strikeSafe(reach, ht - STRIKE_LEAD) and strikeSafe(reach, ht + hd)) then
 			return -- this swing's hitbox would come out while a mob's hit is landing: hold it a moment
 		end
-		if hitRun and ht >= 0.6 then
-			-- Slow weapon (scythe / great axe: the hitbox comes out 1.1-1.4s after the swing starts).
-			-- Swung blind, a mob winds up in the meantime and we have to be out of reach right when
-			-- our hitbox appears: a miss. So start the swing AS a mob winds up - its hit whiffs while
-			-- we stand clear, and ours lands just after, while it recovers.
-			local freshest
+		if hitRun then
+			-- Counter-attack instead of swinging on cooldown. Measured with a great sword (hitbox 0.9s
+			-- after the press): 32 of 80 swings missed, every one with us standing 22-47 studs off when
+			-- the hitbox came out - the mob was mid-attack right then, so we could not be next to it.
+			-- So a swing is started so that its hitbox comes out just AFTER the attack near the target
+			-- ends (the mob is recovering: we can stand on it), a follow-up is allowed right after an
+			-- attack ended, and otherwise we wait for the next wind-up (1.5s at most: an idle or
+			-- stunned mob gets hit anyway).
+			local lateEnd, lastOff
+			local rad = math.max(reach + 10, 22)
+			local tp = target.r.Position
 			for m, t in pairs(attackWarn) do
 				local r = m.Parent and mobRoot(m)
-				if r and (r.Position - target.r.Position).Magnitude <= reach + 10 then
-					local age = now - t
-					if not freshest or age < freshest then
-						freshest = age
+				if r and (r.Position - tp).Magnitude <= rad then
+					local e = Attack.ends(m, t)
+					if e > now and (not lateEnd or e > lateEnd) then
+						lateEnd = e
 					end
 				end
 			end
+			for m, off in pairs(Attack.off) do
+				local r = m.Parent and mobRoot(m)
+				if r and (r.Position - tp).Magnitude <= rad and (not lastOff or off > lastOff) then
+					lastOff = off
+				end
+			end
 			local waited = now - math.max(nextSwingAt, t0)
-			local engaged = (h.Position - target.r.Position).Magnitude <= reach + 12
-			if engaged and not (freshest and freshest <= 0.6) and waited < 2 then
-				return -- wait for its next wind-up (2s at most: a stunned / idle mob gets hit anyway)
+			local engaged = (h.Position - tp).Magnitude <= reach + 30
+			if lateEnd then
+				if now + ht < lateEnd + 0.05 then
+					return -- our hitbox would come out while it is still attacking: start a bit later
+				end
+			elseif engaged and not (lastOff and now - lastOff < 0.6) and waited < 1.5 then
+				return -- nothing to answer yet: wait for its next wind-up
 			end
 		end
 		swingIdx = idx
@@ -3625,6 +3749,18 @@ local function fightOnce(forced)
 					dodgeFrom(w2, clearDist(w2))
 					untilT = e2
 				end
+				-- (measured: a Diamond Spider runs after us for its whole 1.3s attack and lands the hit
+				-- 4 studs away, 10 hits in 4 minutes - one step at the start is not enough for those)
+				local w4 = attackThreat(14)
+				if w4 and os.clock() - (G.FTRedodgeAt or 0) > 0.2 then
+					G.FTRedodgeAt = os.clock()
+					dodgeFrom(w4, clearDist(w4))
+				end
+				-- (one we already stepped clear of that is still mid-attack: stay out until it is done)
+				local w3, e3 = attackThreat(50)
+				if w3 and e3 > untilT then
+					untilT = e3
+				end
 				local p2, r2 = Block.threat(8)
 				if p2 and r2 and r2 < 0.3 then
 					dodgeFrom(p2)
@@ -3698,6 +3834,7 @@ local function mobFightable(e)
 		and (cap <= 0 or e.h.MaxHealth <= cap)
 		and e.h.MaxHealth < 1e8 and not e.m.Name:find('Dummy')
 		and not Deadly.is(e.m)
+		and not mobTooBig(e.h) -- (while mining: step away from a mini boss, do not start a duel with it)
 end
 MineHooks.clear = function(pos)
 	local _, hrp = char()
@@ -3714,9 +3851,9 @@ MineHooks.clear = function(pos)
 end
 -- A mob reached us while mining / walking to a rock.
 MineHooks.defend = function(th)
-	if Deadly.is(th.m) then
+	if Deadly.avoid(th.m) then
 		-- This kind has killed us before: no fighting, no healing nearby - just get well clear.
-		setStatus(('%s nearby (it has killed you before) — getting away'):format((string.gsub(th.m.Name, '%d+$', ''))))
+		setStatus(('%s nearby (too dangerous to stand next to) — getting away'):format((string.gsub(th.m.Name, '%d+$', ''))))
 		for _ = 1, 4 do
 			local _, h0 = char()
 			local d = h0 and Deadly.near(h0.Position, Deadly.RANGE + 10)
@@ -3745,7 +3882,7 @@ MineHooks.defend = function(th)
 				return
 			end
 			local pk = humk.MaxHealth > 0 and humk.Health / humk.MaxHealth * 100 or 100
-			if pk >= 80 then
+			if pk >= 60 then
 				return
 			end
 			local _, nearK = mobsNear(hk.Position, 30)
@@ -5801,6 +5938,18 @@ task.spawn(function()
 							for _, m in ipairs(req.materials) do
 								if (have[m.material.Name] or 0) < (tonumber(m.quantity) or 0) then
 									can = false
+									-- (it used to just sit there: say what is missing, once per item and level)
+									G.FTEnhanceTold = G.FTEnhanceTold or {}
+									local key = it.GUID .. ':' .. lv .. ':' .. m.material.Name
+									if not G.FTEnhanceTold[key] then
+										G.FTEnhanceTold[key] = true
+										local msg = ('%s +%d -> +%d needs %d %s (you have %d)'):format(it.Type, lv, lv + 1,
+											tonumber(m.quantity) or 0, m.material.Name, have[m.material.Name] or 0)
+										statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. 'auto enhance waiting: ' .. msg
+										pcall(function()
+											game:GetService('StarterGui'):SetCore('SendNotification', { Title = 'Auto enhance waiting', Text = msg, Duration = 8 })
+										end)
+									end
 								end
 							end
 						end
