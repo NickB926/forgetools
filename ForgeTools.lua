@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v99'
+local BUILD = 'forge-tools-v104'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -2730,7 +2730,13 @@ end
 -- appears and coming back ~1s later took 0 damage over 6 attacks in a row.
 local attackWarn = {} -- [mob model] = os.clock() when its attack started
 G.FTAtkDur = G.FTAtkDur or {}
-local Attack = { flag = setmetatable({}, { __mode = 'k' }), off = setmetatable({}, { __mode = 'k' }), dur = G.FTAtkDur }
+-- [kind] = { min, max }: seconds into its attack at which the hit lands. Measured on island 3 with a
+-- great sword (hitbox 0.95s after the press): treating the WHOLE attack as "do not stand there"
+-- left no gap to swing in - a Diamond Spider attacks for 1.7s and starts again ~1s later - and 31
+-- of 75 swings missed, 28 of them because we were standing clear at hitbox time. But its hit only
+-- lands 1.2-1.4s in: the first second of the wind-up, and everything after the hit, is free.
+G.FTAtkHit = G.FTAtkHit or { ['Crystal Spider'] = { min = 0.5, max = 0.85, n = 0 }, ['Diamond Spider'] = { min = 1.15, max = 1.45, n = 0 } }
+local Attack = { flag = setmetatable({}, { __mode = 'k' }), off = setmetatable({}, { __mode = 'k' }), dur = G.FTAtkDur, hit = nil, d0 = setmetatable({}, { __mode = 'k' }) }
 pcall(function()
 	if G.FTAttackWarnConn then
 		G.FTAttackWarnConn:Disconnect()
@@ -2747,7 +2753,21 @@ pcall(function()
 				local t0 = os.clock()
 				attackWarn[m] = t0
 				Attack.flag[m] = d
+				if Attack.off[m] and t0 - Attack.off[m] < 8 then
+					local k = (string.gsub(m.Name, '%d+$', ''))
+					G.FTAtkGap = G.FTAtkGap or {}
+					local g = G.FTAtkGap[k] or { min = 99, sum = 0, n = 0 }
+					g.min = math.min(g.min, t0 - Attack.off[m])
+					g.sum += t0 - Attack.off[m]
+					g.n += 1
+					G.FTAtkGap[k] = g
+				end
 				Attack.off[m] = nil
+				do
+					local _, myRoot = char()
+					local mr = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+					Attack.d0[m] = myRoot and mr and (myRoot.Position - mr.Position).Magnitude or nil
+				end
 				d.AncestryChanged:Once(function()
 					if Attack.flag[m] == d then
 						Attack.flag[m] = nil
@@ -2769,6 +2789,62 @@ local ATTACK_WINDOW = 1.0 -- seconds from "Attacking" until the swing is over (w
 -- and a Prismarine Spider's up to 4s. Going back in after a flat 1.0s walked into every Diamond
 -- Spider hit. So: while the flag is up, the longest this kind has ever kept it up; once it is
 -- gone, a moment after it went.
+Attack.hit = G.FTAtkHit
+-- Measured (23 Diamond Spider attacks): started with us 16+ studs away it is a SPIT - released 0.63-
+-- 0.72s in, aimed at where we stand right then, flying 100 studs/s; started closer it is a BITE that
+-- lands 1.15-1.45s in. A spit from under ~20 studs cannot be side-stepped (the hit is decided on
+-- the server before our step gets there): 4 of 5 hits in one run were exactly that.
+if Attack.hit['Diamond Spider'] then
+	Attack.hit['Diamond Spider'].far = { d = 15, min = 0.6, max = 0.75 }
+end
+-- a mob near us that is about to shoot (position), so the caller can get out to dodging range
+function Attack.rangedThreat(radius)
+	local _, hrp = char()
+	if not hrp then
+		return nil
+	end
+	local now = os.clock()
+	for m, t in pairs(attackWarn) do
+		local hw = Attack.hit[(string.gsub(m.Name, '%d+$', ''))]
+		local far = hw and hw.far
+		if far and (Attack.d0[m] or 0) >= far.d - 2 and now - t < far.max + 0.1 then
+			local r = m.Parent and (m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart)
+			if r and (r.Position - hrp.Position).Magnitude < radius then
+				return r.Position
+			end
+		end
+	end
+	return nil
+end
+task.spawn(function()
+	-- learn it: we lost health while exactly one mob within 16 studs was mid-attack
+	local last
+	while alive do
+		task.wait()
+		local _, hrp, hum = char()
+		if hrp and hum then
+			if last and hum.Health < last - 1 and hum.Health > 0 then
+				local now = os.clock()
+				local n, kk, age = 0, nil, nil
+				for m, t in pairs(attackWarn) do
+					local r = m.Parent and (m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart)
+					if r and (r.Position - hrp.Position).Magnitude <= 16 then
+						n += 1
+						kk, age = (string.gsub(m.Name, '%d+$', '')), now - t
+					end
+				end
+				if n == 1 and not (Attack.hit[kk] and Attack.hit[kk].far) and age > 0.15 and age < math.max(1.2, (Attack.dur[kk] or 0) + 0.3) then
+					local w = Attack.hit[kk] or { min = age, max = age, n = 0 }
+					w.min, w.max, w.n = math.min(w.min, age), math.max(w.max, age), w.n + 1
+					Attack.hit[kk] = w
+				end
+			end
+			last = hum.Health
+		else
+			last = nil
+		end
+	end
+end)
 function Attack.ends(m, t)
 	local off = Attack.off[m]
 	if off and off >= t then
@@ -2896,13 +2972,27 @@ local function mobList()
 		end
 	end
 	if filter == 'Any' then
-		local small = {}
+		-- (and nothing standing within 45 studs of one, while there is anything else to fight:
+		-- its area attacks hit us there whatever we do)
+		local small, clear = {}, {}
 		for _, e in ipairs(list) do
 			if not e.big then
 				small[#small + 1] = e
+				local ok = true
+				for _, b in ipairs(list) do
+					if b.big and (b.r.Position - e.r.Position).Magnitude < 45 then
+						ok = false
+						break
+					end
+				end
+				if ok then
+					clear[#clear + 1] = e
+				end
 			end
 		end
-		if #small > 0 then
+		if #clear > 0 then
+			list = clear
+		elseif #small > 0 then
 			list = small
 		end
 	end
@@ -3292,6 +3382,32 @@ function Hazard.step()
 			end)
 			if ok and pos then
 				e.from = e.from or pos
+				if not e.done and not e.fast and now - e.t < 0.3 then
+					-- (waiting to see it fly 6 studs first cost 0.06s+ of a 0.2-0.3s flight)
+					local bv = x:FindFirstChildWhichIsA('BodyVelocity', true)
+					if bv and bv.Velocity.Magnitude >= 40 then
+						e.fast = true
+						local dir = bv.Velocity.Unit
+						local rel = me - pos
+						local along = rel:Dot(dir)
+						if along > 0 and along < 80 and (rel - dir * along).Magnitude < 7 and mobsNear(pos, 30) > 0 then
+							local perp = dir:Cross(Vector3.yAxis)
+							if perp.Magnitude < 0.1 then
+								perp = hrp.CFrame.RightVector
+							end
+							perp = (perp * Vector3.new(1, 0, 1)).Unit
+							if rel:Dot(perp) < 0 then
+								perp = -perp
+							end
+							Hazard.last = now
+							e.done = true
+							if Hazard.sidestep(hrp, perp) then
+								Hazard.n.proj += 1
+								setStatus(('dodged a projectile (%s)'):format(x.Name))
+							end
+						end
+					end
+				end
 				if e.p and now > e.at and not e.done then
 					local v = (pos - e.p) / (now - e.at)
 					local sp = v.Magnitude
@@ -3470,6 +3586,19 @@ local function fightOnce(forced)
 	-- scythe's hitbox, from 30 studs out, missed 4 swings in 5)
 	local UNSAFE_FROM, UNSAFE_TO = 0.22, 0.85 -- seconds into a mob's wind-up during which we must not be near it
 	local animConn
+	-- our own "Attacking" flag appears when the server has accepted a swing
+	local ownAtkAt, ownAtkConn = 0, nil
+	pcall(function()
+		local c0 = char()
+		local st = c0 and c0:FindFirstChild('Status')
+		if st then
+			ownAtkConn = st.ChildAdded:Connect(function(d)
+				if d.Name == 'Attacking' then
+					ownAtkAt = os.clock()
+				end
+			end)
+		end
+	end)
 	pcall(function()
 		local _, _, myHum = char()
 		local animator = myHum and myHum:FindFirstChildOfClass('Animator')
@@ -3489,7 +3618,18 @@ local function fightOnce(forced)
 			local r = m.Parent and mobRoot(m)
 			if r and target.r.Parent and (r.Position - target.r.Position).Magnitude <= math.max(reach + 10, 22) then
 				local age = at - t
-				if age > UNSAFE_FROM and at < math.max(t + UNSAFE_TO, Attack.ends(m, t)) then
+				local hw = Attack.hit[(string.gsub(m.Name, '%d+$', ''))]
+				if hw then
+					-- (known kind: only the moment its hit lands is off limits)
+					local d0 = Attack.d0[m] or 0
+					local far = hw.far
+					if not (far and d0 > far.d + 2) and age > hw.min - 0.2 and age < hw.max + 0.12 then
+						return false
+					end
+					if far and d0 >= far.d - 2 and age > far.min - 0.25 and age < far.max + 0.15 then
+						return false -- (its shot is aimed about now: not next to it)
+					end
+				elseif age > UNSAFE_FROM and at < math.max(t + UNSAFE_TO, Attack.ends(m, t)) then
 					return false
 				end
 			end
@@ -3513,11 +3653,14 @@ local function fightOnce(forced)
 			pend.hp = target.h.Health
 		elseif now <= pend.at + pend.hd + 0.05 then
 			pend.far = math.max(pend.far or 0, gap)
+			if not strikeSafe(pend.reach, 0) then
+				pend.unsafe = true
+			end
 			pend.nearest = math.min(pend.nearest or 999, gap)
 		end
 		if flush or now > pend.at + pend.hd + 0.45 then
 			local log = G.FTSwingLog
-			log[#log + 1] = ('%s#%d ht=%.2f gap %.0f..%.0f reach=%.0f %s'):format(target.m.Name:gsub('%d+$', ''), pend.idx, pend.ht,
+			log[#log + 1] = ('%s %s#%d ht=%.2f gap %.0f..%.0f reach=%.0f %s'):format((pend.why or '?') .. (pend.unsafe and ' UNSAFE' or '') .. (ownAtkAt >= pend.at - pend.ht - 0.05 and (' acc%.2f'):format(ownAtkAt - (pend.at - pend.ht)) or ' REJECTED') .. (' tool=' .. tostring(pend.tool)), target.m.Name:gsub('%d+$', ''), pend.idx, pend.ht,
 				pend.nearest or -1, pend.far or -1, pend.reach, target.h.Health < (pend.hp or target.h.Health) - 0.5 and 'HIT' or 'miss')
 			if #log > 80 then
 				table.remove(log, 1)
@@ -3617,7 +3760,7 @@ local function fightOnce(forced)
 		local ht = combat and type(combat.HitboxTiming) == 'table' and tonumber(combat.HitboxTiming[idx]) or 0.27
 		local hd = combat and type(combat.HitboxDuration) == 'table' and tonumber(combat.HitboxDuration[idx]) or 0.1
 		STRIKE_LEAD = ht >= 0.6 and 0.42 or 0.12
-		if hitRun and not (strikeSafe(reach, ht - STRIKE_LEAD) and strikeSafe(reach, ht + hd)) then
+		if hitRun and not (strikeSafe(reach, ht - STRIKE_LEAD) and strikeSafe(reach, ht - STRIKE_LEAD / 2) and strikeSafe(reach, ht) and strikeSafe(reach, ht + hd)) then
 			return -- this swing's hitbox would come out while a mob's hit is landing: hold it a moment
 		end
 		if hitRun then
@@ -3648,11 +3791,10 @@ local function fightOnce(forced)
 			end
 			local waited = now - math.max(nextSwingAt, t0)
 			local engaged = (h.Position - tp).Magnitude <= reach + 30
-			if lateEnd then
-				if now + ht < lateEnd + 0.05 then
-					return -- our hitbox would come out while it is still attacking: start a bit later
-				end
-			elseif engaged and not (lastOff and now - lastOff < 0.6) and waited < 1.5 then
+			G.FTSwingWhy = lateEnd and ('answer%+.2f'):format(now + ht - lateEnd) or (lastOff and now - lastOff < 0.6) and ('follow%.2f'):format(now - lastOff)
+				or (not engaged and 'far') or 'blind'
+			-- (an attack in progress whose hit-moment our swing clears - checked above - is answered now)
+			if not lateEnd and engaged and not (lastOff and now - lastOff < 0.6) and waited < 1.5 then
 				return -- nothing to answer yet: wait for its next wind-up
 			end
 		end
@@ -3664,7 +3806,7 @@ local function fightOnce(forced)
 		nextSwingAt = now + math.max(cd, dur) + 0.05
 		strikeAt, strikeEnd = now + ht, now + ht + hd + (ht >= 0.6 and 0.22 or 0.1)
 		track(true) -- (close the books on the previous swing)
-		pend = { at = now + ht, hd = hd, ht = ht, idx = idx, reach = reach, hp = target.h.Health }
+		pend = { at = now + ht, hd = hd, ht = ht, idx = idx, reach = reach, hp = target.h.Health, why = hitRun and G.FTSwingWhy or 'n/a', tool = tool and tool.Parent and tool.Parent.ClassName or 'nil' }
 	end
 	local retargetAt, regroupAt = os.clock() + 1, 0
 	while alive and allowed() and target.m.Parent and target.h.Health > 0 and os.clock() - t0 < 45 do
@@ -3677,6 +3819,22 @@ local function fightOnce(forced)
 		if not forced and not strikeAt and os.clock() >= retargetAt then
 			retargetAt = os.clock() + 0.5
 			local _, h0 = char()
+			if h0 and not mobTooBig(target.h) then
+				-- a mini boss walked up to this fight: get out of its reach and pick another one
+				local _, around = mobsNear(h0.Position, 38)
+				local boss
+				for _, e in ipairs(around) do
+					if mobTooBig(e.h) and e.h.MaxHealth < 1e8 then
+						boss = e
+						break
+					end
+				end
+				if boss then
+					setStatus(('%s too close — moving the fight elsewhere'):format((string.gsub(boss.m.Name, '%d+$', ''))))
+					dodgeFrom(boss.r.Position, 48 - (boss.r.Position - h0.Position).Magnitude)
+					break
+				end
+			end
 			local near = mobList()[1]
 			if h0 and near and near.m ~= target.m and near.d + 8 < (h0.Position - target.r.Position).Magnitude then
 				target = near
@@ -3722,7 +3880,9 @@ local function fightOnce(forced)
 		local striking = hitRun and strikeAt and now >= strikeAt - STRIKE_LEAD and now <= strikeEnd
 		if striking and hrp and strikeSafe(reach, 0) and not (rem and rem > 0 and rem < 0.25) then
 			-- Our hitbox is (about to be) out and no hit is landing on us: be on the mob for it.
-			if not inRange then
+			-- (measured: standing still 2-5 studs off, every swing hit; with the mob lunging into / through
+			-- us mid-swing - gap under 1 - 12 of 30 misses. So hold the gap for the whole strike.)
+			if not inRange or (hrp.Position - target.r.Position).Magnitude - math.max(target.r.Size.X, target.r.Size.Z) / 2 < 2.5 then
 				hopIn(hrp, reach)
 			else
 				hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.r.Position.X, hrp.Position.Y, target.r.Position.Z))
@@ -3751,7 +3911,7 @@ local function fightOnce(forced)
 				end
 				-- (measured: a Diamond Spider runs after us for its whole 1.3s attack and lands the hit
 				-- 4 studs away, 10 hits in 4 minutes - one step at the start is not enough for those)
-				local w4 = attackThreat(14)
+				local w4 = attackThreat(14) or Attack.rangedThreat(24)
 				if w4 and os.clock() - (G.FTRedodgeAt or 0) > 0.2 then
 					G.FTRedodgeAt = os.clock()
 					dodgeFrom(w4, clearDist(w4))
@@ -3817,6 +3977,9 @@ local function fightOnce(forced)
 				task.wait()
 			end
 		end
+	end
+	if ownAtkConn then
+		ownAtkConn:Disconnect()
 	end
 	if animConn then
 		animConn:Disconnect()
