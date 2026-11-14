@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v104'
+local BUILD = 'forge-tools-v122'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -27,6 +27,7 @@ if type(G.SB2ForgeToolsUnload) == 'function' then
 	pcall(G.SB2ForgeToolsUnload)
 end
 G.SB2ForgeToolsLoaded = true
+G.FTTrips, G.FTTravel = {}, nil
 G.SB2ForgeToolsBuild = BUILD
 
 local alive = true
@@ -90,6 +91,9 @@ local defaults = {
 	enhanceMinChance = 0,
 	enhanceMaxLevel = 9,
 	raceStop = 'Legendary',
+	raceWant = {},
+	raceMine = 'No change',
+	raceFight = 'No change',
 	raceKeepSpins = 0,
 	sellAt = 90,
 	autoForge = false,
@@ -103,6 +107,13 @@ local defaults = {
 	autoCompleteQuests = false,
 	questBuy = false,
 	autoPickaxe = false,
+	autoSellRunes = false,
+	runeSellTier = 1,
+	runeSellEpic = false,
+	runeKeepTier = 3,
+	runeKeep = { ['Drain Edge'] = true, ['Briar Notch'] = true, ['Miner Shard'] = true },
+	autoLuckPotion = false,
+	autoMinerPotion = false,
 	tracers = false,
 	claimBoard = false,
 	autoBlock = false,
@@ -120,6 +131,8 @@ local defaults = {
 	autoMobs = false,
 	mobFilter = 'Any',
 	retreatHp = 45,
+	healTo = 60,
+	mineRocks = {},
 	maxMobHp = 80,
 	autoEquip = false,
 	tweenSpeed = 55,
@@ -1214,10 +1227,17 @@ end
 -- While we are on our way somewhere, G.FTTravel is where to. Dodges read it: a step away from a mob
 -- that is ahead of us used to throw us 16-30 studs back down the route, again and again.
 local function tweenTo(cf, opts)
-	local prev = G.FTTravel
-	G.FTTravel = typeof(cf) == 'CFrame' and cf.Position or cf
+	local trip = { dest = typeof(cf) == 'CFrame' and cf.Position or cf }
+	G.FTTrips = G.FTTrips or {}
+	table.insert(G.FTTrips, trip)
+	G.FTTravel = trip.dest
 	local ok, a, b = pcall(tweenToRaw, cf, opts)
-	G.FTTravel = prev
+	local at = table.find(G.FTTrips, trip)
+	if at then
+		table.remove(G.FTTrips, at)
+	end
+	-- (back to the trip this one was a leg of, if any; never to one that has already ended)
+	G.FTTravel = G.FTTrips[1] and G.FTTrips[1].dest or nil
 	if not ok then
 		error(a, 0)
 	end
@@ -1503,7 +1523,7 @@ do
 	-- "Avoid mobs that killed me" is on.
 	function Deadly.big(h)
 		local _, _, hum = char()
-		return hum ~= nil and h ~= nil and h.MaxHealth < 1e8 and h.MaxHealth > hum.MaxHealth * 12
+		return hum ~= nil and h ~= nil and h.MaxHealth < 1e8 and (h.MaxHealth > math.min(hum.MaxHealth * 8, 5000) or (h.Parent ~= nil and string.find(h.Parent.Name, 'Prismarine', 1, true) ~= nil))
 	end
 	function Deadly.avoid(m)
 		return Deadly.is(m) or Deadly.big(m:FindFirstChildOfClass('Humanoid'))
@@ -1624,10 +1644,52 @@ local function rockList()
 					if taken == 1 then
 						continue -- someone is at this rock: it is theirs
 					end
-					list[#list + 1] = { m = m, hb = hb, d = d, zone = zone.Name, danger = danger,
+					list[#list + 1] = { m = m, hb = hb, d = d, zone = zone.Name, danger = danger, maxHp = tonumber(m:GetAttribute('MaxHealth')) or hp,
 						score = d + ((climb > 10 and d < 80) and climb * 4 or 0) + math.min(danger, 3) * 35 + taken * 150 + want }
 				end
 			end
+		end
+	end
+	-- Rock selector: the picked kinds come first, wherever they are. With none of them to be had,
+	-- the next best kind is the one with the most health below the picked ones (huge > large >
+	-- medium > small), and kinds bigger than the picked ones come last.
+	local sel = type(settings.mineRocks) == 'table' and next(settings.mineRocks) and settings.mineRocks or nil
+	if sel and not G.FTQuestRock then
+		local ref = 0
+		for _, e in ipairs(list) do
+			if sel[e.m.Name] then
+				ref = math.max(ref, e.maxHp)
+			end
+		end
+		if ref == 0 then
+			ref = MineHooks.selRef or math.huge -- (none of the picked kind around right now: remember how big it is)
+		else
+			MineHooks.selRef = ref
+		end
+		local kinds, order = {}, {}
+		for _, e in ipairs(list) do
+			if not sel[e.m.Name] and not kinds[e.m.Name] then
+				kinds[e.m.Name] = e.maxHp
+				order[#order + 1] = e.m.Name
+			end
+		end
+		table.sort(order, function(a, b)
+			local ha, hb2 = kinds[a], kinds[b]
+			local ua, ub = ha <= ref, hb2 <= ref
+			if ua ~= ub then
+				return ua
+			end
+			if ua then
+				return ha > hb2
+			end
+			return ha < hb2
+		end)
+		local tier = {}
+		for i, name in ipairs(order) do
+			tier[name] = i
+		end
+		for _, e in ipairs(list) do
+			e.score += (tier[e.m.Name] or 0) * 100000
 		end
 	end
 	table.sort(list, function(a, b)
@@ -1684,14 +1746,34 @@ local function mineOnce()
 		end
 		return th
 	end
+	local function why(txt)
+		G.FTMineLog = G.FTMineLog or {}
+		local _, me = char()
+		local off = me and (me.Position - target.hb.Position)
+		local log = G.FTMineLog
+		log[#log + 1] = ('%s %s hp=%s | %s | horiz %.1f vert %.1f half %.1f'):format(os.date('%H:%M:%S'), target.m.Name, tostring(target.m:GetAttribute('Health')),
+			txt, off and (off * Vector3.new(1, 0, 1)).Magnitude or -1, off and off.Y or 0, math.max(target.hb.Size.X, target.hb.Size.Z) / 2)
+		if #log > 120 then
+			table.remove(log, 1)
+		end
+	end
 	local function handleThreat()
 		local th = threatNow()
 		if not th then
 			return false
 		end
-		unreachable[target.m] = os.clock() + 60 -- come back to this rock once the mob is dealt with / gone
+		why('threat ' .. tostring(th.m and th.m.Name) .. (' %.0f studs from us'):format(th.d or -1))
+		-- (measured: 10 of 14 rocks were left this way, each for one spider, and the next rock was 100-200
+		-- studs off. Only a kind we must keep away from is a reason to leave the rock alone for a while.)
+		if Deadly.avoid(th.m) or (th.h and Deadly.big(th.h)) then
+			unreachable[target.m] = os.clock() + 60
+		end
+		local tD = os.clock()
 		if MineHooks.defend then
 			MineHooks.defend(th)
+		end
+		if os.clock() - tD < 1.5 then
+			unreachable[target.m] = math.max(unreachable[target.m] or 0, os.clock() + 30)
 		end
 		return true
 	end
@@ -1720,7 +1802,7 @@ local function mineOnce()
 		end
 		return takenNow
 	end
-	local okGo, why = tweenTo(standNear(target.hb, 2), { alt = alt, abort = function()
+	local okGo, whyGo = tweenTo(standNear(target.hb, 2), { alt = alt, abort = function()
 		return not (settings.autoMine or G.FTQuestWantsOre) or not target.m.Parent or threatNow() ~= nil or takenByOther()
 	end, onRelay = function()
 		setStatus(('mining %s (%.0f studs) — long route, walking via known spots'):format(target.m.Name, target.d))
@@ -1729,16 +1811,18 @@ local function mineOnce()
 		return true
 	end
 	if takenNow then
+		why('taken by another player')
 		setStatus(('someone else got to that %s first — picking another'):format(target.m.Name))
 		return true
 	end
 	if not okGo then
 		local _, myh = char()
-		if settings.autoMine and target.m.Parent and myh and why ~= 'wedged'
+		why('travel failed: ' .. tostring(whyGo) .. ' nav=' .. tostring(G.FTNavDbg))
+		if settings.autoMine and target.m.Parent and myh and whyGo ~= 'wedged'
 			and (myh.Position - target.hb.Position).Magnitude > math.max(target.hb.Size.X, target.hb.Size.Z) / 2 + 10 then
 			local fails = (unreachFails[target.m] or 0) + 1
 			unreachFails[target.m] = fails
-			if why == 'nopath' then
+			if whyGo == 'nopath' then
 				-- Third rock in a row with no route at all, from the same place: it is not the rocks,
 				-- it is where we are standing. Get out, and forget what was ruled out from in here.
 				local sp = MineHooks.strandPos
@@ -1773,7 +1857,7 @@ local function mineOnce()
 				end
 			else
 				unreachable[target.m] = os.clock() + math.min(45 * fails, 300)
-				setStatus('cannot reach ' .. target.m.Name .. ' on foot — skipping for now [' .. tostring(why) .. ': ' .. tostring(G.FTNavDbg) .. ']')
+				setStatus('cannot reach ' .. target.m.Name .. ' on foot — skipping for now [' .. tostring(whyGo) .. ': ' .. tostring(G.FTNavDbg) .. ']')
 			end
 		end
 		return true
@@ -1809,7 +1893,8 @@ local function mineOnce()
 			if noDamage[target.m.Name] >= 3 then
 				tooStrong[target.m.Name] = true
 				setStatus(target.m.Name .. ' too strong for your pickaxe — skipping that type')
-			else
+				else
+				why('no damage 4s')
 				setStatus(('no damage on %s from %.0f studs away (rock is %.0f wide) — trying another'):format(
 					target.m.Name, away, math.max(target.hb.Size.X, target.hb.Size.Z)))
 			end
@@ -1819,10 +1904,37 @@ local function mineOnce()
 		if hrp then
 			local half = math.max(target.hb.Size.X, target.hb.Size.Z) / 2
 			local off = (hrp.Position - target.hb.Position) * Vector3.new(1, 0, 1)
+			local topY = target.hb.Position.Y + target.hb.Size.Y / 2
+			if off.Magnitude < half and hrp.Position.Y - 3 > topY - 2.5 and os.clock() - (MineHooks.offTopAt or 0) > 1 then
+				-- we are ON the rock (measured: horiz 0.7, 3 studs above its top, no damage for 4s,
+				-- four times on the same boulder). Get down beside it.
+				MineHooks.offTopAt = os.clock()
+				local rp = RaycastParams.new()
+				rp.FilterType = Enum.RaycastFilterType.Exclude
+				rp.FilterDescendantsInstances = { LocalPlayer.Character, workspace:FindFirstChild('Living') }
+				rp.RespectCanCollide = true
+				local base = off.Magnitude > 0.5 and math.atan2(off.Z, off.X) or 0
+				for i = 0, 7 do
+					local a = base + (i % 2 == 0 and 1 or -1) * math.ceil(i / 2) * math.pi / 4
+					local at = target.hb.Position + Vector3.new(math.cos(a), 0, math.sin(a)) * (half + 2.5)
+					local hit = workspace:Raycast(Vector3.new(at.X, topY + 3, at.Z), Vector3.new(0, -(target.hb.Size.Y + 30), 0), rp)
+					if hit and hit.Position.Y < topY - 3 and not hit.Instance:IsDescendantOf(target.m) and not Lava.at(hit.Position + Vector3.new(0, 3, 0)) then
+						local stand = hit.Position + Vector3.new(0, 3, 0)
+						why('was on top of the rock - stepping down beside it')
+						hrp.CFrame = CFrame.lookAt(stand, Vector3.new(target.hb.Position.X, stand.Y, target.hb.Position.Z))
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						lastChange = os.clock()
+						break
+					end
+				end
+			end
 			if off.Magnitude > half + 16 then
+				why('knocked far away')
 				break -- knocked far away
-			elseif off.Magnitude > half + 3 and hum then
-				hum:MoveTo(Vector3.new(target.hb.Position.X, hrp.Position.Y - 3, target.hb.Position.Z)) -- step in
+			elseif off.Magnitude > half + 2.5 and hum then
+				-- step in: to the rock's edge, not its middle (walking at the middle climbed onto it)
+				local edge = target.hb.Position + off.Unit * (half + 1.5)
+				hum:MoveTo(Vector3.new(edge.X, hrp.Position.Y - 3, edge.Z))
 			end
 		end
 		if handleThreat() then
@@ -2735,7 +2847,8 @@ G.FTAtkDur = G.FTAtkDur or {}
 -- left no gap to swing in - a Diamond Spider attacks for 1.7s and starts again ~1s later - and 31
 -- of 75 swings missed, 28 of them because we were standing clear at hitbox time. But its hit only
 -- lands 1.2-1.4s in: the first second of the wind-up, and everything after the hit, is free.
-G.FTAtkHit = G.FTAtkHit or { ['Crystal Spider'] = { min = 0.5, max = 0.85, n = 0 }, ['Diamond Spider'] = { min = 1.15, max = 1.45, n = 0 } }
+G.FTAtkHit3 = G.FTAtkHit3 or { ['Crystal Spider'] = { min = 0.5, max = 0.85, n = 0, seed = true }, ['Diamond Spider'] = { min = 1.15, max = 1.45, n = 0, seed = true } }
+G.FTAtkHit = G.FTAtkHit3
 local Attack = { flag = setmetatable({}, { __mode = 'k' }), off = setmetatable({}, { __mode = 'k' }), dur = G.FTAtkDur, hit = nil, d0 = setmetatable({}, { __mode = 'k' }) }
 pcall(function()
 	if G.FTAttackWarnConn then
@@ -2835,7 +2948,22 @@ task.spawn(function()
 				end
 				if n == 1 and not (Attack.hit[kk] and Attack.hit[kk].far) and age > 0.15 and age < math.max(1.2, (Attack.dur[kk] or 0) + 0.3) then
 					local w = Attack.hit[kk] or { min = age, max = age, n = 0 }
-					w.min, w.max, w.n = math.min(w.min, age), math.max(w.max, age), w.n + 1
+					w.s = w.s or {}
+					w.s[#w.s + 1] = age
+					if #w.s > 60 then
+						table.remove(w.s, 1)
+					end
+					w.n += 1
+					if #w.s >= 8 then
+						-- (one stray sample - damage from something else at that moment - must not move it)
+						local sorted = table.clone(w.s)
+						table.sort(sorted)
+						w.min = sorted[math.max(1, math.floor(#sorted * 0.15 + 0.5))]
+						w.max = sorted[math.min(#sorted, math.ceil(#sorted * 0.85))]
+					elseif w.n == #w.s then
+						-- (a kind with no measured window yet: what we have seen so far)
+						w.min, w.max = math.min(w.min, age), math.max(w.max, age)
+					end
 					Attack.hit[kk] = w
 				end
 			end
@@ -2923,7 +3051,7 @@ end
 -- it is picked by name as the Target.
 local function mobTooBig(h)
 	local _, _, hum = char()
-	return hum ~= nil and h.MaxHealth > hum.MaxHealth * 12
+	return hum ~= nil and (h.MaxHealth > math.min(hum.MaxHealth * 8, 5000) or (h.Parent ~= nil and string.find(h.Parent.Name, 'Prismarine', 1, true) ~= nil))
 end
 
 local function mobList()
@@ -3021,7 +3149,7 @@ local function retreatAndHeal()
 			return
 		end
 		local pct = hum.MaxHealth > 0 and hum.Health / hum.MaxHealth * 100 or 100
-		if pct >= 90 then
+		if pct >= math.clamp(tonumber(settings.healTo) or 60, 5, 100) then
 			return
 		end
 		setStatus(('healing at spawn (%.0f%%)'):format(pct))
@@ -3346,6 +3474,63 @@ function Hazard.sidestep(hrp, perp)
 	end
 	return false
 end
+-- Several shooters at once (4 Diamond Spiders): side-stepping one shot at a time is not enough, each
+-- spit is aimed at where we stand when it is released. What a shot cannot hit is something moving
+-- across its line the whole time it is in the air. So while any shooter near us is in its release
+-- window we keep moving - 6 studs every 0.08s - in the direction that crosses ALL their lines best.
+function Hazard.strafe(hrp, now)
+	if now - (Hazard.strafeAt or 0) < 0.08 or now < (G.FTStrikeUntil or 0) then
+		return
+	end
+	local me = hrp.Position
+	local lines
+	for m, t in pairs(attackWarn) do
+		local hw = Attack.hit[(string.gsub(m.Name, '%d+$', ''))]
+		local far = hw and hw.far
+		local age = now - t
+		if far and (Attack.d0[m] or 0) >= far.d - 2 and age > far.min - 0.15 and age < far.max + 0.4 then
+			local r = m.Parent and (m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart)
+			local off = r and (me - r.Position) * Vector3.new(1, 0, 1)
+			if off and off.Magnitude < 70 and off.Magnitude > 1 then
+				lines = lines or {}
+				lines[#lines + 1] = off.Unit
+			end
+		end
+	end
+	if not lines then
+		return
+	end
+	Hazard.strafeAt = now
+	local c = char()
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { c, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+	local best, bestScore, bestDir
+	for i = 0, 7 do
+		local a = i / 8 * math.pi * 2
+		local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+		local score = math.huge
+		for _, u in ipairs(lines) do
+			score = math.min(score, math.abs(dir.X * u.Z - dir.Z * u.X)) -- how squarely it crosses that line
+		end
+		if Hazard.strafeDir and now - (Hazard.strafeLast or 0) < 0.5 then
+			score += dir:Dot(Hazard.strafeDir) * 0.3 -- keep going the same way: no jittering on the spot
+		end
+		if not bestScore or score > bestScore then
+			local move = dir * 6
+			local floor = not workspace:Raycast(me, move, rp) and workspace:Raycast(me + move + Vector3.new(0, 8, 0), Vector3.new(0, -30, 0), rp)
+			if floor and math.abs(floor.Position.Y + 3 - me.Y) < 6 and not Lava.at(floor.Position + Vector3.new(0, 3, 0)) then
+				best, bestScore, bestDir = floor.Position + Vector3.new(0, 3, 0), score, dir
+			end
+		end
+	end
+	if best then
+		hrp.CFrame = hrp.CFrame.Rotation + best
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		Hazard.strafeDir, Hazard.strafeLast = bestDir, now
+		Hazard.n.strafe = (Hazard.n.strafe or 0) + 1
+	end
+end
 function Hazard.step()
 	local _, hrp, hum = char()
 	if not hrp or not hum or hum.Health <= 0 then
@@ -3353,6 +3538,8 @@ function Hazard.step()
 	end
 	local now = os.clock()
 	local me = hrp.Position
+	Hazard.strafe(hrp, now)
+	me = hrp.Position
 	for x, e in pairs(Hazard.seen) do
 		if not x.Parent or now - e.t > 6 then
 			Hazard.seen[x] = nil
@@ -3457,7 +3644,7 @@ task.spawn(function()
 			local FC = controller('ForgeController')
 			forging = (FC and FC.ForgeActive) and true or false
 		end
-		if not forging and next(Hazard.seen) and (settings.autoMine or settings.autoMobs or settings.autoAbyss
+		if not forging and (next(Hazard.seen) or next(attackWarn)) and (settings.autoMine or settings.autoMobs or settings.autoAbyss
 			or settings.autoCompleteQuests or QS.wantMobs or QS.wantMine) then
 			pcall(Hazard.step)
 		end
@@ -3612,18 +3799,22 @@ local function fightOnce(forced)
 		end
 	end)
 	-- Safe to be next to the target `ahead` seconds from now? (looks at every mob winding up near it)
-	local function strikeSafe(reach, ahead)
+	local function strikeSafe(reach, ahead, margin)
+		margin = margin or 0.2
 		local at = os.clock() + (ahead or 0)
 		for m, t in pairs(attackWarn) do
 			local r = m.Parent and mobRoot(m)
 			if r and target.r.Parent and (r.Position - target.r.Position).Magnitude <= math.max(reach + 10, 22) then
 				local age = at - t
 				local hw = Attack.hit[(string.gsub(m.Name, '%d+$', ''))]
+				if hw and not (hw.seed or (hw.s and #hw.s >= 8)) then
+					hw = nil -- (too few samples to trust yet: its whole attack counts as unsafe)
+				end
 				if hw then
 					-- (known kind: only the moment its hit lands is off limits)
 					local d0 = Attack.d0[m] or 0
 					local far = hw.far
-					if not (far and d0 > far.d + 2) and age > hw.min - 0.2 and age < hw.max + 0.12 then
+					if not (far and d0 > far.d + 2) and age > hw.min - margin and age < hw.max + 0.12 then
 						return false
 					end
 					if far and d0 >= far.d - 2 and age > far.min - 0.25 and age < far.max + 0.15 then
@@ -3878,11 +4069,13 @@ local function fightOnce(forced)
 		end
 		local inRange = hrp and (hrp.Position - target.r.Position).Magnitude <= reach - 1 + math.max(target.r.Size.X, target.r.Size.Z) / 2
 		local striking = hitRun and strikeAt and now >= strikeAt - STRIKE_LEAD and now <= strikeEnd
-		if striking and hrp and strikeSafe(reach, 0) and not (rem and rem > 0 and rem < 0.25) then
+		if striking and hrp and (strikeSafe(reach, 0) or (now <= strikeAt + 0.2 and strikeSafe(reach, 0, 0.08))) and not (rem and rem > 0 and rem < 0.25) then
 			-- Our hitbox is (about to be) out and no hit is landing on us: be on the mob for it.
+			G.FTStrikeUntil = strikeEnd -- (the strafe above leaves us alone while our own hitbox is out)
 			-- (measured: standing still 2-5 studs off, every swing hit; with the mob lunging into / through
 			-- us mid-swing - gap under 1 - 12 of 30 misses. So hold the gap for the whole strike.)
-			if not inRange or (hrp.Position - target.r.Position).Magnitude - math.max(target.r.Size.X, target.r.Size.Z) / 2 < 2.5 then
+			local gapNow = (hrp.Position - target.r.Position).Magnitude - math.max(target.r.Size.X, target.r.Size.Z) / 2
+				if not inRange or gapNow < 2.5 or gapNow > 5.5 then
 				hopIn(hrp, reach)
 			else
 				hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.r.Position.X, hrp.Position.Y, target.r.Position.Z))
@@ -4032,7 +4225,7 @@ MineHooks.defend = function(th)
 	end
 	local _, _, hum = char()
 	local pct = hum and hum.MaxHealth > 0 and hum.Health / hum.MaxHealth * 100 or 100
-	if pct < math.max(40, tonumber(settings.retreatHp) or 0) then
+	if (tonumber(settings.retreatHp) or 0) > 0 and pct < math.max(40, tonumber(settings.retreatHp) or 0) then
 		local spawn = workspace:FindFirstChild('SpawnLocation')
 		setStatus(('low health while mining (%.0f%%) — keeping clear of mobs to heal'):format(pct))
 		-- (Measured: planning the 370-stud route to spawn took ~3s standing next to the spider, and
@@ -4045,7 +4238,7 @@ MineHooks.defend = function(th)
 				return
 			end
 			local pk = humk.MaxHealth > 0 and humk.Health / humk.MaxHealth * 100 or 100
-			if pk >= 60 then
+			if pk >= math.min(60, math.clamp(tonumber(settings.healTo) or 60, 5, 100)) then
 				return
 			end
 			local _, nearK = mobsNear(hk.Position, 30)
@@ -4079,7 +4272,7 @@ MineHooks.defend = function(th)
 				return
 			end
 			local p2 = h2.MaxHealth > 0 and h2.Health / h2.MaxHealth * 100 or 100
-			if p2 >= 90 then
+			if p2 >= math.clamp(tonumber(settings.healTo) or 60, 5, 100) then
 				return
 			end
 			if mineThreat() and p2 < 40 then
@@ -4097,6 +4290,17 @@ MineHooks.defend = function(th)
 	if mobFightable(th) then
 		setStatus(('%s is on me — fighting back'):format(th.m.Name))
 		fightOnce(th)
+		-- (the fight hands back after a dodge, a retarget or 45s: while it is still alive and still
+		-- around, it is not over - going back to the rock just brought it along)
+		for _ = 1, 5 do
+			local _, hf, humf = char()
+			if not alive or not hf or not humf or humf.Health <= 0 or lowHp() or humf.Health < humf.MaxHealth * 0.55 or not th.m.Parent or th.h.Health <= 0
+				or (th.r.Position - hf.Position).Magnitude > 45 or not mobFightable(th) then
+				break
+			end
+			setStatus(('finishing %s before going back to the rock'):format(th.m.Name))
+			fightOnce(th)
+		end
 	else
 		setStatus(th.m.Name .. ' is too strong to fight — moving to another rock')
 		pcall(dodgeFrom, th.r.Position)
@@ -5585,12 +5789,139 @@ end
 
 bindToggle(FarmBox, 'FTAutoMine', 'autoMine', 'Auto mine', 'Tweens to the nearest rock and mines it. Rock types your pickaxe cannot damage are skipped.')
 local zoneDD = bindDropdown(FarmBox, 'FTMineZone', 'mineZone', 'Mine in', zoneNames())
+local function rockNames()
+	local hp, out = {}, {}
+	local rocks = workspace:FindFirstChild('Rocks')
+	for _, zone in ipairs(rocks and rocks:GetChildren() or {}) do
+		for _, sp in ipairs(zone:GetChildren()) do
+			local m = sp:FindFirstChildWhichIsA('Model')
+			if m and m:FindFirstChild('Hitbox') and not hp[m.Name] then
+				hp[m.Name] = tonumber(m:GetAttribute('MaxHealth')) or 0
+				out[#out + 1] = m.Name
+			end
+		end
+	end
+	for name in pairs(type(settings.mineRocks) == 'table' and settings.mineRocks or {}) do
+		if not hp[name] then
+			hp[name] = 0
+			out[#out + 1] = name
+		end
+	end
+	table.sort(out, function(a, b)
+		return hp[a] > hp[b]
+	end)
+	return out
+end
+local rockDD
+pcall(function()
+	rockDD = FarmBox:AddDropdown('FTMineRocks', { Text = 'Mine these rocks first', Values = rockNames(), Multi = true, Default = settings.mineRocks, AllowNull = true,
+		Tooltip = 'Works with Auto mine. Picked rocks are mined before anything else, however far. When none of them is up, it takes the next best kind: the one with the most health below your pick (huge > large > medium > small). Nothing picked = nearest rock, as before. Listed from most health to least.' })
+	rockDD:OnChanged(function(v)
+		local out = {}
+		for k, on in pairs(type(v) == 'table' and v or {}) do
+			if on then
+				out[k] = true
+			end
+		end
+		settings.mineRocks = out
+		MineHooks.selRef = nil
+		save()
+	end)
+end)
 bindToggle(FarmBox, 'FTSkipLucky', 'skipLucky', 'Skip Lucky Blocks', 'Lucky Blocks have 10,000 HP.')
+bindToggle(FarmBox, 'FTAutoSellRunes', 'autoSellRunes', 'Auto sell runes', 'Sells runes from wherever you are (raids too), as they come in. Only Common, Uncommon and Rare runes up to the tier below, and never a kind picked under "Runes to keep", an Epic or rarer rune, or a favorited one.')
+bindToggle(FarmBox, 'FTRuneSellEpic', 'runeSellEpic', 'Also sell Epic and rarer runes', 'Off: only Common, Uncommon and Rare runes are sold. On: Epic and rarer runes are sold too, unless their kind is picked under "Runes to keep". Starts off every time the script loads.')
+bindSlider(FarmBox, 'FTRuneKeepTier', 'runeKeepTier', 'Keep those kinds from tier', 1, 3, 'The kinds picked under "Runes to keep" are only kept at this tier or higher: at 3, their tier I and II copies are sold like any other rune.')
+bindSlider(FarmBox, 'FTRuneSellTier', 'runeSellTier', 'Sell runes up to tier', 1, 5, 'Tier 1 = Frost Speck, Rage Mark, Ward Patch and the like. Runes of a higher tier than this are kept.')
+pcall(function()
+	local names, seen = {}, {}
+	pcall(function()
+		for id, def in pairs(require(RS.Shared.Data.Runes).Runes) do
+			if type(def) == 'table' then
+				local k = (string.gsub(tostring(def.Name or id), '%s+[IVX]+$', ''))
+				if not seen[k] then
+					seen[k] = true
+					names[#names + 1] = k
+				end
+			end
+		end
+	end)
+	for k in pairs(type(settings.runeKeep) == 'table' and settings.runeKeep or {}) do
+		if not seen[k] then
+			seen[k] = true
+			names[#names + 1] = k
+		end
+	end
+	table.sort(names)
+	local dd = FarmBox:AddDropdown('FTRuneKeep', { Text = 'Runes to keep', Values = names, Multi = true, Default = settings.runeKeep, AllowNull = true,
+		Tooltip = 'These kinds are never sold, whatever their tier. Every other rune below Epic (and within the tier above) is sold - all copies of it.' })
+	dd:OnChanged(function(v)
+		local out = {}
+		for k, on in pairs(type(v) == 'table' and v or {}) do
+			if on then
+				out[k] = true
+			end
+		end
+		settings.runeKeep = out
+		save()
+	end)
+end)
+bindToggle(FarmBox, 'FTAutoLuckPotion', 'autoLuckPotion', 'Auto luck potions (buy + drink)', 'Keeps a Luck Potion running: drinks them up to the 1 hour cap (never past it). Buys back up to 10 (the most the shop lets you hold) whenever it is in town anyway, and makes the trip to the stall when you run out.')
+bindToggle(FarmBox, 'FTAutoMinerPotion', 'autoMinerPotion', 'Auto miner potions (buy + drink)', 'Keeps a Miner Potion running: drinks them up to the 15 minute cap (3 potions - more would be wasted). Buys back up to 10 (the most the shop lets you hold) whenever it is in town anyway, and makes the trip to the stall when you run out.')
 bindToggle(FarmBox, 'FTAutoSell', 'autoSell', 'Auto sell ores', 'Sells your ores at Greedy Cey when the bag reaches the % below.')
 bindSlider(FarmBox, 'FTSellAt', 'sellAt', 'Sell when bag is % full', 20, 100)
 bindToggle(FarmBox, 'FTAutoSellGear', 'autoSellGear', 'Auto sell spare gear', 'Sells weapons and armor at Marbles once 3+ spares pile up. Never sells what you are wearing, the best item of each slot (weapon / helmet / chestplate / leggings), favorited items or pickaxes.')
 FarmBox:AddButton('Sell ores now', function()
 	sellOres()
+end)
+-- The bag: the game's own opener does nothing in a raid (the window stays parked below the
+-- screen), so if it has not come up we put it there ourselves.
+FarmBox:AddButton('Open / close bag', function()
+	pcall(function()
+		local gui = LocalPlayer.PlayerGui:FindFirstChild('Menu')
+		local inner = gui and gui:FindFirstChild('Frame') and gui.Frame:FindFirstChild('Frame')
+		if not inner then
+			return
+		end
+		local UI = controller('UIController')
+		local M = UI and UI.Modules and UI.Modules.Menu
+		local function shown()
+			return inner.Visible and inner.Position.Y.Scale < 1
+		end
+		if shown() then
+			pcall(function()
+				UI:Close('Menu')
+			end)
+			task.wait(0.6)
+			if shown() then
+				inner.Position = UDim2.new(0.5, 0, 1.5, 0)
+				inner.Visible = false
+			end
+			return
+		end
+		pcall(function()
+			M:Open()
+		end)
+		task.wait(0.7)
+		if not shown() then
+			gui.Enabled = true
+			inner.Visible = true
+			inner.Position = UDim2.new(0.5, 0, 0.5, 0)
+			for _, c in ipairs(inner:GetDescendants()) do
+				if c.Name == 'Menus' then
+					for _, t in ipairs(c:GetChildren()) do
+						if t:IsA('GuiObject') then
+							t.Visible = t.Name == 'Stash'
+						end
+					end
+					break
+				end
+			end
+			pcall(function()
+				M:Update()
+			end)
+		end
+	end)
 end)
 
 bindToggle(ForgeBox, 'FTAutoForge', 'autoForge', 'Auto forge', 'When you have enough ores: tweens to the forge, puts them in and plays every minigame perfectly.')
@@ -5628,7 +5959,8 @@ end)
 
 bindToggle(MobBox, 'FTAutoMobs', 'autoMobs', 'Auto kill mobs', 'Tweens to the nearest mob and fights it with your Weapon.')
 local mobDD = bindDropdown(MobBox, 'FTMobFilter', 'mobFilter', 'Target', mobNames())
-bindSlider(MobBox, 'FTRetreatHp', 'retreatHp', 'Retreat to spawn below % health', 0, 90, 'Goes back to spawn and waits until health is 90% before fighting again.')
+bindSlider(MobBox, 'FTRetreatHp', 'retreatHp', 'Retreat to spawn below % health', 0, 90, 'Below this it stops to heal (health comes back about 1% a second). 0 = never stop to heal, keep working.')
+bindSlider(MobBox, 'FTHealTo', 'healTo', 'Back to work at % health', 5, 100, 'How far it heals before it carries on. Lower = less standing around, more risk.')
 -- The slider used to stop at 2000, which silently hid every bigger mob (island 3: Elite Orc,
 -- Crystal Golem, Yeti, Demonic / Prismarine Spider...). Left at that old maximum = no limit.
 if tonumber(settings.maxMobHp) == 2000 then
@@ -5679,9 +6011,49 @@ do
 		return name, rarity, d and tonumber(d.Spins) or 0
 	end
 	bindDropdown(RaceBox, 'FTRaceStop', 'raceStop', 'Stop at rarity (or better)', { 'Rare', 'Epic', 'Legendary', 'Mythic', 'Relic', 'Exotic', 'Divine' }, 'Rerolling stops as soon as your race is this rarity or better. If it already is, nothing is rolled.')
+	-- Specific races: with any picked here, rolling stops on one of THOSE and the rarity above is ignored.
+	pcall(function()
+		local names, rr = {}, {}
+		pcall(function()
+			local R = require(RS.Shared.Data.Races)
+			for i, n in ipairs(R.RarityOrder or {}) do
+				rank[n] = rank[n] or i
+			end
+			for name, def in pairs(R.Races) do
+				if type(def) == 'table' then
+					names[#names + 1] = name
+					rr[name] = rank[def.Rarity] or 0
+				end
+			end
+		end)
+		for name in pairs(type(settings.raceWant) == 'table' and settings.raceWant or {}) do
+			if rr[name] == nil then
+				names[#names + 1] = name
+				rr[name] = 0
+			end
+		end
+		table.sort(names, function(a, b)
+			if rr[a] ~= rr[b] then
+				return rr[a] > rr[b]
+			end
+			return a < b
+		end)
+		local dd = RaceBox:AddDropdown('FTRaceWant', { Text = 'Stop at these races', Values = names, Multi = true, Default = settings.raceWant, AllowNull = true,
+			Tooltip = 'Pick one or more races: rolling goes on until you have one of them, whatever its rarity, and the rarity setting above is ignored. Nothing picked = stop by rarity. Listed rarest first.' })
+		dd:OnChanged(function(v)
+			local out = {}
+			for k, on in pairs(type(v) == 'table' and v or {}) do
+				if on then
+					out[k] = true
+				end
+			end
+			settings.raceWant = out
+			save()
+		end)
+	end)
 	bindSlider(RaceBox, 'FTRaceKeepSpins', 'raceKeepSpins', 'Keep this many spins', 0, 200, 'Rerolling also stops when only this many spins are left.')
 	local rolling = false
-	RaceBox:AddButton('Reroll race until that rarity', function()
+	RaceBox:AddButton('Reroll race', function()
 		if rolling then
 			rolling = false -- pressed again: stop
 			return
@@ -5700,7 +6072,14 @@ do
 			end)
 			while alive and rolling do
 				local name, rarity, spins = raceInfo()
-				if (rank[rarity] or 0) >= want then
+				local picks = type(settings.raceWant) == 'table' and next(settings.raceWant) and settings.raceWant or nil
+				local done
+				if picks then
+					done = name ~= nil and picks[name] == true
+				else
+					done = (rank[rarity] or 0) >= want
+				end
+				if done then
 					setStatus(('race reroll: you have %s (%s) — done, %d spins used, %d left'):format(tostring(name), tostring(rarity), used, spins))
 					break
 				end
@@ -5740,6 +6119,114 @@ do
 		end)
 	end)
 	RaceBox:AddLabel('Press again to stop. Rolls the current slot.', true)
+
+	-- Race swap: the game lets you change race slot from anywhere, at once (measured: 0.4s, no
+	-- cooldown, health kept). Costs nothing - it only picks which of the races you own is active.
+	do
+		local function slots()
+			local d = data()
+			return d and type(d.RaceSlots) == 'table' and d.RaceSlots or {}, d and d.CurrentRaceSlot
+		end
+		local function switchTo(i)
+			local list, cur = slots()
+			if rolling or not list[i] or cur == i then
+				return false
+			end
+			local svc = service('RaceService')
+			if not svc then
+				return false
+			end
+			local ok = pcall(function()
+				svc:SwitchSlot(i)
+			end)
+			return ok
+		end
+		local function slotOf(name)
+			for i, n in pairs((slots())) do
+				if n == name then
+					return i
+				end
+			end
+		end
+		local vals = { 'No change' }
+		do
+			local seen = {}
+			local list = slots()
+			for i = 1, 8 do
+				local n = list[i]
+				if n and not seen[n] then
+					seen[n] = true
+					vals[#vals + 1] = n
+				end
+			end
+			for _, k in ipairs({ 'raceMine', 'raceFight' }) do
+				if type(settings[k]) ~= 'string' or (settings[k] ~= 'No change' and not seen[settings[k]]) then
+					settings[k] = 'No change' -- (a race no longer in any slot)
+				end
+			end
+		end
+		G.FTSettings = settings -- (for live tests)
+		local SwapBox = Tab:AddLeftGroupbox('Race swap')
+		bindDropdown(SwapBox, 'FTRaceMine', 'raceMine', 'Race while mining', vals, 'Switches to this race (one of your slots) whenever the bot is mining. Free and instant.')
+		bindDropdown(SwapBox, 'FTRaceFight', 'raceFight', 'Race while fighting', vals, 'Switches to this race whenever the bot is fighting or dodging a mob, and back to the mining one afterwards.')
+		SwapBox:AddButton('Switch to next race slot', function()
+			local list, cur = slots()
+			local n = 0
+			for i in pairs(list) do
+				n = math.max(n, i)
+			end
+			for step = 1, n do
+				local i = ((cur or 1) - 1 + step) % n + 1
+				if list[i] then
+					if switchTo(i) then
+						setStatus(('race: switched to %s (slot %d)'):format(tostring(list[i]), i))
+					end
+					break
+				end
+			end
+		end)
+		SwapBox:AddLabel('Paused while a reroll is running. Reload after getting a new race to see it listed.', true)
+		local FIGHT = { 'fighting ', 'dodging ', 'dodged a', 'finishing ', 'clearing ' }
+		task.spawn(function()
+			local mineSince
+			while alive do
+				task.wait(0.4)
+				local st = tostring(G.FTStatus)
+				local mode
+				if string.sub(st, 1, 7) == 'mining ' then
+					mode = 'mine'
+				else
+					for _, pre in ipairs(FIGHT) do
+						if string.sub(st, 1, #pre) == pre then
+							mode = 'fight'
+							break
+						end
+					end
+				end
+				local want
+				if mode == 'fight' then
+					mineSince = nil
+					want = settings.raceFight
+				elseif mode == 'mine' then
+					-- (a second of mining first: the status flips between the two around a fight)
+					mineSince = mineSince or os.clock()
+					if os.clock() - mineSince >= 1.5 then
+						want = settings.raceMine
+					end
+				else
+					mineSince = nil
+				end
+				if want and want ~= 'No change' and not rolling then
+					local i = slotOf(want)
+					local _, cur = slots()
+					if i and cur ~= i then
+						pcall(switchTo, i)
+						task.wait(0.6)
+					end
+				end
+			end
+		end)
+	end
 end
 bindToggle(QuestBox, 'FTAutoAccept', 'autoAcceptQuests', 'Auto accept quests', 'Visits NPCs and takes any quest they offer (repeatable ones again when they come back).')
 bindToggle(QuestBox, 'FTAutoComplete', 'autoCompleteQuests', 'Auto complete quests', 'Works the objectives (forge, sell, equip, talk, kill, mine, buy) and turns quests in at the NPC.')
@@ -5859,6 +6346,9 @@ MobBox:AddButton('Refresh lists', function()
 	pcall(function()
 		zoneDD:SetValues(zoneNames())
 	end)
+	pcall(function()
+		rockDD:SetValues(rockNames())
+	end)
 end)
 
 -- Island travel (same thing the Portal tool does). Lists islands and whether you've unlocked them.
@@ -5977,6 +6467,338 @@ task.spawn(function()
 	end
 end)
 local loopGen = 0
+---------------------------------------------------------------------------
+-- Potions: keep Luck / Miner running. Measured in game: a potion is drunk by equipping it
+-- (CharacterService:EquipMisc puts it in the backpack as a tool) and activating it (about 2s);
+-- each one adds its Duration (300s) to Replica.Data.Potions[name], up to its MaxDuration
+-- (Luck 3600s, Miner 900s) - so anything drunk past the cap is wasted and we never do that.
+-- The shop only sells standing at the stall (Purchase from across the map answers Success=false).
+---------------------------------------------------------------------------
+local Potions = { want = { autoLuckPotion = { 'LuckPotion2', 'LuckPotion1' }, autoMinerPotion = { 'MinerPotion2', 'MinerPotion1' } }, retryAt = 0, REACH = 2500, TOWN = 220 }
+function Potions.load()
+	if Potions.defs == nil then
+		local ok, ex = pcall(function()
+			return require(RS.Shared.Data.Extras).Items.Potion
+		end)
+		Potions.defs = ok and ex or false
+		local ok2, sh = pcall(function()
+			return require(RS.Shared.Data.Proximities).Shop
+		end)
+		Potions.shop = ok2 and sh or {}
+	end
+	return Potions.defs
+end
+function Potions.count(name)
+	local d = data()
+	for _, it in pairs(d and d.Inventory and d.Inventory.Misc or {}) do
+		if type(it) == 'table' and it.Name == name then
+			return tonumber(it.Quantity) or 1
+		end
+	end
+	return 0
+end
+function Potions.left(name)
+	local d = data()
+	return tonumber(d and d.Potions and d.Potions[name]) or 0
+end
+-- the stall selling it, if it is on this island
+function Potions.stall(name)
+	local prox = workspace:FindFirstChild('Proximity')
+	local m = prox and prox:FindFirstChild(name)
+	local _, hrp = char()
+	if not m or not hrp or not Potions.shop[name] then
+		return nil
+	end
+	local ok, pos = pcall(function()
+		return m:GetPivot().Position
+	end)
+	if ok and (pos - hrp.Position).Magnitude < Potions.REACH then
+		return pos
+	end
+	return nil
+end
+-- On the way to a rock nothing is in our hands and nothing needs to be: that is when to drink.
+function Potions.calm()
+	local _, hrp = char()
+	return hrp ~= nil and next(attackWarn) == nil and mobsNear(hrp.Position, 35) == 0
+end
+function Potions.walking()
+	local _, hrp = char()
+	return hrp and G.FTTravel and string.sub(tostring(G.FTStatus), 1, 7) == 'mining ' and (G.FTTravel - hrp.Position).Magnitude > 25 and Potions.calm()
+end
+function Potions.drink(name, onTheMove)
+	local CS, TS = service('CharacterService'), service('ToolService')
+	local c, _, hum = char()
+	if not CS or not TS or not c or not hum or Potions.busy then
+		return false
+	end
+	Potions.busy = true
+	local q0, l0 = Potions.count(name), Potions.left(name)
+	local def = Potions.defs[name]
+	if not onTheMove then
+		setStatus(('drinking %s (%d left after this)'):format(def and def.Name or name, q0 - 1))
+	end
+	local t0 = os.clock()
+	while alive and os.clock() - t0 < 6 and Potions.count(name) >= q0 and hum.Health > 0 and (onTheMove and Potions.walking() or not onTheMove and Potions.calm()) do
+		local tool = LocalPlayer.Backpack:FindFirstChild(name) or c:FindFirstChild(name)
+		if not tool then
+			pcall(function()
+				CS:EquipMisc(name):await()
+			end)
+			task.wait(0.3)
+		else
+			if tool.Parent ~= c then
+				hum:EquipTool(tool)
+				task.wait(0.1)
+			end
+			if tool.Parent == c then
+				pcall(function()
+					TS:ToolActivated(name):await()
+				end)
+				task.wait(0.3)
+			end
+		end
+	end
+	task.wait(0.4)
+	Potions.log = Potions.log or {}
+	Potions.log[#Potions.log + 1] = ('%s %s: stock %d -> %d, timer %d -> %d%s'):format(os.date('%H:%M:%S'), name, q0, Potions.count(name), l0, Potions.left(name), onTheMove and ' (while walking)' or '')
+	Potions.busy = false
+	return Potions.count(name) < q0 or Potions.left(name) > l0 + 60
+end
+function Potions.next(urgentOnly)
+	for key, names in pairs(Potions.want) do
+		if settings[key] then
+			for _, name in ipairs(names) do
+				local def = Potions.defs[name]
+				if def and Potions.count(name) > 0 and Potions.left(name) + (tonumber(def.Duration) or 300) <= (tonumber(def.MaxDuration) or 900)
+					and (not urgentOnly or Potions.left(name) < 20) then
+					return name
+				end
+			end
+		end
+	end
+	return nil
+end
+task.spawn(function()
+	while alive do
+		task.wait(0.5)
+		if (settings.autoLuckPotion or settings.autoMinerPotion) and not Potions.busy and Potions.walking() and os.clock() >= (Potions.drinkAt or 0) then
+			pcall(function()
+				if Potions.load() then
+					local name = Potions.next(false)
+					if name and not Potions.drink(name, true) then
+						Potions.busy = false
+						Potions.drinkAt = os.clock() + 5
+					end
+				end
+			end)
+			Potions.busy = false
+		end
+	end
+end)
+-- true when it used up this turn of the main loop (a drink or a trip to the stall)
+function Potions.step()
+	if not (settings.autoLuckPotion or settings.autoMinerPotion) or not Potions.load() then
+		return false
+	end
+	local d = data()
+	if not d or type(d.Potions) ~= 'table' then
+		return false
+	end
+	local now = os.clock()
+	local shopping = {}
+	for key, names in pairs(Potions.want) do
+		if settings[key] then
+			local buyName
+			for _, name in ipairs(names) do
+				local def = Potions.defs[name]
+				if def then
+					local dur, cap = tonumber(def.Duration) or 300, tonumber(def.MaxDuration) or 900
+					if Potions.count(name) > 0 and Potions.left(name) < 20 and Potions.left(name) + dur <= cap and now >= (Potions.drinkAt or 0) and not Potions.busy and Potions.calm() then
+						if not Potions.drink(name) then
+							Potions.drinkAt = os.clock() + 20 -- (did not go down: not again right away)
+						end
+						return true
+					end
+					buyName = buyName or (Potions.stall(name) and name)
+				end
+			end
+			-- already in town (selling, forging, a quest...) and below a full stock: top up now, so
+			-- the long walk here just for potions hardly ever happens
+			if buyName and now >= (Potions.topAt or 0) then
+				local pos = Potions.stall(buyName)
+				local _, hrpT = char()
+				local limit = tonumber(Potions.shop[buyName].MaxPurchaseLimit) or 10
+				if pos and hrpT and (pos - hrpT.Position).Magnitude < Potions.TOWN and Potions.count(buyName) < limit
+					and (tonumber(d.Gold) or 0) >= (tonumber(Potions.shop[buyName].Price) or math.huge) then
+					shopping[#shopping + 1] = buyName
+					Potions.topping = true
+				end
+			end
+			-- nothing of this kind left to drink and the last one is about to run out: restock
+			local have, running = 0, 0
+			for _, name in ipairs(names) do
+				have += Potions.count(name)
+				running = math.max(running, Potions.left(name))
+			end
+			if buyName and have == 0 and running < 45 and not table.find(shopping, buyName) then
+				shopping[#shopping + 1] = buyName
+			end
+		end
+	end
+	if #shopping == 0 or now < Potions.retryAt then
+		return false
+	end
+	if Potions.topping then
+		Potions.topping = nil
+		Potions.topAt = now + 60
+	end
+	-- one trip stocks up every kind that is switched on (not just the one that ran out)
+	for key, names in pairs(Potions.want) do
+		if settings[key] then
+			for _, name in ipairs(names) do
+				if Potions.stall(name) and not table.find(shopping, name) then
+					local other = 0
+					for _, n2 in ipairs(names) do
+						other += Potions.count(n2)
+					end
+					if other < (tonumber(Potions.shop[name].MaxPurchaseLimit) or 10) then
+						shopping[#shopping + 1] = name
+					end
+					break
+				end
+			end
+		end
+	end
+	local PS = service('ProximityService')
+	local bought = false
+	for _, name in ipairs(shopping) do
+		local sh = Potions.shop[name]
+		local price = tonumber(sh.Price) or math.huge
+		local qty = math.min((tonumber(sh.MaxPurchaseLimit) or 10) - Potions.count(name), math.floor((tonumber(data().Gold) or 0) / price))
+		local pos = Potions.stall(name)
+		if PS and pos and qty > 0 then
+			local def = Potions.defs[name]
+			setStatus(('going to buy %d x %s (%d gold each)'):format(qty, def and def.Name or name, price))
+			local _, hrp = char()
+			if (hrp and (hrp.Position - pos).Magnitude < 9) or tweenTo(CFrame.new(pos + Vector3.new(0, 1, 5))) then
+				task.wait(0.3)
+				local q0 = Potions.count(name)
+				pcall(function()
+					PS:Purchase(name, qty):await()
+				end)
+				local tb = os.clock()
+				while os.clock() - tb < 2 and Potions.count(name) == q0 do
+					task.wait(0.1)
+				end
+				if Potions.count(name) > q0 then
+					bought = true
+					setStatus(('bought %d x %s'):format(Potions.count(name) - q0, def and def.Name or name))
+				end
+			end
+		end
+	end
+	if not bought then
+		Potions.retryAt = os.clock() + 300
+		setStatus('could not buy potions (no gold, or the stall did not sell) — trying again in 5 minutes')
+	end
+	return true
+end
+G.FTPotions = Potions
+
+-- Junk runes (Frost Speck, Rage Mark, Ward Patch... pile up by the hundred). Measured: Greedy Cey
+-- takes them from anywhere on the map, through the same sale the ores go through, basket keyed
+-- by the rune's GUID. Favorited runes are never sold, and one of each kind is always kept.
+local RuneSell = { at = 0, LOW = { common = true, uncommon = true, rare = true } }
+function RuneSell.kind(def, id)
+	return (string.gsub(tostring(def.Name or id), '%s+[IVX]+$', ''))
+end
+function RuneSell.step()
+	if not settings.autoSellRunes or os.clock() < RuneSell.at then
+		return false
+	end
+	RuneSell.at = os.clock() + 30
+	if RuneSell.defs == nil then
+		local ok, R = pcall(function()
+			return require(RS.Shared.Data.Runes).Runes
+		end)
+		RuneSell.defs = ok and R or false
+	end
+	local d = data()
+	local npc = workspace:FindFirstChild('Proximity') and workspace.Proximity:FindFirstChild('Greedy Cey')
+	if not RuneSell.defs or not d then
+		return false
+	end
+	local maxTier = math.clamp(tonumber(settings.runeSellTier) or 1, 1, 5)
+	local fav = d.Favorites or {}
+	local basket, n, kept = {}, 0, {}
+	for _, it in pairs(d.Inventory and d.Inventory.Misc or {}) do
+		local def = type(it) == 'table' and it.GUID and it.Id and RuneSell.defs[it.Id]
+		-- Epic and rarer are never sold. Only a rune whose rarity is KNOWN to be below Epic goes:
+		-- one with no rarity, or a rarity name we have not seen, is kept.
+		local rar = def and string.lower(tostring(it.Rarity or def.Rarity or ''))
+		-- The kinds picked to keep ("Drain Edge" covers I, II and III) are never sold at all; of
+		-- every other kind nothing is held back, not even one.
+		local kind = def and RuneSell.kind(def, it.Id)
+		if def and not (type(settings.runeKeep) == 'table' and settings.runeKeep[kind] and (tonumber(def.Tier) or 1) >= (tonumber(settings.runeKeepTier) or 3)) and (RuneSell.LOW[rar] or settings.runeSellEpic == true) and (tonumber(def.Tier) or 1) <= maxTier and fav[it.GUID] == nil then
+			basket[it.GUID] = 1
+			n += 1
+		end
+	end
+	if n < 1 then
+		return false
+	end
+	setStatus(('selling %d runes'):format(n))
+	local PS, DS = service('ProximityService'), service('DialogueService')
+	local goldBefore = d.Gold or 0
+	local function waitGold()
+		local tg = os.clock()
+		while os.clock() - tg < 3 and ((data() or {}).Gold or 0) == goldBefore do
+			task.wait(0.1)
+		end
+		return ((data() or {}).Gold or 0) ~= goldBefore
+	end
+	-- The direct call needs no NPC, so it also works in a raid (measured there: +25 gold for one
+	-- tier 1 rune). The dialogue route is the fallback, where Greedy Cey exists.
+	pcall(function()
+		local IS = service('InventoryService')
+		if IS then
+			IS:SellMisc(basket)
+		end
+	end)
+	if not waitGold() and npc then
+		pcall(function()
+			PS:ForceDialogue(npc, 'SellConfirmMisc')
+		end)
+		task.wait(0.4)
+		pcall(function()
+			DS:RunCommand('SellConfirm', { Basket = basket })
+		end)
+		waitGold()
+		pcall(function()
+			getsenv(LocalPlayer.PlayerGui.DialogueUI.DialogueHandler).Close()
+		end)
+	end
+	local gained = ((data() or {}).Gold or 0) - goldBefore
+	if gained > 0 then
+		setStatus(('sold %d runes for %d gold'):format(n, gained))
+	else
+		RuneSell.at = os.clock() + 300
+		setStatus('selling runes did not go through — trying again in 5 minutes')
+	end
+	return true
+end
+
+-- Runes sell on their own clock, not from the main loop: that loop stops at "dead / respawning"
+-- (all of a raid, measured: 82 tier 2 runes sat unsold with the slider at 2) and the sale is
+-- only a remote call - it needs no character.
+task.spawn(function()
+	while alive and G.SB2ForgeToolsToken == token do
+		task.wait(5)
+		pcall(RuneSell.step)
+	end
+end)
+
 local function mainLoop(myGen)
 	while alive and G.SB2ForgeToolsToken == token and loopGen == myGen do
 		local ok, err = pcall(function()
@@ -6013,6 +6835,9 @@ local function mainLoop(myGen)
 				if Quest.step() then
 					return
 				end
+			end
+			if Potions.step() then
+				return
 			end
 			local farm = chooseFarm()
 			if forgeNeeded() then
