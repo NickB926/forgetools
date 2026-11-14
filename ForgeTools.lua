@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v145'
+local BUILD = 'forge-tools-v162'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -132,6 +132,7 @@ local defaults = {
 	questRange = 1000,
 	noBlur = false,
 	combatStyle = 'Hit & run',
+	dodgeWhat = 'Only threats',
 	autoAbyss = false,
 	dodgeDist = 16,
 	autoMobs = false,
@@ -1234,12 +1235,71 @@ end
 
 -- While we are on our way somewhere, G.FTTravel is where to. Dodges read it: a step away from a mob
 -- that is ahead of us used to throw us 16-30 studs back down the route, again and again.
+local setStatus -- (defined further down; Nav.fly, Nav.cross and Nav.escape report through it)
+-- No route on foot: glide. Up 40 studs above the higher of the two ends, across, and down onto the
+-- spot, with collisions off (ledges, ladders, cave roofs and pockets like island 4's Spirit Cave
+-- stop mattering). Given up if a fifth of our health goes on the way. The user's call: "dont bother
+-- with ladders just make it glide up".
+function Nav.fly(dest)
+	local _, hrp, hum = char()
+	if not hrp or not hum or hum.Health <= 0 then
+		return false
+	end
+	local from = hrp.Position
+	local alt = math.max(from.Y, dest.Y) + 40
+	local legs = { Vector3.new(from.X, alt, from.Z), Vector3.new(dest.X, alt, dest.Z), dest }
+	local hp0 = hum.Health
+	local speed = math.clamp(tonumber(settings.tweenSpeed) or 55, 30, 70)
+	if setStatus then
+		setStatus(('no route on foot — gliding over (%.0f studs)'):format((dest - from).Magnitude))
+	end
+	stopTween()
+	noclip = true
+	local okRun, done = pcall(function()
+		for _, goal in ipairs(legs) do
+			while true do
+				local dt = task.wait()
+				local _, h, hm = char()
+				if not alive or not h or not hm or hm.Health <= 0 or hm.Health < hp0 * 0.8 then
+					return false
+				end
+				local to = goal - h.Position
+				local step = speed * math.min(dt, 0.1)
+				if to.Magnitude <= step then
+					h.CFrame = CFrame.new(goal)
+					h.AssemblyLinearVelocity = Vector3.zero
+					break
+				end
+				h.CFrame = CFrame.new(h.Position + to.Unit * step)
+				h.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+		return true
+	end)
+	noclip = false
+	local _, h2 = char()
+	if h2 then
+		h2.AssemblyLinearVelocity = Vector3.zero
+	end
+	return okRun and done == true
+end
+
 local function tweenTo(cf, opts)
 	local trip = { dest = typeof(cf) == 'CFrame' and cf.Position or cf }
 	G.FTTrips = G.FTTrips or {}
 	table.insert(G.FTTrips, trip)
 	G.FTTravel = trip.dest
 	local ok, a, b = pcall(tweenToRaw, cf, opts)
+	if ok and a == false and b == 'nopath' and alive and not (opts and opts.abort and opts.abort()) then
+		local _, hf = char()
+		if hf and (trip.dest - hf.Position).Magnitude > 25 and os.clock() - (Nav.flyAt or -1e9) > 3 then
+			Nav.flyAt = os.clock()
+			local okF, res = pcall(Nav.fly, trip.dest)
+			if okF and res then
+				a, b = true, nil
+			end
+		end
+	end
 	local at = table.find(G.FTTrips, trip)
 	if at then
 		table.remove(G.FTTrips, at)
@@ -1260,6 +1320,102 @@ local function standNear(part, gap)
 	local r = math.max(part.Size.X, part.Size.Z) / 2 + (gap or 2)
 	local pos = p + dir * r
 	return CFrame.lookAt(pos, Vector3.new(p.X, pos.Y, p.Z))
+end
+
+-- The long way round. Some areas are pockets: island 4's Spirit Cave only connects to the rest of
+-- the island through the water around it, a 2,200 stud route that the normal planner (which checks
+-- every step and works in short hops between known spots) never comes up with. The game's own
+-- pathfinder does find it in one go. Measured by hand: gliding that route at 60 studs/s with
+-- collisions off took 30 seconds and cost no health; with collisions ON the glide jammed against
+-- the cave mouth. So: one whole-route plan to a spot next to the rock, glided with collisions off,
+-- given up if a fifth of our health goes on the way. Only used for a rock 300+ studs away that
+-- the normal planner has just failed on.
+function Nav.cross(hb, label)
+	local _, hrp, hum = char()
+	if not hrp or not hum or hum.Health <= 0 or not hb or not hb.Parent then
+		return false
+	end
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { LocalPlayer.Character, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Rocks') }
+	rp.RespectCanCollide = true
+	local wps
+	local half = math.max(hb.Size.X, hb.Size.Z) / 2 + 4
+	for a = 0, 270, 90 do
+		local p = hb.Position + Vector3.new(math.cos(math.rad(a)), 0, math.sin(math.rad(a))) * half
+		local r = workspace:Raycast(p + Vector3.new(0, 8, 0), Vector3.new(0, -40, 0), rp)
+		if r then
+			local goal = r.Position + Vector3.new(0, 3, 0)
+			local path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+			local okc = pcall(function()
+				path:ComputeAsync(hrp.Position, goal)
+			end)
+			if okc and path.Status == Enum.PathStatus.Success then
+				local w = path:GetWaypoints()
+				local gap = #w >= 2 and (w[#w].Position - goal) or nil
+				local good = gap and math.abs(gap.Y) <= 7 and Vector3.new(gap.X, 0, gap.Z).Magnitude <= 7
+				if good then
+					for i = 2, #w do
+						local st = w[i].Position - w[i - 1].Position
+						if st.Y > 5 and Vector3.new(st.X, 0, st.Z).Magnitude < st.Y * 0.8 then
+							good = false -- (a "jump" up a wall: not a route)
+							break
+						end
+					end
+				end
+				if good then
+					wps = w
+					break
+				end
+			end
+		end
+		if not alive then
+			return false
+		end
+	end
+	if not wps then
+		return false
+	end
+	local len = 0
+	for i = 2, #wps do
+		len += (wps[i].Position - wps[i - 1].Position).Magnitude
+	end
+	setStatus(('taking the long way round to %s (%.0f studs)'):format(label or 'the rock', len))
+	local hp0 = hum.Health
+	local speed = math.clamp(tonumber(settings.tweenSpeed) or 55, 30, 70)
+	stopTween()
+	noclip = true
+	local okRun, done = pcall(function()
+		for i = 2, #wps do
+			local goal = wps[i].Position + Vector3.new(0, 3.5, 0)
+			while true do
+				local dt = task.wait()
+				local _, h, hm = char()
+				if not alive or not h or not hm or hm.Health <= 0 or hm.Health < hp0 * 0.8 then
+					return false
+				end
+				local to = goal - h.Position
+				local step = speed * math.min(dt, 0.1)
+				if to.Magnitude <= step then
+					h.CFrame = CFrame.new(goal)
+					h.AssemblyLinearVelocity = Vector3.zero
+					break
+				end
+				h.CFrame = CFrame.new(h.Position + to.Unit * step)
+				h.AssemblyLinearVelocity = Vector3.zero
+			end
+		end
+		return true
+	end)
+	noclip = false
+	local _, h2 = char()
+	if h2 then
+		h2.AssemblyLinearVelocity = Vector3.zero
+	end
+	if not (okRun and done) then
+		setStatus('the long way round was cut short (health dropped or the character was lost)')
+	end
+	return okRun and done == true
 end
 
 -- Stranded. Some places have no walkable way out for the pathfinder (measured on island 3: the
@@ -1439,7 +1595,7 @@ local _statusText = 'idle'
 local statusLabel
 local statusLog = {}
 local lastProgress = os.clock()
-local function setStatus(t)
+setStatus = function(t)
 	if t ~= _statusText then
 		lastProgress = os.clock()
 		statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. tostring(t)
@@ -1653,7 +1809,7 @@ local function rockList()
 					-- Rocks with mobs around them count as much farther away, so clear ones win.
 					local danger = mobsNear(hb.Position, 22)
 					local d = (hb.Position - hrp.Position).Magnitude
-					local want = G.FTQuestRock and m.Name == G.FTQuestRock and -350 or 0 -- quest asks for this rock type
+					local want = ((G.FTQuestRock and m.Name == G.FTQuestRock) or (G.FTQuestRocks and G.FTQuestRocks[m.Name])) and -350 or 0 -- quest asks for this rock type (or for an ore only these rocks give)
 					local climb = math.abs(hb.Position.Y - hrp.Position.Y)
 					-- someone else is already on this rock: leave it to them (unless we are on it too)
 					local taken = 0
@@ -1679,7 +1835,7 @@ local function rockList()
 	-- the next best kind is the one with the most health below the picked ones (huge > large >
 	-- medium > small), and kinds bigger than the picked ones come last.
 	local sel = type(settings.mineRocks) == 'table' and next(settings.mineRocks) and settings.mineRocks or nil
-	if sel and not G.FTQuestRock then
+	if sel and not G.FTQuestRock and not G.FTQuestRocks then
 		local ref = 0
 		for _, e in ipairs(list) do
 			if sel[e.m.Name] then
@@ -1720,12 +1876,21 @@ local function rockList()
 	-- Marked rocks (the game's "RockMutation" attribute: Galaxy = Galactic, Blessed, Prismatic...)
 	-- picked in the menu go before everything else, whatever kind of rock they are and wherever.
 	local muts = type(settings.mineMutations) == 'table' and next(settings.mineMutations) and settings.mineMutations or nil
-	if muts and not G.FTQuestRock then
+	if muts and not G.FTQuestRock and not G.FTQuestRocks then
 		for _, e in ipairs(list) do
 			local mu = e.m:GetAttribute('RockMutation')
 			if mu and muts[mu] then
 				e.score -= 1e7
 				e.mut = mu
+			end
+		end
+	end
+	-- A quest's rocks come first wherever they are (measured: with the bamboo rocks 740+ studs off,
+	-- a 350-stud head start still picked the pebble next door, which gives none of the quest's ore).
+	if G.FTQuestRock or G.FTQuestRocks then
+		for _, e in ipairs(list) do
+			if e.m.Name == G.FTQuestRock or (G.FTQuestRocks and G.FTQuestRocks[e.m.Name]) then
+				e.score -= 1e6
 			end
 		end
 	end
@@ -1855,15 +2020,31 @@ local function mineOnce()
 	if not okGo then
 		local _, myh = char()
 		why('travel failed: ' .. tostring(whyGo) .. ' nav=' .. tostring(G.FTNavDbg))
-		if settings.autoMine and target.m.Parent and myh and whyGo ~= 'wedged'
+		if (settings.autoMine or G.FTQuestWantsOre) and target.m.Parent and myh and whyGo ~= 'wedged'
 			and (myh.Position - target.hb.Position).Magnitude > math.max(target.hb.Size.X, target.hb.Size.Z) / 2 + 10 then
 			local fails = (unreachFails[target.m] or 0) + 1
 			unreachFails[target.m] = fails
-			if whyGo == 'nopath' then
+			-- (a rock in another cave, hundreds of studs off, that the trip to failed for whatever
+			-- reason: measured, it went back to the same unreachable boulder 770 studs away for
+			-- minutes while 15 others of the kind had a route. Rule it out, and its zone after two.)
+			local far = (myh.Position - target.hb.Position).Magnitude > 300
+			if far and os.clock() - (MineHooks.crossAt or -1e9) > 2 then
+				MineHooks.crossAt = os.clock()
+				if Nav.cross(target.hb, target.m.Name) then
+					table.clear(unreachable)
+					table.clear(unreachFails)
+					table.clear(zoneNoPath)
+					table.clear(zoneBlocked)
+					return true
+				end
+			end
+			if whyGo == 'nopath' or far then
 				-- Third rock in a row with no route at all, from the same place: it is not the rocks,
 				-- it is where we are standing. Get out, and forget what was ruled out from in here.
 				local sp = MineHooks.strandPos
-				if sp and (myh.Position - sp).Magnitude < 25 then
+				if far then
+					MineHooks.strandN = 0
+				elseif sp and (myh.Position - sp).Magnitude < 25 then
 					MineHooks.strandN = (MineHooks.strandN or 0) + 1
 				else
 					MineHooks.strandPos, MineHooks.strandN = myh.Position, 1
@@ -1885,8 +2066,10 @@ local function mineOnce()
 				end
 				z.n += 1
 				z.at = os.clock()
-				if z.n >= 2 and settings.mineZone == 'Any' then
-					zoneBlocked[target.zone] = os.clock() + 1200
+				if (z.n >= 2 or far) and settings.mineZone == 'Any' then
+					-- (a far zone: on to the next zone at once, and back to this one in 3 minutes -
+					-- from another spot the same zone often does have a route)
+					zoneBlocked[target.zone] = os.clock() + (far and z.n < 2 and 180 or 1200)
 					zoneNoPath[target.zone] = nil
 					setStatus(target.zone .. ' is walled off from here — mining other zones')
 				else
@@ -3109,6 +3292,155 @@ end
 -- "ParryWindow" attachment ~0.35s before). Tested on island 2 slimes: stepping out when "Attacking"
 -- appears and coming back ~1s later took 0 damage over 6 attacks in a row.
 local attackWarn = {} -- [mob model] = os.clock() when its attack started
+-- Threat ledger. With strong gear most mobs cannot hurt us faster than we heal, and stepping away
+-- from every one of them only costs hits. So an attack is only treated as something to dodge
+-- (= put in attackWarn, which every dodge reads) when that KIND of mob has shown it matters:
+--   * one of its hits took 12% of our health or more, or
+--   * its hit size / its attack rhythm is more than we heal per second (both measured), or
+--   * we are under pressure right now: below 45% health, or losing 12% more than we healed
+--     over the last 8 seconds (several small mobs at once) - then everything is dodged until
+--     health is back over 85%.
+-- A kind we have never been hit by is not dodged: its first hit is the measurement.
+local Threat = { all = setmetatable({}, { __mode = 'k' }), kind = G.FTThreatKinds or {}, heal = G.FTThreatHeal or 0.01,
+	took = {}, healed = {}, pressure = false, told = {} }
+G.FTThreatKinds = Threat.kind
+G.FTThreat = Threat
+function Threat.key(m)
+	local k = (string.gsub(m.Name, '%d+$', ''))
+	local mu = m:GetAttribute('Mutation')
+	return type(mu) == 'string' and (mu .. ' ' .. k) or k
+end
+function Threat.period(m)
+	local k = (string.gsub(m.Name, '%d+$', ''))
+	local g = G.FTAtkGap and G.FTAtkGap[k]
+	local gap = g and g.n > 0 and g.sum / g.n or 1.5
+	return math.clamp(gap + ((G.FTAtkDur or {})[k] or 1), 1, 6)
+end
+function Threat.keyIs(key)
+	if settings.dodgeWhat == 'Everything' or Threat.pressure then
+		return true
+	end
+	local rec = Threat.kind[key]
+	if rec and os.time() - (rec.at or 0) > (rec.hit >= 0.35 and 3600 or 600) then
+		Threat.kind[key] = nil
+		rec = nil
+	end
+	return rec ~= nil and (rec.hit >= 0.12 or rec.hit / 3 > Threat.heal)
+end
+function Threat.recIs(rec, m)
+	return rec.hit >= 0.12 or rec.hit / Threat.period(m) > Threat.heal
+end
+function Threat.is(m)
+	if settings.dodgeWhat == 'Everything' or Threat.pressure then
+		return true
+	end
+	local _, _, hum = char()
+	if not hum or hum.MaxHealth <= 0 then
+		return true
+	end
+	local key = Threat.key(m)
+	local rec = Threat.kind[key]
+	-- (measured against other gear, or long ago: measure again)
+	if rec and (os.time() - (rec.at or 0) > (rec.hit >= 0.35 and 3600 or 600) or math.abs((rec.max or 0) - hum.MaxHealth) > 0.15 * hum.MaxHealth) then
+		Threat.kind[key] = nil
+		rec = nil
+	end
+	if not rec then
+		-- never hit by it: only something far out of our league is dodged unseen
+		local mh = m:FindFirstChildOfClass('Humanoid')
+		return mh ~= nil and mh.MaxHealth > hum.MaxHealth * 20
+	end
+	return Threat.recIs(rec, m)
+end
+task.spawn(function()
+	local last, lastMax, lastHum
+	local accHeal, accTime = 0, 0
+	while alive do
+		local dt = task.wait(0.05)
+		local _, hrp, hum = char()
+		if hrp and hum and hum.Health > 0 and hum.MaxHealth > 0 then
+			local h, mx, now = hum.Health, hum.MaxHealth, os.clock()
+			if last and lastMax == mx and lastHum == hum then
+				local d = (h - last) / mx
+				if d < -0.003 then
+					Threat.took[#Threat.took + 1] = { now, -d }
+					local best, bestD
+					for m, t in pairs(Threat.all) do
+						local r = m.Parent and (m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart)
+						if r and now - t < 3 then
+							local dist = (r.Position - hrp.Position).Magnitude
+							if dist <= 30 and (not bestD or dist < bestD) then
+								best, bestD = m, dist
+							end
+						end
+					end
+					-- (a shot or marker we chose not to step out of a moment ago: the damage is its)
+					local hz = Threat.hazAt
+					local key, per
+					if hz and now - hz.t < 1.5 then
+						key, per = hz.key, 3
+					elseif best then
+						key, per = Threat.key(best), Threat.period(best)
+					end
+					if key then
+						local rec = Threat.kind[key] or { hit = -d, n = 0 }
+						rec.hit = rec.n == 0 and -d or (rec.hit * 0.6 + -d * 0.4)
+						rec.n += 1
+						rec.at, rec.max = os.time(), mx
+						Threat.kind[key] = rec
+						local is = rec.hit >= 0.12 or rec.hit / per > Threat.heal
+						if Threat.told[key] ~= is then
+							Threat.told[key] = is
+							statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. (is
+								and ('now dodging %s: it hits for %.1f%% of your health every ~%.1fs, you heal %.1f%%/s'):format(key, rec.hit * 100, per, Threat.heal * 100)
+								or ('not dodging %s: %.1f%% per hit every ~%.1fs is less than the %.1f%%/s you heal'):format(key, rec.hit * 100, per, Threat.heal * 100))
+						end
+					end
+				elseif d > 0 and d < 0.5 then
+					Threat.healed[#Threat.healed + 1] = { now, d }
+					accHeal += d
+				end
+				if h < mx - 0.5 then
+					accTime += dt
+				end
+			end
+			if accTime >= 5 then
+				-- healing per second, over time spent below full health
+				Threat.heal = math.max(0.002, Threat.heal * 0.5 + (accHeal / accTime) * 0.5)
+				G.FTThreatHeal = Threat.heal
+				accHeal, accTime = 0, 0
+			end
+			local tk, hl = 0, 0
+			while Threat.took[1] and now - Threat.took[1][1] > 8 do
+				table.remove(Threat.took, 1)
+			end
+			while Threat.healed[1] and now - Threat.healed[1][1] > 8 do
+				table.remove(Threat.healed, 1)
+			end
+			for _, e in ipairs(Threat.took) do
+				tk += e[2]
+			end
+			for _, e in ipairs(Threat.healed) do
+				hl += e[2]
+			end
+			local frac = h / mx
+			local was = Threat.pressure
+			if frac < 0.45 or (tk - hl > 0.12 and frac < 0.8) then
+				Threat.pressure = true
+			elseif frac > 0.85 then
+				Threat.pressure = false
+			end
+			if Threat.pressure ~= was and settings.dodgeWhat ~= 'Everything' then
+				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. (Threat.pressure
+					and ('under pressure (health %.0f%%, lost %.0f%% / healed %.0f%% in 8s): dodging everything'):format(frac * 100, tk * 100, hl * 100)
+					or 'health back over 85%: dodging only threats again')
+			end
+			last, lastMax, lastHum = h, mx, hum
+		else
+			last = nil
+		end
+	end
+end)
 G.FTAtkDur = G.FTAtkDur or {}
 -- [kind] = { min, max }: seconds into its attack at which the hit lands. Measured on island 3 with a
 -- great sword (hitbox 0.95s after the press): treating the WHOLE attack as "do not stand there"
@@ -3132,7 +3464,10 @@ pcall(function()
 			-- own made the bot dodge away from itself after every swing of its weapon or pickaxe)
 			if m and m:GetAttribute('IsNpc') and not Players:GetPlayerFromCharacter(m) then
 				local t0 = os.clock()
-				attackWarn[m] = t0
+				Threat.all[m] = t0
+				if Threat.is(m) then
+					attackWarn[m] = t0
+				end
 				Attack.flag[m] = d
 				if Attack.off[m] and t0 - Attack.off[m] < 8 then
 					local k = (string.gsub(m.Name, '%d+$', ''))
@@ -3322,6 +3657,10 @@ local function mobTooBig(h)
 	return hum ~= nil and (h.MaxHealth > math.min(hum.MaxHealth * 8, 5000) or (h.Parent ~= nil and string.find(h.Parent.Name, 'Prismarine', 1, true) ~= nil))
 end
 
+-- Mobs no route was found to (measured: stood in town for minutes "fighting" apes 500-750 studs
+-- away on another level, every route "no path"). Left alone for 3 minutes; quests see them as absent.
+local mobNoRoute = setmetatable({}, { __mode = 'k' })
+G.FTMobNoRoute = mobNoRoute
 local function mobList()
 	local _, hrp = char()
 	local living = workspace:FindFirstChild('Living')
@@ -3356,6 +3695,7 @@ local function mobList()
 			local r = mobRoot(m)
 			local cap = tonumber(settings.maxMobHp) or 0
 			if h and r and h.Health > 0 and m:GetAttribute('KillCredited') ~= true
+				and (mobNoRoute[m] or 0) < os.clock()
 				and mobMatches(baseName(m.Name), filter)
 				and (cap <= 0 or h.MaxHealth <= cap)
 				and h.MaxHealth < 1e8 and not m.Name:find('Dummy') -- training dummies never die
@@ -3710,7 +4050,7 @@ do
 				end
 			elseif p.m.Parent and p.r.Parent then
 				local h = p.m:FindFirstChildOfClass('Humanoid')
-				if (not h or h.Health > 0) and (p.r.Position - hrp.Position).Magnitude <= radius then
+				if (not h or h.Health > 0) and (p.r.Position - hrp.Position).Magnitude <= radius and Threat.is(p.m) then
 					if not bestRem or rem < bestRem then
 						bestPos, bestRem = p.r.Position, rem
 					end
@@ -3964,7 +4304,9 @@ function Hazard.step()
 					local flat = (me - cf.Position) * Vector3.new(1, 0, 1)
 					if flat.Magnitude < rad + 2 and math.abs(me.Y - cf.Position.Y) < 20 then
 						Hazard.last = now
-						if dodgeFrom(cf.Position, math.max(10, rad + 6 - flat.Magnitude)) then
+						if not Threat.keyIs('attack marker') then
+							Threat.hazAt = { key = 'attack marker', t = now } -- (stood in it: what it costs gets measured)
+						elseif dodgeFrom(cf.Position, math.max(10, rad + 6 - flat.Magnitude)) then
 							Hazard.n.ground += 1
 							setStatus('stepping out of an attack marker')
 						end
@@ -3996,7 +4338,9 @@ function Hazard.step()
 							end
 							Hazard.last = now
 							e.done = true
-							if Hazard.sidestep(hrp, perp) then
+							if not Threat.keyIs('shot ' .. x.Name) then
+								Threat.hazAt = { key = 'shot ' .. x.Name, t = now }
+							elseif Hazard.sidestep(hrp, perp) then
 								Hazard.n.proj += 1
 								setStatus(('dodged a projectile (%s)'):format(x.Name))
 							end
@@ -4030,7 +4374,9 @@ function Hazard.step()
 							end
 							Hazard.last = now
 							e.done = true
-							if Hazard.sidestep(hrp, perp) then
+							if not Threat.keyIs('shot ' .. x.Name) then
+								Threat.hazAt = { key = 'shot ' .. x.Name, t = now }
+							elseif Hazard.sidestep(hrp, perp) then
 								Hazard.n.proj += 1
 								setStatus(('dodged a projectile (%s)'):format(x.Name))
 							end
@@ -4492,7 +4838,7 @@ local function fightOnce(forced)
 				local _, around = mobsNear(h0.Position, 38)
 				local boss
 				for _, e in ipairs(around) do
-					if mobTooBig(e.h) and e.h.MaxHealth < 1e8 then
+					if mobTooBig(e.h) and e.h.MaxHealth < 1e8 and Threat.is(e.m) then
 						boss = e
 						break
 					end
@@ -4542,7 +4888,17 @@ local function fightOnce(forced)
 		local kite = false
 		if hitRun and target.r.Parent then
 			-- only in a crowd: against one mob we stay in reach and dodge just its wind-ups
-			kite = mobsNear(target.r.Position, 25) >= 2
+			-- (and only if one of them can actually hurt us: stepping away from harmless mobs that walk
+			-- up was most of the "dodging" left once their attacks were being ignored)
+			local nk, crowd = mobsNear(target.r.Position, 25)
+			if nk >= 2 then
+				for _, e in ipairs(crowd) do
+					if Threat.is(e.m) then
+						kite = true
+						break
+					end
+				end
+			end
 		end
 		local inRange = hrp and (hrp.Position - target.r.Position).Magnitude <= reach - 1 + math.max(target.r.Size.X, target.r.Size.Z) / 2
 		local striking = hitRun and strikeAt and now >= strikeAt - STRIKE_LEAD and now <= strikeEnd
@@ -4620,9 +4976,46 @@ local function fightOnce(forced)
 				end
 			else
 				-- (hit & run: stop short of the mob; the hop above takes us in when it is safe)
-				tweenTo(standFor(hitRun and 14 or math.clamp(reach - 3.5, 1.5, 4)), { abort = function()
+				local okGo, whyGo = tweenTo(standFor(hitRun and 14 or math.clamp(reach - 3.5, 1.5, 4)), { abort = function()
 					return not allowed() or not target.m.Parent or target.h.Health <= 0
 				end })
+				-- (measured: stood on one spot for 10+ minutes "fighting" mobs 140-820 studs away, every
+				-- route coming back "no path" - the result of this move was never looked at. Same cure as
+				-- for rocks: three failures from the same place = it is where we stand; go up and over.)
+				local _, hs = char()
+				if not okGo and hs then
+					if target.r and (target.r.Position - hs.Position).Magnitude > 40 then
+						-- (and its neighbours: no route to one of a pack is no route to the pack)
+						local lvN = workspace:FindFirstChild('Living')
+						for _, om in ipairs(lvN and lvN:GetChildren() or {}) do
+							local orr = om:GetAttribute('IsNpc') and (om:FindFirstChild('HumanoidRootPart') or om.PrimaryPart)
+							if orr and (orr.Position - target.r.Position).Magnitude <= 200 then
+								mobNoRoute[om] = os.clock() + 180
+							end
+						end
+						mobNoRoute[target.m] = os.clock() + 180
+					end
+					G.FTFightStrand = G.FTFightStrand or { n = 0 }
+					local S = G.FTFightStrand
+					if S.pos and (hs.Position - S.pos).Magnitude < 25 then
+						S.n += 1
+					else
+						S.pos, S.n = hs.Position, 1
+					end
+					if S.n >= 3 then
+						S.n = 0
+						local out = Nav.escape()
+						statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. (out and 'no route to any mob from here — moved up and over to a spot with routes'
+							or ('no route to %s from here (%s) and no way out found yet'):format(target.m.Name, tostring(whyGo)))
+						if not out then
+							task.wait(2)
+						end
+						break
+					end
+					task.wait(0.3)
+				elseif okGo and G.FTFightStrand then
+					G.FTFightStrand.n = 0
+				end
 			end
 			tool = equip('Weapon')
 		else
@@ -5555,6 +5948,90 @@ do
 	local skipped = {}
 	local turnInAt = {}
 	local lastAcceptScan, lastBoard = 0, 0
+	-- What a quest objective needs, and whether that is on THIS island. (Measured: it locked onto a
+	-- quest for Elite Orcs - another island's mob - and spent its 6 minutes killing whatever ape was
+	-- nearest "for the quest"; and for "collect Water Stone" it mined any rock at all, though only
+	-- the bamboo rocks give that ore.)
+	local Here = { rockSeen = {}, rockAt = -1e9, src = {} }
+	function Here.rocks()
+		if os.clock() - Here.rockAt > 15 then
+			Here.rockAt = os.clock()
+			local rocks = workspace:FindFirstChild('Rocks')
+			for _, zone in ipairs(rocks and rocks:GetChildren() or {}) do
+				for _, sp in ipairs(zone:GetChildren()) do
+					local m = sp:FindFirstChildWhichIsA('Model')
+					if m then
+						Here.rockSeen[m.Name] = os.clock()
+					end
+				end
+			end
+		end
+		return Here.rockSeen
+	end
+	function Here.rock(name)
+		local t = Here.rocks()[name]
+		return t ~= nil and os.clock() - t < 900
+	end
+	-- rocks whose drop list (the game's Rock data) has this ore
+	function Here.sources(ore)
+		if Here.src[ore] == nil then
+			local out = {}
+			pcall(function()
+				for name, def in pairs(require(RS.Shared.Data.Rock)) do
+					if type(def) == 'table' and type(def.Ores) == 'table' and table.find(def.Ores, ore) then
+						out[name] = true
+					end
+				end
+			end)
+			Here.src[ore] = out
+		end
+		return Here.src[ore]
+	end
+	function Here.mob(target)
+		local lv = workspace:FindFirstChild('Living')
+		for _, m in ipairs(lv and lv:GetChildren() or {}) do
+			if m:GetAttribute('IsNpc') and (mobNoRoute[m] or 0) < os.clock()
+				and (target == nil or mobMatches((string.gsub(m.Name, '%d+$', '')), target)) then
+				return true
+			end
+		end
+		return false
+	end
+	function Here.specificMob(target)
+		return target ~= 'Any' and target ~= 'Mob' and target ~= 'AnyBoss' and string.sub(target, 1, 9) ~= 'Mutation:'
+	end
+	-- can this objective be worked on from here?
+	function Here.can(p)
+		local t, target = p.questType, tostring(p.target)
+		if t == 'Kill' then
+			return Here.mob(Here.specificMob(target) and target or nil)
+		elseif t == 'Mine' then
+			return target == 'Any' or target == 'Rock' or Here.rock(target)
+		elseif t == 'Collect' and target ~= 'Ore' and not (ShopData and ShopData[target]) then
+			local src = Here.sources(target)
+			if next(src) == nil then
+				return true -- (no rock lists it: unknown, the old behaviour)
+			end
+			for name in pairs(src) do
+				if Here.rock(name) then
+					return true
+				end
+			end
+			return false
+		end
+		return true
+	end
+	function Here.quest(qd)
+		if type(qd) ~= 'table' then
+			return false
+		end
+		for _, p in ipairs(qd.Progress or {}) do
+			if (tonumber(p.currentProgress) or 0) < (tonumber(p.requiredAmount) or 1) and Here.can(p) then
+				return true
+			end
+		end
+		return false
+	end
 	-- One quest at a time: the bot locks onto a quest and works only on that one until it is
 	-- finished and turned in. It lets go only when the quest gives it nothing to do, or when
 	-- 6 minutes pass without any progress on it (then that quest rests for 10 minutes).
@@ -5573,6 +6050,7 @@ do
 		QS.wantMobs, QS.wantMine, QS.mobTarget = false, false, nil
 		QS.storyMobs, QS.storyMine = false, false
 		G.FTQuestRock = nil
+		G.FTQuestRocks = nil
 		G.FTReserve = {}
 		local d = data()
 		if not d then
@@ -5589,6 +6067,23 @@ do
 				order[#order + 1] = id
 			end
 			local focusId = settings.focusQuest ~= 'Auto' and d.Quests[settings.focusQuest] ~= nil and settings.focusQuest or nil
+			local hereQ, fracQ, mineQ = {}, {}, {}
+			for _, id in ipairs(order) do
+				hereQ[id] = Here.quest(d.Quests[id])
+				mineQ[id] = false
+				for _, p in ipairs(type(d.Quests[id]) == 'table' and d.Quests[id].Progress or {}) do
+					if (tonumber(p.currentProgress) or 0) < (tonumber(p.requiredAmount) or 1)
+						and (p.questType == 'Mine' or (p.questType == 'Collect' and not (ShopData and ShopData[tostring(p.target)]))) and Here.can(p) then
+						mineQ[id] = true
+					end
+				end
+				local sum, n = 0, 0
+				for _, p in ipairs(type(d.Quests[id]) == 'table' and d.Quests[id].Progress or {}) do
+					n += 1
+					sum += math.clamp((tonumber(p.currentProgress) or 0) / math.max(tonumber(p.requiredAmount) or 1, 1), 0, 1)
+				end
+				fracQ[id] = n > 0 and math.floor(sum / n * 1000 + 0.5) or 0
+			end
 			table.sort(order, function(a, b)
 				-- The quest you picked in "Focus quest" goes first.
 				if focusId and (a == focusId) ~= (b == focusId) then
@@ -5600,10 +6095,29 @@ do
 				if da ~= db then
 					return da
 				end
+				-- then the ones with something to do on this island
+				local ha, hb = hereQ[a], hereQ[b]
+				if ha ~= hb then
+					return ha
+				end
+				-- NPC / story quests before the daily and weekly board ones
+				local ba = string.find(tostring(a), '^Daily') ~= nil or string.find(tostring(a), '^Weekly') ~= nil
+				local bb = string.find(tostring(b), '^Daily') ~= nil or string.find(tostring(b), '^Weekly') ~= nil
+				if ba ~= bb then
+					return bb
+				end
 				local ra = QuestData and QuestData[a] and QuestData[a].Repeatable and 1 or 0
 				local rb = QuestData and QuestData[b] and QuestData[b].Repeatable and 1 or 0
 				if ra ~= rb then
 					return ra < rb
+				end
+				-- mining ones before fighting ones (rocks are always reachable; mob packs often are not)
+				if mineQ[a] ~= mineQ[b] then
+					return mineQ[a]
+				end
+				-- the one closest to finished first
+				if fracQ[a] ~= fracQ[b] then
+					return fracQ[a] > fracQ[b]
 				end
 				return tostring(a) < tostring(b)
 			end)
@@ -5625,6 +6139,10 @@ do
 					lockId = nil
 				end
 			end
+			-- (a quest with nothing to do right now is set aside and the next one tried in the same
+			-- pass: one per pass, with a walk to a quest giver in between each, took minutes to get
+			-- through a full quest log)
+			for _ = 1, math.max(1, #order) do
 			if not lockId then
 				for _, id in ipairs(order) do
 					if (stalled[id] or 0) < nowQ then
@@ -5635,6 +6153,9 @@ do
 				end
 			end
 			G.FTQuestLock = lockId
+			if not lockId then
+				break
+			end
 			local engaged = false
 			for _, id in ipairs(order) do
 				if id ~= lockId then
@@ -5658,7 +6179,9 @@ do
 					local cur, req = tonumber(p.currentProgress) or 0, tonumber(p.requiredAmount) or 1
 					if cur < req then
 						local t, target = p.questType, tostring(p.target)
-						if t == 'Kill' then
+						if (t == 'Kill' or t == 'Mine' or t == 'Collect') and not Here.can(p) then
+							-- (its mob / rock is not on this island: nothing to do for it from here)
+						elseif t == 'Kill' then
 							QS.wantMobs = true
 							engaged = true
 							if pri then
@@ -5679,6 +6202,12 @@ do
 							engaged = true
 							if t == 'Mine' and target ~= 'Any' and target ~= 'Rock' then
 								G.FTQuestRock = G.FTQuestRock or target
+							elseif t == 'Collect' and target ~= 'Ore' and next(Here.sources(target)) then
+								-- an ore: mine the rocks that drop it
+								G.FTQuestRocks = G.FTQuestRocks or {}
+								for name in pairs(Here.sources(target)) do
+									G.FTQuestRocks[name] = true
+								end
 							end
 							if pri then
 								QS.storyMine = true
@@ -5750,6 +6279,11 @@ do
 				stalled[lockId] = os.clock() + 300
 				lockId = nil
 			end
+			if lockId then
+				break
+			end
+			end
+			G.FTQuestLock = lockId
 		end
 		-- A quest that needs ore: don't sit on a 10,000 HP Lucky Block.
 		G.FTQuestWantsOre = QS.wantMine
@@ -6426,8 +6960,8 @@ pcall(function()
 		save()
 	end)
 end)
-bindToggle(FarmBox, 'FTAutoLuckPotion', 'autoLuckPotion', 'Auto luck potions (buy + drink)', 'Keeps a Luck Potion running: drinks them up to the 1 hour cap (never past it). Buys back up to 10 (the most the shop lets you hold) whenever it is in town anyway, and makes the trip to the stall when you run out.')
-bindToggle(FarmBox, 'FTAutoMinerPotion', 'autoMinerPotion', 'Auto miner potions (buy + drink)', 'Keeps a Miner Potion running: drinks them up to the 15 minute cap (3 potions - more would be wasted). Buys back up to 10 (the most the shop lets you hold) whenever it is in town anyway, and makes the trip to the stall when you run out.')
+bindToggle(FarmBox, 'FTAutoLuckPotion', 'autoLuckPotion', 'Auto luck potions (buy + drink)', 'Keeps a Luck Potion running: drinks them up to the 1 hour cap (never past it). Only buys more (10, the most the shop lets you hold) once you have none of that potion left.')
+bindToggle(FarmBox, 'FTAutoMinerPotion', 'autoMinerPotion', 'Auto miner potions (buy + drink)', 'Keeps a Miner Potion running: drinks them up to the 15 minute cap (3 potions - more would be wasted). Only buys more (10, the most the shop lets you hold) once you have none of that potion left.')
 bindToggle(FarmBox, 'FTAutoSell', 'autoSell', 'Auto sell ores', 'Sells your ores at Greedy Cey when the bag reaches the % below.')
 bindSlider(FarmBox, 'FTSellAt', 'sellAt', 'Sell when bag is % full', 20, 100)
 bindToggle(FarmBox, 'FTAutoSellGear', 'autoSellGear', 'Auto sell spare gear', 'Sells weapons and armor at Marbles once 3+ spares pile up. Never sells what you are wearing, the best item of each slot (weapon / helmet / chestplate / leggings), favorited items or pickaxes.')
@@ -6774,6 +7308,7 @@ MobBox:AddButton('Forget deadly mobs', function()
 	Deadly.clear()
 	setStatus('deadly list cleared' .. (was ~= '' and (' (was: ' .. was .. ')') or ''))
 end)
+bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything' }, 'Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 12% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
 bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Block / parry' }, 'Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Block / parry: stands and blocks. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)')
 bindSlider(MobBox, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
 bindToggle(MobBox, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
@@ -6866,15 +7401,44 @@ do
 				local active = B:GetActive()
 				banner = active and active.Id or B.Standard.Id
 			end)
+			local Races
+			pcall(function()
+				Races = require(RS.Shared.Data.Races).Races
+			end)
+			-- is this race one to stop on?
+			local function wanted(name)
+				local picks = type(settings.raceWant) == 'table' and next(settings.raceWant) and settings.raceWant or nil
+				if picks then
+					return name ~= nil and picks[name] == true
+				end
+				local def = Races and name and Races[name]
+				return (rank[type(def) == 'table' and def.Rarity or ''] or 0) >= want
+			end
+			-- the race the server's own answer to the roll names, if it names one
+			local function raceFrom(r)
+				if not Races then
+					return nil
+				end
+				if type(r) == 'string' then
+					return Races[r] and r or nil
+				end
+				if type(r) == 'table' then
+					for _, k in ipairs({ 'Race', 'NewRace', 'Result', 'Name', 'race', 'name', 'result' }) do
+						if type(r[k]) == 'string' and Races[r[k]] then
+							return r[k]
+						end
+					end
+					for _, v in pairs(r) do
+						if type(v) == 'string' and Races[v] then
+							return v
+						end
+					end
+				end
+				return nil
+			end
 			while alive and rolling do
 				local name, rarity, spins = raceInfo()
-				local picks = type(settings.raceWant) == 'table' and next(settings.raceWant) and settings.raceWant or nil
-				local done
-				if picks then
-					done = name ~= nil and picks[name] == true
-				else
-					done = (rank[rarity] or 0) >= want
-				end
+				local done = wanted(name)
 				if done then
 					setStatus(('race reroll: you have %s (%s) — done, %d spins used, %d left'):format(tostring(name), tostring(rarity), used, spins))
 					break
@@ -6894,14 +7458,39 @@ do
 				if ok and got then
 					used += 1
 					fails = 0
-					-- wait for our data to show the new race before deciding again
-					local t0 = os.clock()
-					while os.clock() - t0 < 2 and select(3, raceInfo()) == spins do
-						task.wait(0.1)
+					-- It used to wait (2s at most) for the spin count to drop and then read the race: the
+					-- race arrives in a separate update, so the next round could still see the OLD race and
+					-- roll straight over the one it was meant to stop on. Now: the server's own answer
+					-- decides first, and nothing is rolled again until our data is confirmed.
+					local told = raceFrom(got)
+					if told and wanted(told) then
+						setStatus(('race reroll: rolled %s — done, %d spins used'):format(told, used))
+						break
 					end
+					local t0 = os.clock()
 					local n2, r2, s2 = raceInfo()
+					while os.clock() - t0 < 8 and (s2 == spins or (told and n2 ~= told)) do
+						task.wait(0.1)
+						n2, r2, s2 = raceInfo()
+					end
+					if not told then
+						-- no race in the answer: the race we read must hold still before it is trusted
+						local same = os.clock()
+						while os.clock() - same < 1 do
+							task.wait(0.1)
+							local n3 = raceInfo()
+							if n3 ~= n2 then
+								n2, same = n3, os.clock()
+							end
+						end
+						n2, r2, s2 = raceInfo()
+					end
 					setStatus(('race reroll #%d: %s (%s) — %d spins left'):format(used, tostring(n2), tostring(r2), s2))
-					task.wait(0.4)
+					if s2 == spins or (told and n2 ~= told) then
+						setStatus(('race reroll: could not confirm roll #%d (answer %s, data %s) — stopped so nothing gets rolled over. Check your race, then press again.'):format(used, tostring(told), tostring(n2)))
+						break
+					end
+					task.wait(0.2)
 				else
 					fails += 1
 					if fails >= 3 then
@@ -7556,7 +8145,7 @@ task.spawn(function()
 		if (settings.autoLuckPotion or settings.autoMinerPotion) and not Potions.busy and os.clock() >= (Potions.drinkAt or 0) then
 			pcall(function()
 				if Potions.load() then
-					local name = Potions.next(true) -- (only when one has run out: never a whole stack at once)
+					local name = Potions.next(false) -- (asked for: keep drinking until the timer is as full as the game allows)
 					if name and not Potions.drink(name, true) then
 						Potions.busy = false
 						Potions.drinkAt = os.clock() + 5
@@ -7585,7 +8174,7 @@ function Potions.step()
 				local def = Potions.defs[name]
 				if def then
 					local dur, cap = tonumber(def.Duration) or 300, tonumber(def.MaxDuration) or 900
-					if Potions.count(name) > 0 and Potions.left(name) < 20 and Potions.left(name) + dur <= cap and now >= (Potions.drinkAt or 0) and not Potions.busy then
+					if Potions.count(name) > 0 and Potions.left(name) + dur <= cap and now >= (Potions.drinkAt or 0) and not Potions.busy then
 						if not Potions.drink(name) then
 							Potions.drinkAt = os.clock() + 20 -- (did not go down: not again right away)
 						end
@@ -7594,25 +8183,14 @@ function Potions.step()
 					buyName = buyName or (Potions.stall(name) and name)
 				end
 			end
-			-- already in town (selling, forging, a quest...) and below a full stock: top up now, so
-			-- the long walk here just for potions hardly ever happens
-			if buyName and now >= (Potions.topAt or 0) then
-				local pos = Potions.stall(buyName)
-				local _, hrpT = char()
-				local limit = tonumber(Potions.shop[buyName].MaxPurchaseLimit) or 10
-				if pos and hrpT and (pos - hrpT.Position).Magnitude < Potions.TOWN and Potions.count(buyName) < limit
-					and (tonumber(d.Gold) or 0) >= (tonumber(Potions.shop[buyName].Price) or math.huge) then
-					shopping[#shopping + 1] = buyName
-					Potions.topping = true
-				end
-			end
+			-- (asked for: no topping up - a potion is only bought once there is none of it left)
 			-- nothing of this kind left to drink and the last one is about to run out: restock
 			local have, running = 0, 0
 			for _, name in ipairs(names) do
 				have += Potions.count(name)
 				running = math.max(running, Potions.left(name))
 			end
-			if buyName and have == 0 and running < 45 and not table.find(shopping, buyName) then
+			if buyName and Potions.count(buyName) < 1 and not table.find(shopping, buyName) then
 				shopping[#shopping + 1] = buyName
 			end
 		end
@@ -7633,7 +8211,7 @@ function Potions.step()
 					for _, n2 in ipairs(names) do
 						other += Potions.count(n2)
 					end
-					if other < (tonumber(Potions.shop[name].MaxPurchaseLimit) or 10) then
+					if Potions.count(name) < 1 then
 						shopping[#shopping + 1] = name
 					end
 					break
@@ -8091,60 +8669,101 @@ task.spawn(function()
 					end
 				end
 				G.FTEnhanced = G.FTEnhanced or {}
+				-- Speed (the game lets the button be spammed): every worn item rolls at the same time, each
+				-- one roll after another with nothing in between; chance and cost are asked once per item
+				-- and level and remembered, so a roll is a single round trip.
+				G.FTEnhCache = G.FTEnhCache or {}
+				local running, didRoll, refused = 0, false, false
 				for slot, worn in pairs(d.Equipped or {}) do
 					local it = type(worn) == 'table' and worn.GUID and (fresh[worn.GUID] or worn) or nil
 					local known = it and math.max(tonumber(it.Upgrade) or 0, G.FTEnhanced[it.GUID] or 0) or 0
 					if it and it.Type and known < maxLv then
-						local lv = known
-						local okC, ch = svc:PreviewChance(it.GUID, {}, nil):await()
-						local okR, req = svc:GetUpgradeRequirements(it):await()
-						local chance = okC and type(ch) == 'table' and tonumber(ch.Final) or 0
-						local can = okR and type(req) == 'table' and type(req.materials) == 'table' and chance >= minCh
-							and (tonumber(d.Gold) or 0) >= (tonumber(req.totalPrice) or math.huge)
-						if can then
-							for _, m in ipairs(req.materials) do
-								if (have[m.material.Name] or 0) < (tonumber(m.quantity) or 0) then
-									can = false
-									-- (it used to just sit there: say what is missing, once per item and level)
-									G.FTEnhanceTold = G.FTEnhanceTold or {}
-									local key = it.GUID .. ':' .. lv .. ':' .. m.material.Name
-									if not G.FTEnhanceTold[key] then
-										G.FTEnhanceTold[key] = true
-										local msg = ('%s +%d -> +%d needs %d %s (you have %d)'):format(it.Type, lv, lv + 1,
-											tonumber(m.quantity) or 0, m.material.Name, have[m.material.Name] or 0)
-										statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. 'auto enhance waiting: ' .. msg
-										pcall(function()
-											game:GetService('StarterGui'):SetCore('SendNotification', { Title = 'Auto enhance waiting', Text = msg, Duration = 8 })
-										end)
+						running += 1
+						task.spawn(function()
+							pcall(function()
+								local lv = known
+								for _ = 1, 40 do
+									if not alive or not settings.autoEnhance or lv >= maxLv then
+										break
 									end
+									local ckey = it.GUID .. ':' .. lv
+									local c = G.FTEnhCache[ckey]
+									if not c then
+										local probe = table.clone(it)
+										probe.Upgrade = lv
+										local okC, ch = svc:PreviewChance(it.GUID, {}, nil):await()
+										local okR, req = svc:GetUpgradeRequirements(probe):await()
+										c = { chance = okC and type(ch) == 'table' and tonumber(ch.Final) or 0, req = okR and type(req) == 'table' and req or nil }
+										if c.req then
+											G.FTEnhCache[ckey] = c
+										end
+									end
+									local req, chance = c.req, c.chance
+									local dn = data()
+									local can = req and type(req.materials) == 'table' and chance >= minCh
+										and (tonumber(dn and dn.Gold) or 0) >= (tonumber(req.totalPrice) or math.huge)
+									if can then
+										local haveNow = {}
+										for _, mi in pairs(((dn or {}).Inventory or {}).Misc or {}) do
+											if type(mi) == 'table' and mi.Name then
+												haveNow[mi.Name] = (haveNow[mi.Name] or 0) + (tonumber(mi.Quantity) or 1)
+											end
+										end
+										for _, m in ipairs(req.materials) do
+											if (haveNow[m.material.Name] or 0) < (tonumber(m.quantity) or 0) then
+												can = false
+												G.FTEnhanceTold = G.FTEnhanceTold or {}
+												local key = it.GUID .. ':' .. lv .. ':' .. m.material.Name
+												if not G.FTEnhanceTold[key] then
+													G.FTEnhanceTold[key] = true
+													local msg = ('%s +%d -> +%d needs %d %s (you have %d)'):format(it.Type, lv, lv + 1,
+														tonumber(m.quantity) or 0, m.material.Name, haveNow[m.material.Name] or 0)
+													statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. 'auto enhance waiting: ' .. msg
+													pcall(function()
+														game:GetService('StarterGui'):SetCore('SendNotification', { Title = 'Auto enhance waiting', Text = msg, Duration = 8 })
+													end)
+												end
+											end
+										end
+									end
+									if not can then
+										break
+									end
+									local okE, res = svc:EnhanceEquipment(it.GUID, nil, nil):await()
+									local nlv = okE and type(res) == 'table' and tonumber(res.newLevel) or lv
+									G.FTEnhanced[it.GUID] = nlv
+									if nlv > lv then
+										didRoll = true
+										setStatus(('enhanced %s to +%d (%.0f%% chance)'):format(it.Type, nlv, chance))
+									elseif nlv < lv then
+										didRoll = true
+										setStatus(('enhancing %s failed: +%d -> +%d'):format(it.Type, lv, nlv))
+									else
+										refused = true
+										G.FTEnhCache[ckey] = nil
+										break
+									end
+									lv = nlv
 								end
-							end
-						end
-						if can then
-							local okE, res = svc:EnhanceEquipment(it.GUID, nil, nil):await()
-							local nlv = lv
-							if okE and type(res) == 'table' and tonumber(res.newLevel) then
-								nlv = tonumber(res.newLevel)
-								G.FTEnhanced[it.GUID] = nlv
-							end
-							if nlv > lv then
-								gap, noChange = 0.1, 0
-								setStatus(('enhanced %s to +%d (%.0f%% chance)'):format(it.Type, nlv, chance))
-							elseif nlv < lv then
-								gap, noChange = 0.1, 0
-								setStatus(('enhancing %s failed: +%d -> +%d'):format(it.Type, lv, nlv))
-							else
-								-- (one refusal can be the server's own rate limit: only three in a row is a stop)
-								noChange += 1
-								gap = 1
-								if noChange >= 3 then
-									noChange = 0
-									pauseUntil = os.clock() + 300
-									setStatus(('the game did not enhance %s — trying again in 5 minutes'):format(it.Type))
-								end
-							end
-							return -- one item per round
-						end
+							end)
+							running -= 1
+						end)
+					end
+				end
+				local tw = os.clock()
+				while running > 0 and os.clock() - tw < 60 do
+					task.wait(0.05)
+				end
+				if didRoll then
+					gap, noChange = 0.1, 0
+				elseif refused then
+					-- (one refusal can be the server's own rate limit: only three rounds in a row is a stop)
+					noChange += 1
+					gap = 1
+					if noChange >= 3 then
+						noChange = 0
+						pauseUntil = os.clock() + 300
+						setStatus('the game is not enhancing — trying again in 5 minutes')
 					end
 				end
 			end)
