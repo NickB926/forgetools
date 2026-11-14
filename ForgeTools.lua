@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v84'
+local BUILD = 'forge-tools-v89'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -86,6 +86,9 @@ local defaults = {
 	autoSellGear = false,
 	forgeWhenFull = false,
 	forgeAlternate = false,
+	autoEnhance = false,
+	enhanceMinChance = 100,
+	enhanceMaxLevel = 9,
 	raceStop = 'Legendary',
 	raceKeepSpins = 0,
 	sellAt = 90,
@@ -1503,11 +1506,14 @@ local function rockList()
 					local half = math.max(hb.Size.X, hb.Size.Z) / 2
 					if d > half + 8 then
 						for _, op in ipairs(others) do
-							if (op - hb.Position).Magnitude <= half + 9 then
+							if (op - hb.Position).Magnitude <= half + 13 then
 								taken = 1
 								break
 							end
 						end
+					end
+					if taken == 1 then
+						continue -- someone is at this rock: it is theirs
 					end
 					list[#list + 1] = { m = m, hb = hb, d = d, zone = zone.Name, danger = danger,
 						score = d + ((climb > 10 and d < 80) and climb * 4 or 0) + math.min(danger, 3) * 35 + taken * 150 + want }
@@ -1571,12 +1577,37 @@ local function mineOnce()
 		return true
 	end
 	G.FTNavDbg = nil
+	-- someone else reaches the rock while we are still on the way: leave it to them
+	local takenAt, takenNow = 0, false
+	local function takenByOther()
+		if os.clock() - takenAt < 0.4 then
+			return takenNow
+		end
+		takenAt, takenNow = os.clock(), false
+		local _, me = char()
+		local half = math.max(target.hb.Size.X, target.hb.Size.Z) / 2
+		if me and (me.Position - target.hb.Position).Magnitude > half + 8 then
+			for _, pl in ipairs(Players:GetPlayers()) do
+				local oh = pl ~= LocalPlayer and pl.Character and pl.Character:FindFirstChild('HumanoidRootPart')
+				if oh and (oh.Position - target.hb.Position).Magnitude <= half + 13 then
+					takenNow = true
+					unreachable[target.m] = os.clock() + 45
+					break
+				end
+			end
+		end
+		return takenNow
+	end
 	local okGo, why = tweenTo(standNear(target.hb, 2), { alt = alt, abort = function()
-		return not (settings.autoMine or G.FTQuestWantsOre) or not target.m.Parent or mineThreat() ~= nil
+		return not (settings.autoMine or G.FTQuestWantsOre) or not target.m.Parent or mineThreat() ~= nil or takenByOther()
 	end, onRelay = function()
 		setStatus(('mining %s (%.0f studs) — long route, walking via known spots'):format(target.m.Name, target.d))
 	end })
 	if handleThreat() then
+		return true
+	end
+	if takenNow then
+		setStatus(('someone else got to that %s first — picking another'):format(target.m.Name))
 		return true
 	end
 	if not okGo then
@@ -2444,6 +2475,20 @@ local function forgeOnce()
 	local before = #(((data() or {}).Inventory or {}).Equipments or {})
 	FC.Ores = ores
 	FC.ItemType = itemType
+	-- The forge request also carries what the forge SCREEN has selected (mold, locked class).
+	-- Left over from the other item type (e.g. weapon molds picked by hand, then an armor
+	-- forge) the game refuses the whole forge: make the screen agree with what we are making.
+	pcall(function()
+		local F = controller('UIController').Modules.Forge
+		F.selectedItemType = itemType
+		F.MoldItem, F.MoldCount, F.LockedClass = nil, 0, nil
+	end)
+	local oreNote = {}
+	for name, n in pairs(ores) do
+		oreNote[#oreNote + 1] = tostring(name) .. ' x' .. tostring(n)
+	end
+	table.sort(oreNote)
+	G.FTLastForge = itemType .. ': ' .. table.concat(oreNote, ', ')
 	task.spawn(function()
 		pcall(function()
 			FC:ChangeSequence('Melt')
@@ -2467,7 +2512,7 @@ local function forgeOnce()
 		task.wait(0.5)
 	end
 	if rejected then
-		setStatus('forge was rejected — reopening it next time')
+		setStatus('forge was rejected — reopening it next time [' .. tostring(G.FTLastForge):sub(1, 160) .. ']')
 	end
 	task.wait(2)
 	pcall(function()
@@ -5200,6 +5245,9 @@ bindToggle(QuestBox, 'FTAutoMail', 'autoMail', 'Auto claim mail & rewards', 'Eve
 bindToggle(QuestBox, 'FTAutoOffer', 'autoOffer', 'Auto offer altar shards', 'Twilight War altar: spends your side\'s shards on offers (x10 while you can, then x1) and takes the free daily gifts.')
 bindToggle(QuestBox, 'FTAutoDaily', 'autoDaily', 'Auto claim daily login', 'Claims the daily login reward when it is ready.')
 bindToggle(QuestBox, 'FTAutoCodes', 'autoCodes', 'Auto redeem codes', 'Tries each known code once per account. Add new codes to PlayerTools/forgecodes.txt (one per line).')
+bindToggle(ForgeBox, 'FTAutoEnhance', 'autoEnhance', 'Auto enhance equipped gear', 'Spends essences and gold to enhance the weapon and armor you are wearing, one level at a time. Only tries when the success chance is at least the number below: a failed enhance drops the item a level and can cost a rune slot. Never uses medallions.')
+bindSlider(ForgeBox, 'FTEnhanceMinChance', 'enhanceMinChance', 'Only enhance at this chance or better (%)', 50, 100, 'At 100 an enhance can never fail.')
+bindSlider(ForgeBox, 'FTEnhanceMaxLevel', 'enhanceMaxLevel', 'Stop enhancing at +', 1, 9, 'Items already at this level are left alone.')
 bindToggle(ForgeBox, 'FTAutoEquip', 'autoEquip', 'Auto equip better gear', 'After forging, equips the item if its slot is empty or it beats what you have on (more ores, then quality).')
 MobBox:AddButton('Refresh lists', function()
 	pcall(function()
@@ -5402,6 +5450,81 @@ end)
 -- Tracers pill + sync tracers to the saved setting
 pcall(wireTracersPill)
 pcall(setTracers, settings.tracers == true)
+
+-- Auto enhance: the gear being worn goes up one level at a time while the game's own success
+-- chance is at least the user's limit and the essences + gold are there. (Game rules: a failed
+-- enhance takes the item down a level, and at +3 / +6 / +9 it also loses a rune slot.)
+task.spawn(function()
+	local pauseUntil = 0
+	local gap = 5
+	while alive and G.SB2ForgeToolsToken == token do
+		task.wait(gap)
+		gap = 10 -- (right after a successful enhance the next one follows in 1.5s)
+		if settings.autoEnhance and os.clock() >= pauseUntil then
+			pcall(function()
+				local FC = controller('ForgeController')
+				local d = data()
+				local svc = service('EnhanceService')
+				if not d or not svc or (FC and FC.ForgeActive) then
+					return
+				end
+				local have = {}
+				for _, it in pairs((d.Inventory or {}).Misc or {}) do
+					if type(it) == 'table' and it.Name then
+						have[it.Name] = (have[it.Name] or 0) + (tonumber(it.Quantity) or 1)
+					end
+				end
+				local maxLv = math.clamp(tonumber(settings.enhanceMaxLevel) or 9, 1, 9)
+				local minCh = math.clamp(tonumber(settings.enhanceMinChance) or 100, 50, 100)
+				-- (d.Equipped is a copy that does not follow enhances: levels come from the inventory list)
+				local fresh = {}
+				for _, e in ipairs((d.Inventory or {}).Equipments or {}) do
+					if type(e) == 'table' and e.GUID then
+						fresh[e.GUID] = e
+					end
+				end
+				G.FTEnhanced = G.FTEnhanced or {}
+				for slot, worn in pairs(d.Equipped or {}) do
+					local it = type(worn) == 'table' and worn.GUID and (fresh[worn.GUID] or worn) or nil
+					local known = it and math.max(tonumber(it.Upgrade) or 0, G.FTEnhanced[it.GUID] or 0) or 0
+					if it and it.Type and known < maxLv then
+						local lv = known
+						local okC, ch = svc:PreviewChance(it.GUID, {}, nil):await()
+						local okR, req = svc:GetUpgradeRequirements(it):await()
+						local chance = okC and type(ch) == 'table' and tonumber(ch.Final) or 0
+						local can = okR and type(req) == 'table' and type(req.materials) == 'table' and chance >= minCh
+							and (tonumber(d.Gold) or 0) >= (tonumber(req.totalPrice) or math.huge)
+						if can then
+							for _, m in ipairs(req.materials) do
+								if (have[m.material.Name] or 0) < (tonumber(m.quantity) or 0) then
+									can = false
+								end
+							end
+						end
+						if can then
+							local okE, res = svc:EnhanceEquipment(it.GUID, nil, nil):await()
+							local nlv = lv
+							if okE and type(res) == 'table' and tonumber(res.newLevel) then
+								nlv = tonumber(res.newLevel)
+								G.FTEnhanced[it.GUID] = nlv
+							end
+							if nlv > lv then
+								gap = 1.5
+								setStatus(('enhanced %s to +%d (%.0f%% chance)'):format(it.Type, nlv, chance))
+							elseif nlv < lv then
+								setStatus(('enhancing %s failed: +%d -> +%d'):format(it.Type, lv, nlv))
+							else
+								pauseUntil = os.clock() + 300
+								setStatus(('the game did not enhance %s — trying again in 5 minutes'):format(it.Type))
+							end
+							return -- one item per round
+						end
+					end
+				end
+			end)
+		end
+	end
+end)
 
 -- Stuck watchdog: if an auto option is on but nothing has changed for 75s (no new status, no
 -- movement, no forge running), stop whatever it is waiting on and restart the loop.
