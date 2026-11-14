@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v130'
+local BUILD = 'forge-tools-v145'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -99,8 +99,10 @@ local defaults = {
 	autoForge = false,
 	forgeType = 'Weapon',
 	forgePiece = 'Any',
+	forgeMold = 'None',
 	fleeDeadly = true,
 	forgeOres = 3,
+	forgeMinOres = 3,
 	forgeTraits = false,
 	forgeTraitOres = {},
 	forgeKeep = 0,
@@ -117,6 +119,8 @@ local defaults = {
 	autoLuckPotion = false,
 	autoMinerPotion = false,
 	tracers = false,
+	mobTracers = false,
+	huntSpecial = {},
 	claimBoard = false,
 	autoBlock = false,
 	autoMail = false,
@@ -135,6 +139,8 @@ local defaults = {
 	retreatHp = 45,
 	healTo = 60,
 	mineRocks = {},
+	mineMutations = {},
+	mineMeteors = false,
 	maxMobHp = 80,
 	autoEquip = false,
 	tweenSpeed = 55,
@@ -1711,6 +1717,18 @@ local function rockList()
 			e.score += (tier[e.m.Name] or 0) * 100000
 		end
 	end
+	-- Marked rocks (the game's "RockMutation" attribute: Galaxy = Galactic, Blessed, Prismatic...)
+	-- picked in the menu go before everything else, whatever kind of rock they are and wherever.
+	local muts = type(settings.mineMutations) == 'table' and next(settings.mineMutations) and settings.mineMutations or nil
+	if muts and not G.FTQuestRock then
+		for _, e in ipairs(list) do
+			local mu = e.m:GetAttribute('RockMutation')
+			if mu and muts[mu] then
+				e.score -= 1e7
+				e.mut = mu
+			end
+		end
+	end
 	table.sort(list, function(a, b)
 		return a.score < b.score
 	end)
@@ -2257,9 +2275,77 @@ local function questForgeType()
 end
 -- "Alternate weapon / armor": the type flips after every item that was actually made.
 local forgeAlt, forgeFails = nil, 0
+local forgeBad = {} -- [item type] = os.clock() until which the server keeps refusing it
 local function forgeTypeNow()
-	return questForgeType() or Piece.typeOf(settings.forgePiece)
-		or (settings.forgeAlternate and forgeAlt) or settings.forgeType
+	local forced = questForgeType() or Piece.typeOf(settings.forgePiece)
+	if forced then
+		return forced
+	end
+	if settings.forgeAlternate and forgeAlt then
+		-- (measured: Weapon forges were refused every time while Armor went through; alternating
+		-- then lost ~10s on every second forge and a 5 minute pause after two in a row)
+		local other = (forgeAlt == 'Weapon') and 'Armor' or 'Weapon'
+		if (forgeBad[forgeAlt] or 0) > os.clock() and (forgeBad[other] or 0) <= os.clock() then
+			return other
+		end
+		return forgeAlt
+	end
+	return settings.forgeType
+end
+
+-- Molds: the game's way to aim a forge at one item. Each item has its own number of molds that
+-- guarantees it (Cutlass 12, Dagger 2, Excalibur 150...); with fewer the chance is
+-- (molds / guarantee) squared - half the molds is a quarter of the chance - so anything short of
+-- the full number mostly burns molds. The item also needs a minimum ore count (by its class:
+-- a straight sword 9, a colossal sword 50). We only ever use molds when the full number is owned.
+local Mold = {}
+do
+	local cache = {}
+	function Mold.info(name)
+		if cache[name] == nil then
+			local out = false
+			pcall(function()
+				local E = require(RS.Shared.Data.Equipments)
+				local IRm = require(RS.Shared.ItemRarity)
+				local d = E:GetItemData(name)
+				local base = E:GetItemBaseType(name)
+				local cfg = base and IRm:GetItemDataConfig(base)
+				local kind = E:GetItemType(name)
+				if d and base and (kind == 'Weapon' or kind == 'Armor') then
+					out = { kind = kind, molds = tonumber(d.Molds) or tonumber(IRm.MoldGuarantee) or 30, minOres = cfg and tonumber(cfg.lock_min_ores) or 3 }
+				end
+			end)
+			cache[name] = out
+		end
+		return cache[name] or nil
+	end
+	function Mold.owned(itemType)
+		local key = itemType == 'Weapon' and 'WeaponMold' or 'ArmorMold'
+		local n = 0
+		local d = data()
+		for _, it in pairs(d and d.Inventory and d.Inventory.Misc or {}) do
+			if type(it) == 'table' and it.Name == key then
+				n += tonumber(it.Quantity) or 1
+			end
+		end
+		return n
+	end
+	-- The mold target for a forge of `itemType`: name, molds to use, least ores - or nil when
+	-- none is picked, it is the other type, or we do not own enough molds to guarantee it.
+	function Mold.plan(itemType)
+		local name = settings.forgeMold
+		if type(name) ~= 'string' or name == 'None' then
+			return nil
+		end
+		local info = Mold.info(name)
+		if not info or info.kind ~= itemType then
+			return nil
+		end
+		if Mold.owned(itemType) < info.molds then
+			return nil, 0, 0, info
+		end
+		return name, info.molds, info.minOres, info
+	end
 end
 
 local function forgeNeeded()
@@ -2301,6 +2387,10 @@ local function forgeNeeded()
 	local need = math.max(3, tonumber(settings.forgeOres) or 3)
 	if (settings.forgeBest or settings.forgeTraits) and need <= 3 then
 		need = 20 -- wait for enough ores to make something bigger than a dagger
+	end
+	local moldName, _, moldMin = Mold.plan(forgeTypeNow())
+	if moldName then
+		need = moldMin -- (a molded item: exactly as many ores as that item needs is enough)
 	end
 	return total >= need
 end
@@ -2427,7 +2517,7 @@ do
 
 	-- Returns pick {ore = n}, count, score. The forge takes at most 4 different ore types, so try
 	-- every set of up to 4 of your best ore types and every ore count, and keep the best score.
-	function Best.pick(itemType, maxOres, exactN)
+	function Best.pick(itemType, maxOres, exactN, minN)
 		local types = {}
 		for name, n in pairs((forgeCounts())) do
 			local m, neu = oreMult(name)
@@ -2470,7 +2560,7 @@ do
 							break
 						end
 					end
-					if n >= 3 and all and (not exactN or n == exactN) then
+					if n >= math.max(3, minN or 3) and all and (not exactN or n == exactN) then
 						local score = (sum / n) * (exactN and 1 or expectedBase(itemType, n))
 						if score > best.score then
 							local pick = {}
@@ -2527,7 +2617,7 @@ do
 		return traitCache[itemType] or {}
 	end
 	-- Returns pick {ore = n}, count, how many ores are at full trait strength.
-	function Best.traitPick(itemType, maxOres, exactN)
+	function Best.traitPick(itemType, maxOres, exactN, minN)
 		local has = Best.traitOres(itemType)
 		local counts = forgeCounts()
 		local cands, others = {}, {}
@@ -2601,7 +2691,7 @@ do
 				best = { k = #set, score = score, pick = pick, n = n }
 			end
 		end
-		local lo, hi = exactN or 3, exactN or math.max(3, maxOres)
+		local lo, hi = exactN or math.max(3, minN or 3), exactN or math.max(3, maxOres)
 		for n = lo, hi do
 			for i = 1, #cands do
 				try({ cands[i] }, n)
@@ -2698,11 +2788,14 @@ local function pickForgeOres(itemType)
 		end
 		return pick, got
 	end
+	local moldName, _, moldMin = Mold.plan(itemType or settings.forgeType)
+	moldMin = moldName and moldMin or 3
+	moldMin = math.max(moldMin, math.clamp(tonumber(settings.forgeMinOres) or 3, 3, 60))
 	if settings.forgeTraits then
 		local cap = tonumber(settings.forgeOres) or 3
-		cap = cap > 3 and cap or 60
-		local pick, got = Best.traitPick(itemType or settings.forgeType, cap)
-		if got >= 3 then
+		cap = math.max(cap > 3 and cap or 60, moldMin)
+		local pick, got = Best.traitPick(itemType or settings.forgeType, cap, nil, moldMin)
+		if got >= moldMin then
 			return pick, got
 		end
 	end
@@ -2710,12 +2803,13 @@ local function pickForgeOres(itemType)
 		-- Slider left at the old default (3) would cap "best" at a dagger: treat <=3 as "no cap" (60).
 		local cap = tonumber(settings.forgeOres) or 3
 		cap = cap > 3 and cap or 60
-		local pick, got = Best.pick(itemType or settings.forgeType, cap)
-		if got >= 3 then
+		cap = math.max(cap, moldMin)
+		local pick, got = Best.pick(itemType or settings.forgeType, cap, nil, moldMin)
+		if got >= moldMin then
 			return pick, got
 		end
 	end
-	local want = math.max(3, tonumber(settings.forgeOres) or 3)
+	local want = math.max(3, tonumber(settings.forgeOres) or 3, moldMin)
 	local ores = forgeCounts()
 	local list = {}
 	for name, n in pairs(ores) do
@@ -2888,6 +2982,18 @@ local function forgeOnce()
 		local F = controller('UIController').Modules.Forge
 		F.selectedItemType = itemType
 		F.MoldItem, F.MoldCount, F.LockedClass = nil, 0, nil
+		-- the mold target, when we own enough molds to guarantee it and the ores reach its minimum
+		local moldName, moldCount, moldMin = Mold.plan(itemType)
+		local total = 0
+		for _, n in pairs(ores) do
+			total += n
+		end
+		if moldName and total >= moldMin then
+			F.MoldItem, F.MoldCount = moldName, moldCount
+			G.FTLastMold = ('%s with %d molds'):format(moldName, moldCount)
+		else
+			G.FTLastMold = nil
+		end
 	end)
 	local oreNote = {}
 	for name, n in pairs(ores) do
@@ -2895,10 +3001,14 @@ local function forgeOnce()
 	end
 	table.sort(oreNote)
 	G.FTLastForge = itemType .. ': ' .. table.concat(oreNote, ', ')
+	-- The game's own call comes back as soon as the server has answered; refused = it has put the
+	-- screen back on ore select by then (no need to sit there 6 seconds to find out).
+	local meltBack = false
 	task.spawn(function()
 		pcall(function()
 			FC:ChangeSequence('Melt')
 		end)
+		meltBack = true
 	end)
 	-- Wait for the new item to land in the inventory (or give up after 90s).
 	local t2 = os.clock()
@@ -2911,16 +3021,16 @@ local function forgeOnce()
 			break
 		end
 		-- The server refused to start (the game drops back to ore select): stop waiting.
-		if os.clock() - t2 > 6 and FC.Sequence == 'OreSelect' then
+		if FC.Sequence == 'OreSelect' and (os.clock() - t2 > 6 or (meltBack and os.clock() - t2 > 0.5)) then
 			rejected = true
 			break
 		end
-		task.wait(0.5)
+		task.wait(0.25)
 	end
 	if rejected then
 		setStatus('forge was rejected — reopening it next time [' .. tostring(G.FTLastForge):sub(1, 160) .. ']')
 	end
-	task.wait(2)
+	task.wait(ok and 1 or 0.3)
 	pcall(function()
 		FC:EndForge()
 	end)
@@ -2965,7 +3075,16 @@ local function forgeOnce()
 		pcall(autoEquipBest)
 	else
 		forgeFails += 1
-		if forgeFails >= 2 then
+		local other = (itemType == 'Weapon') and 'Armor' or 'Weapon'
+		if rejected then
+			forgeBad[itemType] = os.clock() + 600
+		end
+		if rejected and settings.forgeAlternate and (forgeBad[other] or 0) <= os.clock()
+			and not questForgeType() and not Piece.typeOf(settings.forgePiece) then
+			forgeFails = 0
+			forgeAlt = other
+			setStatus(('the forge refused a %s [%s] — making %s only for the next 10 minutes'):format(itemType, tostring(G.FTLastForge):sub(1, 120), other))
+		elseif forgeFails >= 2 then
 			forgeFails = 0
 			G.FTForgeFailUntil = os.clock() + 300
 			G.FTForgeDrain = nil
@@ -3277,6 +3396,146 @@ local function mobList()
 		return a.d < b.d
 	end)
 	return list
+end
+
+-- Special enemies picked to hunt (the game marks them with a "Mutation" attribute: Heaven, Hell,
+-- Lucky...): nearest first. They go before quests and farming.
+local huntSkip = {} -- [modifier .. ' ' .. kind] = os.clock() until which it is left alone (it killed us)
+local function specialTargets()
+	local want = settings.huntSpecial
+	local list = {}
+	if type(want) ~= 'table' or not next(want) then
+		return list
+	end
+	local _, hrp = char()
+	local living = workspace:FindFirstChild('Living')
+	if not hrp or not living then
+		return list
+	end
+	for _, m in ipairs(living:GetChildren()) do
+		local mut = m:GetAttribute('Mutation')
+		if mut and want[mut] and m:GetAttribute('IsNpc') and m:GetAttribute('KillCredited') ~= true then
+			local h = m:FindFirstChildOfClass('Humanoid')
+			local r = mobRoot(m)
+			local key = tostring(mut) .. ' ' .. (string.gsub(m.Name, '%d+$', ''))
+			if h and r and h.Health > 0 and h.MaxHealth < 1e8 and not Lava.at(r.Position) and not Deadly.is(m)
+				and (huntSkip[key] or 0) < os.clock() then
+				list[#list + 1] = { m = m, h = h, r = r, d = (r.Position - hrp.Position).Magnitude, mut = mut, hunt = true, key = key }
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.d < b.d
+	end)
+	return list
+end
+
+-- Event meteors (Inferno / Prismatic / Fichillium / comet rocks). They are not in workspace.Rocks:
+-- the game's CometRockController knows where each one is, they last 90 seconds, and they are broken
+-- with the pickaxe from within 6 studs (CometRocks.HitRange). Standing within 5 studs of one as it
+-- LANDS kills (KillRadius), so we wait 12 studs off until it has been there a few seconds.
+local Meteor = { seen = {}, bad = {} }
+function Meteor.list()
+	local out = {}
+	local CC = controller('CometRockController')
+	local ok, ps = pcall(function()
+		return CC:Positions()
+	end)
+	local _, hrp = char()
+	if ok and type(ps) == 'table' and hrp then
+		for _, pos in ipairs(ps) do
+			if typeof(pos) == 'Vector3' then
+				local key = ('%d,%d,%d'):format(pos.X, pos.Y, pos.Z)
+				Meteor.seen[key] = Meteor.seen[key] or os.clock()
+				if (Meteor.bad[key] or 0) < os.clock() then
+					out[#out + 1] = { pos = pos, key = key, d = (pos - hrp.Position).Magnitude }
+				end
+			end
+		end
+	end
+	table.sort(out, function(a, b)
+		return a.d < b.d
+	end)
+	return out
+end
+function Meteor.step()
+	if not settings.mineMeteors then
+		return false
+	end
+	local t = Meteor.list()[1]
+	if not t or t.d > 1500 then
+		return false
+	end
+	local function there()
+		for _, e in ipairs(Meteor.list()) do
+			if (e.pos - t.pos).Magnitude < 4 then
+				return true
+			end
+		end
+		return false
+	end
+	local _, hrp = char()
+	if not hrp then
+		return false
+	end
+	setStatus(('meteor (%.0f studs)'):format(t.d))
+	local flat = (hrp.Position - t.pos) * Vector3.new(1, 0, 1)
+	local dir = flat.Magnitude > 1 and flat.Unit or Vector3.new(1, 0, 0)
+	local function spot(dist)
+		local at = t.pos + dir * dist
+		local g = groundAt(at + Vector3.new(0, 8, 0))
+		local y = (g and math.abs(g.Y - 3 - t.pos.Y) < 12) and g.Y or t.pos.Y + 3 -- (groundAt already stands us 3 up)
+		local sp = Vector3.new(at.X, y, at.Z)
+		return CFrame.lookAt(sp, Vector3.new(t.pos.X, sp.Y, t.pos.Z))
+	end
+	if t.d > 16 then
+		tweenTo(spot(12), { abort = function()
+			return not settings.mineMeteors or not there()
+		end })
+	end
+	-- (not under it while it lands)
+	while alive and settings.mineMeteors and there() and os.clock() - (Meteor.seen[t.key] or 0) < 4 do
+		task.wait(0.2)
+	end
+	if not there() then
+		return true
+	end
+	local _, h2 = char()
+	if not h2 then
+		return true
+	end
+	h2.CFrame = spot(3.5)
+	h2.AssemblyLinearVelocity = Vector3.zero
+	local tool = equip('Pickaxe')
+	local t0 = os.clock()
+	local swings = 0
+	while alive and settings.mineMeteors and there() and os.clock() - t0 < 60 do
+		local _, h3, hum = char()
+		if not h3 or not hum or hum.Health <= 0 or hum.Health / math.max(1, hum.MaxHealth) < 0.3 then
+			break
+		end
+		if ((h3.Position - t.pos) * Vector3.new(1, 0, 1)).Magnitude > 5 then
+			h3.CFrame = spot(3.5)
+			h3.AssemblyLinearVelocity = Vector3.zero
+		else
+			h3.CFrame = CFrame.lookAt(h3.Position, Vector3.new(t.pos.X, h3.Position.Y, t.pos.Z))
+		end
+		if not (tool and tool.Parent == LocalPlayer.Character) then
+			tool = equip('Pickaxe')
+		end
+		swing(tool)
+		swings += 1
+		setStatus(('breaking meteor (%d swings)'):format(swings))
+		task.wait(0.35)
+	end
+	if there() then
+		-- still standing after a minute of swings (or we had to leave): not this one again for a while
+		Meteor.bad[t.key] = os.clock() + 45
+		statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('meteor not broken after %d swings'):format(swings)
+	else
+		statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('meteor broken (%d swings)'):format(swings)
+	end
+	return true
 end
 
 local function lowHp()
@@ -3931,6 +4190,13 @@ local function fightOnce(forced)
 			ownAtkConn = st.ChildAdded:Connect(function(d)
 				if d.Name == 'Attacking' then
 					ownAtkAt = os.clock()
+					-- (measured with a spear: the flag shows 0.29s after the press and the damage 0.65-0.8s
+					-- after it, for a hitbox the data puts at 0.40 - the server runs the swing that much late.
+					-- Leaving at 0.40 + 0.2 missed 15 swings of 26.)
+					local lag = ownAtkAt - lastSwingAt
+					if lag > 0.05 and lag < 0.6 then
+						G.FTAccLag = (G.FTAccLag or lag) * 0.7 + lag * 0.3
+					end
 				end
 			end)
 		end
@@ -3989,19 +4255,40 @@ local function fightOnce(forced)
 			return
 		end
 		local gap = (h.Position - target.r.Position).Magnitude - math.max(target.r.Size.X, target.r.Size.Z) / 2
+		-- (trace: every 0.05s from the press, our gap to the mob; '!' = it is attacking, 'f' = we face away)
+		do
+			local rel = now - (pend.at - pend.ht)
+			pend.tr = pend.tr or {}
+			if rel < 1.25 and rel >= (pend.trNext or 0) then
+				pend.trNext = rel + 0.05
+				local st = target.m:FindFirstChild('Status')
+				local atk = st and st:FindFirstChild('Attacking')
+				local to = (target.r.Position - h.Position) * Vector3.new(1, 0, 1)
+				local facing = to.Magnitude < 0.1 or h.CFrame.LookVector:Dot(to.Unit) > 0.7
+				pend.tr[#pend.tr + 1] = ('%.2f:%d%s%s%s'):format(rel, gap, atk and '!' or '', facing and '' or 'f', (target.r.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude > 3 and ('v%d'):format((target.r.AssemblyLinearVelocity * Vector3.new(1, 0, 1)).Magnitude) or '')
+			end
+		end
+		if now >= pend.at and not pend.gapAt then
+			pend.gapAt = gap -- (where we stood the moment the hitbox was due)
+		end
+		if now >= pend.at - 0.3 and not pend.dmg and target.h.Health < (pend.hp or target.h.Health) - 0.5 then
+			pend.dmg, pend.dmgGap = now - (pend.at - pend.ht), gap -- (when the damage really showed up)
+		end
 		if now < pend.at - 0.3 then
 			pend.hp = target.h.Health
-		elseif now <= pend.at + pend.hd + 0.05 then
+		elseif now <= pend.at + (pend.lag or 0) + pend.hd + 0.05 then
 			pend.far = math.max(pend.far or 0, gap)
 			if not strikeSafe(pend.reach, 0) then
 				pend.unsafe = true
 			end
 			pend.nearest = math.min(pend.nearest or 999, gap)
 		end
-		if flush or now > pend.at + pend.hd + 0.45 then
+		if flush or now > pend.at + (pend.lag or 0) + pend.hd + 0.6 then
 			local log = G.FTSwingLog
 			log[#log + 1] = ('%s %s#%d ht=%.2f gap %.0f..%.0f reach=%.0f %s'):format((pend.why or '?') .. (pend.unsafe and ' UNSAFE' or '') .. (ownAtkAt >= pend.at - pend.ht - 0.05 and (' acc%.2f'):format(ownAtkAt - (pend.at - pend.ht)) or ' REJECTED') .. (' tool=' .. tostring(pend.tool)), target.m.Name:gsub('%d+$', ''), pend.idx, pend.ht,
-				pend.nearest or -1, pend.far or -1, pend.reach, target.h.Health < (pend.hp or target.h.Health) - 0.5 and 'HIT' or 'miss')
+				pend.nearest or -1, pend.far or -1, pend.reach, (target.h.Health < (pend.hp or target.h.Health) - 0.5 and 'HIT' or 'miss')
+					.. (' at=%.0f'):format(pend.gapAt or -1) .. (pend.dmg and (' dmg+%.2f@%.0f'):format(pend.dmg, pend.dmgGap or -1) or '')
+					.. ' | ' .. table.concat(pend.tr or {}, ' '))
 			if #log > 80 then
 				table.remove(log, 1)
 			end
@@ -4050,9 +4337,35 @@ local function fightOnce(forced)
 		spot = Vector3.new(spot.X, floor.Position.Y + 3, spot.Z)
 		return CFrame.lookAt(spot, Vector3.new(tp.X, spot.Y, tp.Z))
 	end
+	-- Where the SERVER has the mob. The game's hitbox (HitboxClass) is a box around our own
+	-- character, about 5.5 studs each way for a spear, tested on the server against the mob as the
+	-- server has it. What we see is the mob ~0.25s ago and our hop takes ~0.15s to get there, so a mob
+	-- running at 20 is 6-8 studs from where it is on screen: standing right next to its picture missed
+	-- (6 swings of 36, all on mobs that were moving). So aim at where it is going.
+	local function leadOffset()
+		local v = target.r.AssemblyLinearVelocity * Vector3.new(1, 0, 1)
+		if v.Magnitude < 3 then
+			return Vector3.zero
+		end
+		local off = v * math.clamp((G.FTAccLag or 0.3) + 0.1, 0.2, 0.5)
+		if off.Magnitude > 8 then
+			off = off.Unit * 8
+		end
+		-- (a mob running at us stops when it gets to us: never aim past ourselves)
+		local _, h0 = char()
+		if h0 then
+			local toUs = (h0.Position - target.r.Position) * Vector3.new(1, 0, 1)
+			if toUs.Magnitude > 0.5 and off:Dot(toUs.Unit) > toUs.Magnitude - 2.5 then
+				local along = math.max(0, toUs.Magnitude - 2.5)
+				off = toUs.Unit * math.min(along, off:Dot(toUs.Unit))
+			end
+		end
+		return off
+	end
 	local function hopIn(h, reach)
 		-- The hitbox only reaches ~reach studs in front of us: stand well inside it, facing the mob.
-		local cf = standFor(math.clamp(reach - 3.5, 1.5, 4))
+		-- (traced: 4-5 studs off missed 14 swings of 16, 2-3 off hit 9 of 10)
+		local cf = standFor(math.clamp(reach - 3.5, 1.5, 2.3))
 		if Lava.at(groundAt(cf.Position)) then
 			-- that side of the mob is lava: any dry side will do
 			local tp = target.r.Position
@@ -4066,7 +4379,17 @@ local function fightOnce(forced)
 				end
 			end
 		end
+		local off = leadOffset()
+		if off.Magnitude > 0.5 then
+			local spot = cf.Position + off
+			if not Lava.at(groundAt(spot)) then
+				local tp = target.r.Position + off
+				local flat = Vector3.new(tp.X, spot.Y, tp.Z)
+				cf = (flat - spot).Magnitude > 0.5 and CFrame.lookAt(spot, flat) or (cf + off)
+			end
+		end
 		h.CFrame = cf
+		-- (the server slides the hitbox by our own velocity / 6: stand still for it)
 		h.AssemblyLinearVelocity = Vector3.zero
 	end
 	local function swingTick(reach)
@@ -4099,8 +4422,13 @@ local function fightOnce(forced)
 		local cd = combat and type(combat.HitCooldown) == 'table' and tonumber(combat.HitCooldown[idx]) or 0.4
 		local ht = combat and type(combat.HitboxTiming) == 'table' and tonumber(combat.HitboxTiming[idx]) or 0.27
 		local hd = combat and type(combat.HitboxDuration) == 'table' and tonumber(combat.HitboxDuration[idx]) or 0.1
-		STRIKE_LEAD = ht >= 0.6 and 0.42 or 0.12
-		if hitRun and not (strikeSafe(reach, ht - STRIKE_LEAD) and strikeSafe(reach, ht - STRIKE_LEAD / 2) and strikeSafe(reach, ht) and strikeSafe(reach, ht + hd)) then
+		-- (traced at ~300ms round trip: arriving 0.05s before the hitbox on a mob standing still missed
+		-- 3 of 3, standing there from the start hit 8 of 8 - our hop reaches the server late. Leaving can
+		-- be early for the same reason.)
+		STRIKE_LEAD = ht >= 0.6 and 0.42 or 0.3
+		local lag = 0 -- (tried staying 0.3s longer for server lag: no better, 16 hits of 31, and more damage taken)
+		if hitRun and not (strikeSafe(reach, ht - STRIKE_LEAD) and strikeSafe(reach, ht - STRIKE_LEAD / 2) and strikeSafe(reach, ht) and strikeSafe(reach, ht + hd)
+			and strikeSafe(reach, ht + lag / 2) and strikeSafe(reach, ht + lag) and strikeSafe(reach, ht + lag + hd)) then
 			return -- this swing's hitbox would come out while a mob's hit is landing: hold it a moment
 		end
 		if hitRun then
@@ -4134,7 +4462,7 @@ local function fightOnce(forced)
 			G.FTSwingWhy = lateEnd and ('answer%+.2f'):format(now + ht - lateEnd) or (lastOff and now - lastOff < 0.6) and ('follow%.2f'):format(now - lastOff)
 				or (not engaged and 'far') or 'blind'
 			-- (an attack in progress whose hit-moment our swing clears - checked above - is answered now)
-			if not lateEnd and engaged and not (lastOff and now - lastOff < 0.6) and waited < 1.5 then
+			if ht >= 0.6 and not lateEnd and engaged and not (lastOff and now - lastOff < 0.6) and waited < 1.5 then
 				return -- nothing to answer yet: wait for its next wind-up
 			end
 		end
@@ -4144,9 +4472,9 @@ local function fightOnce(forced)
 		-- (a great axe's swing plays for 1.6s but its cooldown says 1.5: a press in between is dropped)
 		local dur = combat and type(combat.AttackDuration) == 'table' and tonumber(combat.AttackDuration[idx]) or 0
 		nextSwingAt = now + math.max(cd, dur) + 0.05
-		strikeAt, strikeEnd = now + ht, now + ht + hd + (ht >= 0.6 and 0.22 or 0.1)
+		strikeAt, strikeEnd = now + ht, now + ht + lag + (ht >= 0.6 and hd + 0.22 or 0.06)
 		track(true) -- (close the books on the previous swing)
-		pend = { at = now + ht, hd = hd, ht = ht, idx = idx, reach = reach, hp = target.h.Health, why = hitRun and G.FTSwingWhy or 'n/a', tool = tool and tool.Parent and tool.Parent.ClassName or 'nil' }
+		pend = { at = now + ht, lag = lag, hd = hd, ht = ht, idx = idx, reach = reach, hp = target.h.Health, why = hitRun and G.FTSwingWhy or 'n/a', tool = tool and tool.Parent and tool.Parent.ClassName or 'nil' }
 	end
 	local retargetAt, regroupAt = os.clock() + 1, 0
 	while alive and allowed() and target.m.Parent and target.h.Health > 0 and os.clock() - t0 < 45 do
@@ -4218,16 +4546,18 @@ local function fightOnce(forced)
 		end
 		local inRange = hrp and (hrp.Position - target.r.Position).Magnitude <= reach - 1 + math.max(target.r.Size.X, target.r.Size.Z) / 2
 		local striking = hitRun and strikeAt and now >= strikeAt - STRIKE_LEAD and now <= strikeEnd
-		if striking and hrp and (strikeSafe(reach, 0) or (now <= strikeAt + 0.2 and strikeSafe(reach, 0, 0.08))) and not (rem and rem > 0 and rem < 0.25) then
+		if striking and hrp and (strikeSafe(reach, 0) or (now <= strikeEnd - 0.05 and strikeSafe(reach, 0, 0.08))) and not (rem and rem > 0 and rem < 0.25) then
 			-- Our hitbox is (about to be) out and no hit is landing on us: be on the mob for it.
 			G.FTStrikeUntil = strikeEnd -- (the strafe above leaves us alone while our own hitbox is out)
 			-- (measured: standing still 2-5 studs off, every swing hit; with the mob lunging into / through
 			-- us mid-swing - gap under 1 - 12 of 30 misses. So hold the gap for the whole strike.)
-			local gapNow = (hrp.Position - target.r.Position).Magnitude - math.max(target.r.Size.X, target.r.Size.Z) / 2
-				if not inRange or gapNow < 2.5 or gapNow > 5.5 then
+			local aim = target.r.Position + leadOffset()
+			local gapNow = ((hrp.Position - aim) * Vector3.new(1, 0, 1)).Magnitude - math.max(target.r.Size.X, target.r.Size.Z) / 2
+			if not inRange or gapNow < 1.2 or gapNow > 3.3 then
 				hopIn(hrp, reach)
 			else
-				hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.r.Position.X, hrp.Position.Y, target.r.Position.Z))
+				hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(aim.X, hrp.Position.Y, aim.Z))
+				hrp.AssemblyLinearVelocity = Vector3.zero
 			end
 			task.wait()
 		elseif threatPos and rem and rem < 0.45 then
@@ -5466,14 +5796,50 @@ do
 	-- Known working codes (Nov 2026). Add more in PlayerTools/forgecodes.txt, one per line.
 	local CODES = { 'AIDASAYSSORRY', 'SORRYFORSHUTDOWNN!', 'TWILIGHTWAR', 'FORGECOMEBACK', 'CRIMSONSAKURA' }
 	local triedPath = 'PlayerTools/forgecodes_tried_' .. string.lower(LocalPlayer.Name):gsub('[^%w_]', '') .. '.txt'
-	local tried = {}
+	local tried = {} -- [code] = os.time() of the last attempt (0 = from before times were kept)
 	pcall(function()
 		if isfile(triedPath) then
 			for line in readfile(triedPath):gmatch('[^\r\n]+') do
-				tried[line] = true
+				local c, t = line:match('^(.-)\t(%d+)$')
+				tried[c or line] = tonumber(t) or 0
 			end
 		end
 	end)
+	-- The game does not tell the client which codes exist, so the working ones are read from a
+	-- tracker page every 15 minutes (each is shown there in a <code> tag). A tracker can be hours
+	-- behind the game's Discord: brand new codes still go in forgecodes.txt by hand.
+	local online, onlineAt = {}, -1e9
+	local ONLINE_URL = 'https://www.theforge.gg/codes'
+	local function fetchOnline()
+		if os.clock() - onlineAt < 900 then
+			return
+		end
+		onlineAt = os.clock()
+		local okh, body = pcall(function()
+			return game:HttpGet(ONLINE_URL)
+		end)
+		if not okh or type(body) ~= 'string' then
+			G.FTCodesOnline = 'fetch failed: ' .. tostring(body):sub(1, 80)
+			return
+		end
+		local found, n = {}, 0
+		for c in body:gmatch('<code[^>]*>([^<]+)</code>') do
+			c = c:gsub('&amp;', '&'):gsub('^%s+', ''):gsub('%s+$', '')
+			if #c >= 4 and #c <= 32 and c:match('^[%w!_%-%.]+$') and c:match('%u') and not found[c] then
+				found[c] = true
+				n += 1
+			end
+		end
+		if n > 0 then
+			online = found
+		end
+		local names = {}
+		for c in pairs(online) do
+			names[#names + 1] = c
+		end
+		table.sort(names)
+		G.FTCodesOnline = ('%d listed: %s'):format(n, table.concat(names, ', '))
+	end
 	local function codeList()
 		local list, seen = {}, {}
 		local function add(c)
@@ -5484,6 +5850,9 @@ do
 			end
 		end
 		for _, c in ipairs(CODES) do
+			add(c)
+		end
+		for c in pairs(online) do
 			add(c)
 		end
 		pcall(function()
@@ -5600,9 +5969,13 @@ do
 			for k, v in pairs(d.RedeemedCodes or {}) do
 				redeemed[type(k) == 'string' and k or tostring(v)] = true
 			end
+			pcall(fetchOnline)
 			for _, code in ipairs(codeList()) do
-				if not tried[code] and not redeemed[code] and not redeemed[code:upper()] then
-					tried[code] = true
+				-- a code the tracker lists as working gets another go every 6 hours (a first try can
+				-- fail on a rate limit or before the code is live)
+				local again = online[code] and tried[code] and os.time() - tried[code] > 21600
+				if (not tried[code] or again) and not redeemed[code] and not redeemed[code:upper()] then
+					tried[code] = os.time()
 					local okr, res = pcall(function()
 						return select(2, service('CodeService'):RedeemCode(code):await())
 					end)
@@ -5615,8 +5988,8 @@ do
 					end
 					pcall(function()
 						local lines = {}
-						for c in pairs(tried) do
-							lines[#lines + 1] = c
+						for c, t in pairs(tried) do
+							lines[#lines + 1] = c .. '\t' .. tostring(tonumber(t) or 0)
 						end
 						writefile(triedPath, table.concat(lines, '\n') .. '\n')
 					end)
@@ -5937,6 +6310,7 @@ local function mobNames()
 end
 
 bindToggle(FarmBox, 'FTAutoMine', 'autoMine', 'Auto mine', 'Tweens to the nearest rock and mines it. Rock types your pickaxe cannot damage are skipped.')
+bindToggle(FarmBox, 'FTMineMeteors', 'mineMeteors', 'Break event meteors', 'When an event drops meteors (Inferno, Prismatic, Fichillium, comet rocks) the bot goes to each one and breaks it with the pickaxe before anything else. They only last 90 seconds.')
 local zoneDD = bindDropdown(FarmBox, 'FTMineZone', 'mineZone', 'Mine in', zoneNames())
 local function rockNames()
 	local hp, out = {}, {}
@@ -5963,6 +6337,43 @@ local function rockNames()
 end
 local rockDD
 pcall(function()
+	pcall(function()
+		local labels, idOf, labelOf = {}, {}, {}
+		pcall(function()
+			for id, def in pairs(require(RS.Shared.Data.RockMutations).Mutations) do
+				local label = type(def) == 'table' and tostring(def.DisplayName or id) or tostring(id)
+				labels[#labels + 1] = label
+				idOf[label], labelOf[id] = id, label
+			end
+		end)
+		if #labels == 0 then
+			for id, label in pairs({ Galaxy = 'Galactic', Blessed = 'Blessed', Prismatic = 'Prismatic', Moss = 'Mossy', Corrupted = 'Corrupted', Molten = 'Molten' }) do
+				labels[#labels + 1] = label
+				idOf[label], labelOf[id] = id, label
+			end
+		end
+		table.sort(labels)
+		if type(settings.mineMutations) ~= 'table' then
+			settings.mineMutations = {}
+		end
+		local def = {}
+		for id, on in pairs(settings.mineMutations) do
+			if on == true and labelOf[id] then
+				def[#def + 1] = labelOf[id]
+			end
+		end
+		FarmBox:AddDropdown('FTMineMutations', { Text = 'Marked rocks first', Values = labels, Multi = true, Default = def, AllowNull = true,
+			Tooltip = 'Rocks carrying one of these marks (Galactic, Blessed, Prismatic...) are mined before anything else, whatever kind of rock they are and wherever they are on the map. Nothing picked = off.' }):OnChanged(function(v)
+			local out = {}
+			for label, on in pairs(type(v) == 'table' and v or {}) do
+				if on and idOf[label] then
+					out[idOf[label]] = true
+				end
+			end
+			settings.mineMutations = out
+			save()
+		end)
+	end)
 	rockDD = FarmBox:AddDropdown('FTMineRocks', { Text = 'Mine these rocks first', Values = rockNames(), Multi = true, Default = settings.mineRocks, AllowNull = true,
 		Tooltip = 'Works with Auto mine. Picked rocks are mined before anything else, however far. When none of them is up, it takes the next best kind: the one with the most health below your pick (huge > large > medium > small). Nothing picked = nearest rock, as before. Listed from most health to least.' })
 	rockDD:OnChanged(function(v)
@@ -6206,8 +6617,90 @@ do
 		end)
 	end)
 end
-bindDropdown(ForgeBox, 'FTForgePiece', 'forgePiece', 'Aim for piece', Piece.names(), 'The game rolls the piece from how many ores go in, so it cannot be forced. This waits for the ore count with the best odds for the piece you pick, forges with exactly that many, and repeats. Overrides Weapon / Armor above. "Ores per forge (max)" still caps it.')
+-- Piece target: how many ores go in decides WHICH piece comes out (few = helmets and daggers,
+-- many = the heavy pieces). Picking a piece here makes every forge use the ore count with the best
+-- odds for it (the game's own odds table), and forges that item's type.
+do
+	local labels, byLabel, labelOf = { 'Any' }, {}, {}
+	pcall(function()
+		local rows = {}
+		for _, name in ipairs(Piece.names()) do
+			local ty = name ~= 'Any' and Piece.typeOf(name)
+			if ty then
+				local okc, n, ch = pcall(Piece.count, ty, name)
+				rows[#rows + 1] = { name = name, ty = ty, n = okc and n or nil, ch = okc and ch or nil }
+			end
+		end
+		table.sort(rows, function(x, y)
+			if x.ty ~= y.ty then
+				return x.ty < y.ty
+			end
+			return (x.n or 999) < (y.n or 999)
+		end)
+		for _, r in ipairs(rows) do
+			local label = r.n and ('%s: %s (%d ores, %.0f%%)'):format(r.ty, r.name, r.n, r.ch or 0) or ('%s: %s'):format(r.ty, r.name)
+			labels[#labels + 1] = label
+			byLabel[label] = r.name
+			labelOf[r.name] = label
+		end
+	end)
+	G.FTPieceLabels = labels
+	if not labelOf[settings.forgePiece] then
+		settings.forgePiece = 'Any'
+	end
+	ForgeBox:AddDropdown('FTForgePiece', { Text = 'Piece target', Values = labels, Default = labelOf[settings.forgePiece] or 'Any', AllowNull = false,
+		Tooltip = 'Pick a piece (e.g. Medium Leggings) and every forge uses the ore count that gives it the best chance, shown next to each name with that chance. It also decides weapon or armor while set. It is a chance, not a guarantee: for a guarantee use molds below. "Any" = off.' }):OnChanged(function(v)
+		if type(v) == 'string' then
+			settings.forgePiece = byLabel[v] or 'Any'
+			save()
+		end
+	end)
+end
+do
+	local labels, byLabel, labelOf = { 'None' }, {}, {}
+	pcall(function()
+		local E = require(RS.Shared.Data.Equipments)
+		local rows = {}
+		local function scan(t, depth)
+			for k, v in pairs(t) do
+				if type(k) == 'string' and type(v) == 'table' then
+					local info = Mold.info(k)
+					if info then
+						rows[#rows + 1] = { name = k, info = info }
+					elseif depth < 2 then
+						scan(v, depth + 1)
+					end
+				end
+			end
+		end
+		scan(E, 0)
+		table.sort(rows, function(x, y)
+			if x.info.kind ~= y.info.kind then
+				return x.info.kind > y.info.kind -- weapons first
+			end
+			return x.name < y.name
+		end)
+		local seen = {}
+		for _, r in ipairs(rows) do
+			if not seen[r.name] then
+				seen[r.name] = true
+				local label = ('%s: %s (%d molds, %d+ ores)'):format(r.info.kind, r.name, r.info.molds, r.info.minOres)
+				labels[#labels + 1] = label
+				byLabel[label] = r.name
+				labelOf[r.name] = label
+			end
+		end
+	end)
+	ForgeBox:AddDropdown('FTForgeMold', { Text = 'Mold target', Values = labels, Default = labelOf[settings.forgeMold] or 'None', AllowNull = false,
+		Tooltip = 'Aims the forge at one item with molds. Only used when you own the full number of molds that guarantees that item (fewer is mostly wasted: half the molds is a quarter of the chance) and when "Make" is its type; the forge then waits for the minimum ore count of that item. Otherwise it forges normally and no molds are spent.' }):OnChanged(function(v)
+		if type(v) == 'string' then
+			settings.forgeMold = byLabel[v] or 'None'
+			save()
+		end
+	end)
+end
 bindSlider(ForgeBox, 'FTForgeOres', 'forgeOres', 'Ores per forge (max)', 3, 60, 'The most ores one item may use. Left at 3, the smart picks treat it as no limit.')
+bindSlider(ForgeBox, 'FTForgeMinOres', 'forgeMinOres', 'Ores per forge (min)', 3, 60, 'The fewest ores one item may use. Few ores only ever make the small pieces (helmets, daggers): raise this for chestplates, leggings and big weapons. Trait mode with rare ores you only own 2 of otherwise settles on 6-ore items.')
 bindSlider(FarmBox, 'FTForgeKeep', 'forgeKeep', 'Keep of each ore (auto sell)', 0, 20, 'With auto forge on, auto sell leaves this many of each ore for forging.')
 do
 	local oreList = {}
@@ -6235,6 +6728,32 @@ ForgeBox:AddButton('Forge now', function()
 end)
 
 bindToggle(MobBox, 'FTAutoMobs', 'autoMobs', 'Auto kill mobs', 'Tweens to the nearest mob and fights it with your Weapon.')
+pcall(function()
+	local names = {}
+	pcall(function()
+		for name in pairs(require(RS.Shared.Data.Mutations).Mutations) do
+			names[#names + 1] = name
+		end
+	end)
+	if #names == 0 then
+		names = { 'Heaven', 'Hell', 'Limbo', 'Lucky', 'Ancient', 'Chaotic', 'Giant', 'Golden' }
+	end
+	table.sort(names)
+	if type(settings.huntSpecial) ~= 'table' then
+		settings.huntSpecial = {}
+	end
+	MobBox:AddDropdown('FTHuntSpecial', { Text = 'Hunt special enemies', Values = names, Multi = true, Default = (function() local d = {} for k, on in pairs(settings.huntSpecial) do if on == true then d[#d + 1] = k end end return d end)(), AllowNull = true,
+		Tooltip = 'Enemies with one of these modifiers (Heaven, Hell, Lucky...) are fought first, wherever they are on the map, before quests and farming. Works without "Auto kill mobs". Nothing picked = off.' }):OnChanged(function(v)
+		local out = {}
+		for k, on in pairs(type(v) == 'table' and v or {}) do
+			if on then
+				out[k] = true
+			end
+		end
+		settings.huntSpecial = out
+		save()
+	end)
+end)
 local mobDD = bindDropdown(MobBox, 'FTMobFilter', 'mobFilter', 'Target', mobNames())
 bindSlider(MobBox, 'FTRetreatHp', 'retreatHp', 'Retreat to spawn below % health', 0, 90, 'Below this it stops to heal (health comes back about 1% a second). 0 = never stop to heal, keep working.')
 bindSlider(MobBox, 'FTHealTo', 'healTo', 'Back to work at % health', 5, 100, 'How far it heals before it carries on. Lower = less standing around, more risk.')
@@ -6444,6 +6963,7 @@ do
 		end
 		G.FTSettings = settings -- (for live tests)
 		G.FTBest = Best
+		G.FTMold = Mold
 		local SwapBox = Tab:AddLeftGroupbox('Race swap')
 		bindDropdown(SwapBox, 'FTRaceMine', 'raceMine', 'Race while mining', vals, 'Switches to this race (one of your slots) whenever the bot is mining. Free and instant.')
 		bindDropdown(SwapBox, 'FTRaceFight', 'raceFight', 'Race while fighting', vals, 'Switches to this race whenever the bot is fighting or dodging a mob, and back to the mining one afterwards.')
@@ -6789,7 +7309,7 @@ bindSlider(QuestBox, 'FTQuestRange', 'questRange', 'Look for new quests within (
 bindToggle(QuestBox, 'FTAutoMail', 'autoMail', 'Auto claim mail & rewards', 'Every minute: claims all mail, level rewards, index (codex) rewards, and free seasonal-event rewards (event quests, milestones, altar daily).')
 bindToggle(QuestBox, 'FTAutoOffer', 'autoOffer', 'Auto offer altar shards', 'Twilight War altar: spends your side\'s shards on offers (x10 while you can, then x1) and takes the free daily gifts.')
 bindToggle(QuestBox, 'FTAutoDaily', 'autoDaily', 'Auto claim daily login', 'Claims the daily login reward when it is ready.')
-bindToggle(QuestBox, 'FTAutoCodes', 'autoCodes', 'Auto redeem codes', 'Tries each known code once per account. Add new codes to PlayerTools/forgecodes.txt (one per line).')
+bindToggle(QuestBox, 'FTAutoCodes', 'autoCodes', 'Auto redeem codes', 'Reads the working codes from theforge.gg every 15 minutes and redeems any you have not used. A tracker can be hours behind the game\'s Discord: a brand new code can also go in PlayerTools/forgecodes.txt (one per line).')
 bindToggle(ForgeBox, 'FTAutoEnhance', 'autoEnhance', 'Auto enhance equipped gear', 'Spends essences and gold to enhance the weapon and armor you are wearing, one level at a time. A failed enhance drops the item a level and can cost a rune slot; use the chance slider below to only take safer rolls. Never uses medallions.')
 -- The limit used to default to 100%, which stopped every item at +3 (+3 -> +4 is a 70% roll).
 -- No limit by default now; whatever was saved before (the slider could not go under 50) is
@@ -7001,28 +7521,16 @@ function Potions.drink(name, onTheMove)
 	if not onTheMove then
 		setStatus(('drinking %s (%d left after this)'):format(def and def.Name or name, q0 - 1))
 	end
+	-- (measured: ToolService:ToolActivated(name) on its own, potion neither equipped nor held,
+	-- answered true after 3.3s with stock 10 -> 9 and the timer 0 -> 299. So no tool swap at all.)
 	local t0 = os.clock()
-	while alive and os.clock() - t0 < 6 and Potions.count(name) >= q0 and hum.Health > 0 and (onTheMove and Potions.walking() or not onTheMove and Potions.calm()) do
-		local tool = LocalPlayer.Backpack:FindFirstChild(name) or c:FindFirstChild(name)
-		if not tool then
-			pcall(function()
-				CS:EquipMisc(name):await()
-			end)
-			task.wait(0.3)
-		else
-			if tool.Parent ~= c then
-				hum:EquipTool(tool)
-				task.wait(0.1)
-			end
-			if tool.Parent == c then
-				pcall(function()
-					TS:ToolActivated(name):await()
-				end)
-				task.wait(0.3)
-			end
-		end
+	pcall(function()
+		TS:ToolActivated(name):await()
+	end)
+	while alive and os.clock() - t0 < 5 and Potions.count(name) >= q0 do
+		task.wait(0.1)
 	end
-	task.wait(0.4)
+	task.wait(0.2)
 	Potions.log = Potions.log or {}
 	Potions.log[#Potions.log + 1] = ('%s %s: stock %d -> %d, timer %d -> %d%s'):format(os.date('%H:%M:%S'), name, q0, Potions.count(name), l0, Potions.left(name), onTheMove and ' (while walking)' or '')
 	Potions.busy = false
@@ -7045,10 +7553,10 @@ end
 task.spawn(function()
 	while alive do
 		task.wait(0.5)
-		if (settings.autoLuckPotion or settings.autoMinerPotion) and not Potions.busy and Potions.walking() and os.clock() >= (Potions.drinkAt or 0) then
+		if (settings.autoLuckPotion or settings.autoMinerPotion) and not Potions.busy and os.clock() >= (Potions.drinkAt or 0) then
 			pcall(function()
 				if Potions.load() then
-					local name = Potions.next(false)
+					local name = Potions.next(true) -- (only when one has run out: never a whole stack at once)
 					if name and not Potions.drink(name, true) then
 						Potions.busy = false
 						Potions.drinkAt = os.clock() + 5
@@ -7077,7 +7585,7 @@ function Potions.step()
 				local def = Potions.defs[name]
 				if def then
 					local dur, cap = tonumber(def.Duration) or 300, tonumber(def.MaxDuration) or 900
-					if Potions.count(name) > 0 and Potions.left(name) < 20 and Potions.left(name) + dur <= cap and now >= (Potions.drinkAt or 0) and not Potions.busy and Potions.calm() then
+					if Potions.count(name) > 0 and Potions.left(name) < 20 and Potions.left(name) + dur <= cap and now >= (Potions.drinkAt or 0) and not Potions.busy then
 						if not Potions.drink(name) then
 							Potions.drinkAt = os.clock() + 20 -- (did not go down: not again right away)
 						end
@@ -7292,6 +7800,32 @@ local function mainLoop(myGen)
 			if Abyss.step() then
 				return
 			end
+			if Meteor.step() then
+				return
+			end
+			do
+				-- (measured: with every modifier ticked and "retreat at" on 0 it ran 800 studs back to a
+				-- Possessed Monk Panda five times and died next to it each time)
+				local _, _, hh = char()
+				local frac = hh and hh.MaxHealth > 0 and hh.Health / hh.MaxHealth or 0
+				local sp = frac >= 0.6 and not lowHp() and specialTargets()[1] or nil
+				if sp then
+					setStatus(('hunting %s %s (%.0f studs)'):format(sp.mut, sp.m.Name, sp.d))
+					fightOnce(sp)
+					local _, _, h2 = char()
+					if not h2 or h2.Health <= 0 then
+						huntSkip[sp.key] = os.clock() + 900
+						statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('%s killed us — leaving that kind alone for 15 minutes'):format(sp.key)
+					elseif sp.m.Parent and sp.h.Health > 0 and h2.Health / math.max(1, h2.MaxHealth) < 0.4 then
+						-- backed out hurt: get clear of it, and it waits until we are back over 60%
+						local _, hr = char()
+						if hr and sp.r.Parent then
+							dodgeFrom(sp.r.Position, 60)
+						end
+					end
+					return
+				end
+			end
 			if os.clock() - lastQuestStep > 3 then
 				lastQuestStep = os.clock()
 				Rewards.step()
@@ -7342,15 +7876,197 @@ end)
 pcall(wireTracersPill)
 pcall(setTracers, settings.tracers == true)
 
+---------------------------------------------------------------------------
+-- Special-enemy tracers: a line to every mob carrying one of the game's modifiers (Heaven, Hell,
+-- Limbo, Lucky, Ancient, Chaotic, Giant...), in the modifier's own name colour, with its name and
+-- distance. Toggled by the "SP" pill. The modifier list is the game's own (Shared.Data.Mutations).
+-- How a mob is recognised: an attribute holding a modifier name, else a modifier name written on
+-- its name tag (a word that is not part of the mob's own name).
+---------------------------------------------------------------------------
+local MobTrace = { list = {}, found = {} }
+do
+	local muts
+	local function names()
+		if not muts then
+			local out = {}
+			pcall(function()
+				local M = require(RS.Shared.Data.Mutations)
+				for name, def in pairs(M.Mutations or {}) do
+					if type(def) == 'table' then
+						out[name] = typeof(def.NameColor) == 'Color3' and def.NameColor or Color3.fromRGB(255, 220, 90)
+					end
+				end
+			end)
+			if next(out) then
+				muts = out
+			else
+				return out
+			end
+		end
+		return muts
+	end
+	function MobTrace.mutation(m)
+		local mu = names()
+		for k, v in pairs(m:GetAttributes()) do
+			if type(v) == 'string' and mu[v] then
+				return v, 'attribute ' .. tostring(k)
+			end
+		end
+		local own = {}
+		for word in string.gmatch(m.Name, '%a+') do
+			own[word] = true
+		end
+		local hrp = m:FindFirstChild('HumanoidRootPart')
+		local fr = hrp and hrp:FindFirstChild('infoFrame')
+		if fr then
+			for _, d in ipairs(fr:GetDescendants()) do
+				if d:IsA('TextLabel') and d.Text ~= '' then
+					local text = string.gsub(d.Text, '<[^>]->', '')
+					for word in string.gmatch(text, '%a+') do
+						if mu[word] and not own[word] then
+							return word, 'name tag'
+						end
+					end
+				end
+			end
+		end
+		return nil
+	end
+	function MobTrace.scan()
+		local list = {}
+		local living = workspace:FindFirstChild('Living')
+		for _, m in ipairs(living and living:GetChildren() or {}) do
+			if m:GetAttribute('IsNpc') and not m:GetAttribute('DpsDummy') then
+				local hrp = m:FindFirstChild('HumanoidRootPart')
+				local hum = m:FindFirstChildOfClass('Humanoid')
+				if hrp and hum and hum.Health > 0 then
+					local ok, mut, how = pcall(MobTrace.mutation, m)
+					if ok and mut then
+						list[#list + 1] = { m = m, hrp = hrp, mut = mut, color = names()[mut], name = (string.gsub(m.Name, '%d+$', '')) }
+						if not MobTrace.found[m] then
+							MobTrace.found[m] = true
+							statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('special enemy: %s %s (seen by %s)'):format(mut, m.Name, tostring(how))
+						end
+					end
+				end
+			end
+		end
+		MobTrace.list = list
+	end
+	local lines, texts = {}, {}
+	local function hide(from)
+		for i = from, #lines do
+			lines[i].Visible = false
+			texts[i].Visible = false
+		end
+	end
+	function MobTrace.clear()
+		for i = 1, #lines do
+			pcall(function()
+				lines[i]:Remove()
+				texts[i]:Remove()
+			end)
+		end
+		lines, texts = {}, {}
+	end
+	function MobTrace.draw()
+		if not settings.mobTracers or type(Drawing) ~= 'table' and type(Drawing) ~= 'userdata' then
+			hide(1)
+			return
+		end
+		local cam = workspace.CurrentCamera
+		local vp = cam.ViewportSize
+		local from = Vector2.new(vp.X / 2, vp.Y - 4)
+		local me = cam.CFrame.Position
+		local n = 0
+		for _, e in ipairs(MobTrace.list) do
+			if e.m.Parent and e.hrp.Parent then
+				local pos, onScreen = cam:WorldToViewportPoint(e.hrp.Position)
+				if pos.Z > 0 then
+					n += 1
+					if not lines[n] then
+						local l = Drawing.new('Line')
+						l.Thickness = 2
+						l.Transparency = 1
+						lines[n] = l
+						local t = Drawing.new('Text')
+						t.Size = 16
+						t.Center = true
+						t.Outline = true
+						texts[n] = t
+					end
+					local l, t = lines[n], texts[n]
+					l.From, l.To, l.Color, l.Visible = from, Vector2.new(pos.X, pos.Y), e.color, true
+					t.Text = ('%s %s  %dm'):format(e.mut, e.name, math.floor((e.hrp.Position - me).Magnitude))
+					t.Position, t.Color, t.Visible = Vector2.new(pos.X, pos.Y - 28), e.color, onScreen
+				end
+			end
+		end
+		hide(n + 1)
+	end
+	task.spawn(function()
+		while alive do
+			if settings.mobTracers then
+				pcall(MobTrace.scan)
+			else
+				MobTrace.list = {}
+			end
+			task.wait(1)
+		end
+	end)
+	local rc = RunService.RenderStepped:Connect(function()
+		if alive then
+			pcall(MobTrace.draw)
+		end
+	end)
+	task.spawn(function()
+		while alive do
+			task.wait(0.5)
+		end
+		rc:Disconnect()
+		MobTrace.clear()
+	end)
+	G.FTMobTrace = MobTrace
+	pcall(function()
+		local reg = G.SB2RegisterPill
+		if type(reg) ~= 'function' then
+			return
+		end
+		local btn
+		local function paint()
+			local on = settings.mobTracers == true
+			btn.Text = on and 'SP \226\151\143' or 'SP'
+			btn.TextColor3 = on and Color3.fromRGB(255, 214, 120) or Color3.fromRGB(220, 230, 245)
+			local st = btn:FindFirstChildOfClass('UIStroke')
+			if st then
+				st.Color = on and Color3.fromRGB(230, 180, 70) or Color3.fromRGB(70, 90, 120)
+			end
+		end
+		btn = reg({
+			id = 'SP',
+			text = settings.mobTracers and 'SP \226\151\143' or 'SP',
+			onClick = function()
+				settings.mobTracers = not settings.mobTracers
+				save()
+				paint()
+			end,
+		})
+		paint()
+	end)
+end
+
 -- Auto enhance: the gear being worn goes up one level at a time while the game's own success
 -- chance is at least the user's limit and the essences + gold are there. (Game rules: a failed
 -- enhance takes the item down a level, and at +3 / +6 / +9 it also loses a rune slot.)
 task.spawn(function()
 	local pauseUntil = 0
 	local gap = 5
+	local noChange = 0
 	while alive and G.SB2ForgeToolsToken == token do
 		task.wait(gap)
-		gap = 10 -- (right after a successful enhance the next one follows in 1.5s)
+		-- (by hand the game lets you spam the button: after any roll, won or lost, the next one
+		-- follows at once; only with nothing to enhance does it look again every 3s)
+		gap = 3
 		if settings.autoEnhance and os.clock() >= pauseUntil then
 			pcall(function()
 				local FC = controller('ForgeController')
@@ -7412,13 +8128,20 @@ task.spawn(function()
 								G.FTEnhanced[it.GUID] = nlv
 							end
 							if nlv > lv then
-								gap = 1.5
+								gap, noChange = 0.1, 0
 								setStatus(('enhanced %s to +%d (%.0f%% chance)'):format(it.Type, nlv, chance))
 							elseif nlv < lv then
+								gap, noChange = 0.1, 0
 								setStatus(('enhancing %s failed: +%d -> +%d'):format(it.Type, lv, nlv))
 							else
-								pauseUntil = os.clock() + 300
-								setStatus(('the game did not enhance %s — trying again in 5 minutes'):format(it.Type))
+								-- (one refusal can be the server's own rate limit: only three in a row is a stop)
+								noChange += 1
+								gap = 1
+								if noChange >= 3 then
+									noChange = 0
+									pauseUntil = os.clock() + 300
+									setStatus(('the game did not enhance %s — trying again in 5 minutes'):format(it.Type))
+								end
 							end
 							return -- one item per round
 						end
