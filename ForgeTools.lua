@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v179'
+local BUILD = 'forge-tools-v184'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -134,6 +134,7 @@ local defaults = {
 	combatStyle = 'Hit & run',
 	dodgeWhat = 'Only threats',
 	autoAbyss = false,
+	autoBoss = false,
 	dodgeDist = 16,
 	autoMobs = false,
 	mobFilter = 'Any',
@@ -1290,8 +1291,139 @@ function Nav.fly(dest)
 	return okRun and done == true
 end
 
+-- The game's own fast travel (v182). Measured: WaypointService:RequestTeleport(name) is free for an
+-- unlocked waypoint, but answers false unless you stand at a waypoint stone (the game's menu shuts
+-- 20 studs from one). So a long trip becomes: glide to the nearest unlocked stone, teleport to the
+-- stone nearest the destination, glide the rest - when that is well under the direct distance.
+function Nav.waypoints()
+	local wf = workspace:FindFirstChild('Waypoints')
+	local okd, d = pcall(data)
+	local un = okd and type(d) == 'table' and d.WaypointsUnlocked or nil
+	local out = {}
+	for _, w in ipairs(wf and wf:GetChildren() or {}) do
+		local open = w.Name == 'Town Hall' or w.Name == 'Village'
+		for _, t in pairs(type(un) == 'table' and un or {}) do
+			if type(t) == 'table' and t[w.Name] then
+				open = true
+			end
+		end
+		local okp, pos = pcall(function()
+			return w:IsA('BasePart') and w.Position or w:GetPivot().Position
+		end)
+		if okp then
+			out[#out + 1] = { name = w.Name, pos = pos, model = w, open = open }
+		end
+	end
+	return out
+end
+-- (measured: the server only answers a waypoint call after the stone's own prompt was triggered)
+function Nav.touchStone(w)
+	pcall(function()
+		local pr = w.model:FindFirstChildWhichIsA('ProximityPrompt', true)
+		if pr and fireproximityprompt then
+			fireproximityprompt(pr)
+		end
+	end)
+	task.wait(0.6)
+end
+function Nav.closeStoneMenu()
+	pcall(function()
+		controller('UIController'):Close(true)
+	end)
+end
+-- Locked stones are bought from wherever we are (v184). Measured: WaypointService:RequestUnlock
+-- ('Raids') from 1,382 studs away answered true, the stone was unlocked and 15,000 gold was taken -
+-- the same as unlocking from the game's map. One-time gold price from the game's own table.
+function Nav.unlockNear()
+	if os.clock() - (Nav.unlockAt or -1e9) < 30 then
+		return
+	end
+	Nav.unlockAt = os.clock()
+	local okd, d = pcall(data)
+	if not okd or type(d) ~= 'table' then
+		return
+	end
+	if Nav.wpPrices == nil then
+		Nav.wpPrices = false
+		pcall(function()
+			Nav.wpPrices = require(RS.Shared.Data.Waypoints).Prices
+		end)
+	end
+	Nav.unlockBad = Nav.unlockBad or {}
+	for _, w in ipairs(Nav.waypoints()) do
+		local price = type(Nav.wpPrices) == 'table' and tonumber(Nav.wpPrices[w.name]) or nil
+		if not w.open and price and (tonumber(d.Gold) or 0) >= price and os.clock() > (Nav.unlockBad[w.name] or 0) then
+			Nav.unlockBad[w.name] = os.clock() + 600
+			local okU, a = pcall(function()
+				return service('WaypointService'):RequestUnlock(w.name):await()
+			end)
+			G.FTUnlockLast = ('%s %s for %d gold: ok=%s %s'):format(os.date('%H:%M:%S'), w.name, price, tostring(okU), tostring(a))
+			if setStatus then
+				setStatus(('fast travel: unlocked the %s waypoint (%d gold)'):format(w.name, price))
+			end
+			task.wait(0.5)
+		end
+	end
+end
+local tweenToFwd
+function Nav.hop(dest, opts)
+	local _, hrp = char()
+	if not hrp or os.clock() < (Nav.hopBad or 0) then
+		return false
+	end
+	local direct = (dest - hrp.Position).Magnitude
+	if direct < 350 then
+		return false
+	end
+	local near, nearD, far, farD
+	for _, w in ipairs(Nav.waypoints()) do
+		local d1, d2 = (w.pos - hrp.Position).Magnitude, (w.pos - dest).Magnitude
+		if w.open and (not nearD or d1 < nearD) then
+			near, nearD = w, d1
+		end
+		if w.open and (not farD or d2 < farD) then
+			far, farD = w, d2
+		end
+	end
+	if not near or near == far or nearD + farD > direct * 0.6 then
+		return false
+	end
+	if setStatus then
+		setStatus(('fast travel: to the %s waypoint (%.0f studs), then %s'):format(near.name, nearD, far.name))
+	end
+	if nearD > 10 then
+		local okT = tweenToFwd(CFrame.new(near.pos + Vector3.new(0, 3, 5)), { abort = opts and opts.abort, noHop = true })
+		if not okT then
+			Nav.hopBad = os.clock() + 120
+			return false
+		end
+	end
+	Nav.touchStone(near)
+	local okC, a, b = pcall(function()
+		return service('WaypointService'):RequestTeleport(far.name):await()
+	end)
+	Nav.closeStoneMenu()
+	G.FTHopLast = ('%s %s -> %s: ok=%s %s %s'):format(os.date('%H:%M:%S'), near.name, far.name, tostring(okC), tostring(a), tostring(b))
+	local t0 = os.clock()
+	while alive and os.clock() - t0 < 8 do
+		local _, h = char()
+		if h and (h.Position - far.pos).Magnitude < 60 then
+			task.wait(1) -- (the arrival effect)
+			G.FTHops = (G.FTHops or 0) + 1
+			return true
+		end
+		task.wait(0.2)
+	end
+	Nav.hopBad = os.clock() + 300 -- (refused: plain travel for the next 5 minutes)
+	return false
+end
+
 local function tweenTo(cf, opts)
 	local trip = { dest = typeof(cf) == 'CFrame' and cf.Position or cf }
+	if not (opts and opts.noHop) then
+		pcall(Nav.unlockNear, opts)
+		pcall(Nav.hop, trip.dest, opts)
+	end
 	G.FTTrips = G.FTTrips or {}
 	table.insert(G.FTTrips, trip)
 	G.FTTravel = trip.dest
@@ -1317,6 +1449,7 @@ local function tweenTo(cf, opts)
 	end
 	return a, b
 end
+tweenToFwd = tweenTo
 
 local function standNear(part, gap)
 	local _, hrp = char()
@@ -6262,6 +6395,24 @@ do
 			for id in pairs(d.Quests or {}) do
 				order[#order + 1] = id
 			end
+			-- The focused quest was handed in and the same NPC gave the next one of the chain
+			-- (ShogunQuest4 -> ShogunQuest5): the focus moves along with it. (measured: focus stayed on
+			-- the finished quest = Auto, which went mining for another quest instead of the new one)
+			if settings.focusQuest ~= 'Auto' and d.Quests[settings.focusQuest] == nil then
+				local stem, num = string.match(settings.focusQuest, '^(.-)(%d+)$')
+				local nextId, nextNum
+				for id in pairs(d.Quests) do
+					local s2, n2 = string.match(id, '^(.-)(%d+)$')
+					if stem and s2 == stem and tonumber(n2) > tonumber(num) and (not nextNum or tonumber(n2) < nextNum) then
+						nextId, nextNum = id, tonumber(n2)
+					end
+				end
+				if nextId then
+					statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('focus quest moved on: %s -> %s'):format(settings.focusQuest, nextId)
+					settings.focusQuest = nextId
+					pcall(save)
+				end
+			end
 			local focusId = settings.focusQuest ~= 'Auto' and d.Quests[settings.focusQuest] ~= nil and settings.focusQuest or nil
 			-- (a rock kind a quest has already counted as mined is one the pickaxe can break)
 			for _, qd0 in pairs(d.Quests) do
@@ -6948,6 +7099,160 @@ do
 end
 
 ---------------------------------------------------------------------------
+-- World boss (v181, written from the game's data, NOT yet tried live).
+-- Read from the game: each island's boss (Island 4: Asura's Incarnate) is entered through the
+-- party gate workspace.Proximity.CreateParty (its prompt carries PartyType = the boss name).
+-- Pressing it = PartyService:CreateParty(type); the leader then starts it with
+-- PartyService:Activate() once the lobby is open. The menu text says boss lobbies are free and a
+-- new one opens every 5-10 minutes (Raids are the ones that take a Raid Ticket: never touched here).
+-- The gate shows a countdown; whether it counts to "opens" or "closes" is not known, so a start is
+-- tried once right away and after that only around the moment the countdown runs out.
+---------------------------------------------------------------------------
+local Boss = { lastTry = -1e9, fails = 0, pauseUntil = 0, first = true }
+do
+	function Boss.gate()
+		local prox = workspace:FindFirstChild('Proximity')
+		local gate = prox and prox:FindFirstChild('CreateParty')
+		local pr = gate and gate:FindFirstChildWhichIsA('ProximityPrompt', true)
+		local kind = pr and pr:GetAttribute('PartyType')
+		if not gate or type(kind) ~= 'string' then
+			return nil
+		end
+		local okp, pos = pcall(function()
+			return gate:IsA('BasePart') and gate.Position or gate:GetPivot().Position
+		end)
+		if not okp then
+			return nil
+		end
+		-- the countdown on the gate, in seconds (nil = none shown)
+		local secs
+		for _, d in ipairs(gate:GetDescendants()) do
+			if d:IsA('TextLabel') then
+				local m, sc = string.match(d.Text, '^(%d+):(%d+)$')
+				if m then
+					secs = tonumber(m) * 60 + tonumber(sc)
+				elseif string.match(d.Text, '^%d+$') then
+					secs = tonumber(d.Text)
+				end
+			end
+		end
+		return gate, kind, pos, secs
+	end
+	-- the boss itself, alive and on our side of the map (= we are in its arena)
+	function Boss.target(kind)
+		local living = workspace:FindFirstChild('Living')
+		local _, hrp = char()
+		if not living or not hrp or type(kind) ~= 'string' then
+			return nil
+		end
+		for _, m in ipairs(living:GetChildren()) do
+			if m:GetAttribute('IsNpc') and string.sub(m.Name, 1, #kind) == kind then
+				local h = m:FindFirstChildOfClass('Humanoid')
+				local r = mobRoot(m)
+				if h and r and h.Health > 0 then
+					local d = (r.Position - hrp.Position).Magnitude
+					if d < 400 then
+						return { m = m, h = h, r = r, d = d, big = false }
+					end
+				end
+			end
+		end
+		return nil
+	end
+	function Boss.step()
+		if not settings.autoBoss then
+			Boss.first = true -- (so switching it on again tries straight away)
+			return false
+		end
+		if Abyss.inRun() then
+			return false
+		end
+		local gate, kind, pos, secs = Boss.gate()
+		if not gate then
+			return false
+		end
+		local t = Boss.target(kind)
+		if t then
+			Boss.fails = 0
+			setStatus(('boss: fighting %s (%d / %d HP)'):format(kind, t.h.Health, t.h.MaxHealth))
+			fightOnce(t)
+			return true
+		end
+		local now = os.clock()
+		if now < Boss.pauseUntil then
+			return false
+		end
+		-- a start is tried right after the toggle goes on, and after that when the gate's countdown
+		-- is about to run out (walking over when it is under a minute)
+		local due = Boss.first or (secs ~= nil and secs <= 60)
+		if not due or now - Boss.lastTry < 25 then
+			return false
+		end
+		local _, hrp = char()
+		if not hrp then
+			return false
+		end
+		if (hrp.Position - pos).Magnitude > 12 then
+			setStatus(('boss: going to the %s gate'):format(kind))
+			if not tweenTo(CFrame.new(pos + Vector3.new(0, 2, 4))) then
+				Boss.lastTry = os.clock()
+				return true
+			end
+		end
+		if not Boss.first and secs ~= nil and secs > 3 and secs <= 60 then
+			setStatus(('boss: at the %s gate, countdown %ds'):format(kind, secs))
+			task.wait(0.5)
+			return true
+		end
+		Boss.first = false
+		Boss.lastTry = os.clock()
+		setStatus(('boss: opening a %s party'):format(kind))
+		local made, why
+		pcall(function()
+			local pc = controller('PartyController')
+			local cur = pc and pc.CurrentParty
+			if cur and cur.Type ~= kind then
+				why = 'you are in a ' .. tostring(cur.Type) .. ' party'
+			elseif not cur then
+				service('PartyService'):CreateParty(kind):await()
+			end
+			made = why == nil
+		end)
+		if not made then
+			setStatus('boss: could not open the party' .. (why and (' — ' .. why) or ''))
+			Boss.pauseUntil = os.clock() + 300
+			return true
+		end
+		task.wait(1.5)
+		setStatus(('boss: starting %s'):format(kind))
+		local okA, a, b = pcall(function()
+			return service('PartyService'):Activate():await()
+		end)
+		G.FTBossStart = ('%s ok=%s %s %s'):format(os.date('%H:%M:%S'), tostring(okA), tostring(a), tostring(b))
+		-- in the arena = the boss shows up next to us
+		local t0 = os.clock()
+		while alive and settings.autoBoss and os.clock() - t0 < 25 do
+			if Boss.target(kind) then
+				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: in the arena with %s'):format(kind)
+				return true
+			end
+			task.wait(0.5)
+		end
+		Boss.fails += 1
+		statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: the start did not go through (%s), try %d'):format(tostring(G.FTBossStart), Boss.fails)
+		if Boss.fails >= 3 then
+			-- (a lobby that never opens for us - e.g. already beaten today: stop walking over)
+			Boss.fails = 0
+			Boss.pauseUntil = os.clock() + 1800
+			setStatus(('boss: %s would not start 3 times in a row — trying again in 30 minutes'):format(kind))
+		else
+			setStatus(('boss: %s did not start — next try when the gate countdown runs out'):format(kind))
+		end
+		return true
+	end
+end
+
+---------------------------------------------------------------------------
 -- GUI
 ---------------------------------------------------------------------------
 local Library
@@ -7530,6 +7835,7 @@ bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Eve
 bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Block / parry' }, 'Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Block / parry: stands and blocks. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)')
 bindSlider(MobBox, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
 bindToggle(MobBox, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
+bindToggle(MobBox, 'FTAutoBoss', 'autoBoss', 'Auto boss (this island)', 'UNTESTED. Goes to this island\'s boss gate (Island 4: Asura\'s Incarnate), opens a party, starts it when the lobby opens and fights the boss. Boss lobbies are free (no ticket). Ignores the max mob health slider. Tries once right away, then each time the gate countdown runs out; gives up for 30 minutes after 3 starts in a row that do not go through.')
 bindToggle(MobBox, 'FTAutoCards', 'autoCards', 'Auto pick abyss cards', 'Picks a card for you after each floor, even when you play the Abyss yourself.')
 bindDropdown(MobBox, 'FTCardFocus', 'cardFocus', 'Card priority', { 'Best overall', 'Damage', 'Survival', 'Loot' }, 'Best overall: rarest card (Abyssal > Fusion > Epic > Rare > Common). Damage / Survival / Loot: that kind of card first, then rarity.')
 bindToggle(MobBox, 'FTAutoBlock', 'autoBlock', 'Auto block (F)', 'Blocks right before a mob\'s attack lands, then goes back to swinging.')
@@ -8594,6 +8900,9 @@ local function mainLoop(myGen)
 				return
 			end
 			if Abyss.step() then
+				return
+			end
+			if Boss.step() then
 				return
 			end
 			if Meteor.step() then
