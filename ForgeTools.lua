@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v184'
+local BUILD = 'forge-tools-v202'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -128,6 +128,7 @@ local defaults = {
 	autoCodes = false,
 	autoDaily = false,
 	parryLead = 20,
+	parryShineLead = 0,
 	forgeBest = false,
 	questRange = 1000,
 	noBlur = false,
@@ -1247,7 +1248,7 @@ local setStatus -- (defined further down; Nav.fly, Nav.cross and Nav.escape repo
 -- spot, with collisions off (ledges, ladders, cave roofs and pockets like island 4's Spirit Cave
 -- stop mattering). Given up if a fifth of our health goes on the way. The user's call: "dont bother
 -- with ladders just make it glide up".
-function Nav.fly(dest)
+function Nav.fly(dest, opts, first)
 	local _, hrp, hum = char()
 	if not hrp or not hum or hum.Health <= 0 then
 		return false
@@ -1257,11 +1258,20 @@ function Nav.fly(dest)
 	local legs = { Vector3.new(from.X, alt, from.Z), Vector3.new(dest.X, alt, dest.Z), dest }
 	local hp0 = hum.Health
 	local speed = math.clamp(tonumber(settings.tweenSpeed) or 55, 30, 70)
+	-- (v188, the user's call after a measured test: 1,000 studs at 300 studs/s held, 600 held once,
+	-- 1,000 studs/s got the account kicked. So 300, and only for the really long trips - the many
+	-- 300-500 stud moves inside one area stay at the old speed, in case it is the number of fast
+	-- trips that the game counts.)
+	if (dest - from).Magnitude > 500 then
+		speed = math.clamp(tonumber(settings.glideSpeed) or 90, speed, 120) -- (v189: 300 got the account kicked on its first real trip; 90 is the user's one careful step up from 66)
+	end
+	G.FTFlySpeed = speed
 	if setStatus then
-		setStatus(('no route on foot — gliding over (%.0f studs)'):format((dest - from).Magnitude))
+		setStatus(((first and 'long trip' or 'no route on foot') .. ' — gliding over (%.0f studs)'):format((dest - from).Magnitude))
 	end
 	stopTween()
 	noclip = true
+	local calledOff = false
 	local okRun, done = pcall(function()
 		for _, goal in ipairs(legs) do
 			while true do
@@ -1269,6 +1279,19 @@ function Nav.fly(dest)
 				local _, h, hm = char()
 				if not alive or not h or not hm or hm.Health <= 0 or hm.Health < hp0 * 0.8 then
 					return false
+				end
+				if opts and opts.abort and opts.abort() then
+					-- called off in the air: set down on the ground below, not dropped from 40 studs up
+					local rp = RaycastParams.new()
+					rp.FilterType = Enum.RaycastFilterType.Exclude
+					rp.FilterDescendantsInstances = { LocalPlayer.Character, workspace:FindFirstChild('Living') }
+					local hit = workspace:Raycast(h.Position, Vector3.new(0, -400, 0), rp)
+					if hit then
+						h.CFrame = CFrame.new(hit.Position + Vector3.new(0, 3.5, 0))
+					end
+					h.AssemblyLinearVelocity = Vector3.zero
+					calledOff = true
+					return true
 				end
 				local to = goal - h.Position
 				local step = speed * math.min(dt, 0.1)
@@ -1288,7 +1311,7 @@ function Nav.fly(dest)
 	if h2 then
 		h2.AssemblyLinearVelocity = Vector3.zero
 	end
-	return okRun and done == true
+	return okRun and done == true, calledOff
 end
 
 -- The game's own fast travel (v182). Measured: WaypointService:RequestTeleport(name) is free for an
@@ -1398,12 +1421,25 @@ function Nav.hop(dest, opts)
 			return false
 		end
 	end
-	Nav.touchStone(near)
-	local okC, a, b = pcall(function()
-		return service('WaypointService'):RequestTeleport(far.name):await()
-	end)
+	local okC, a, b
+	local tries = 0
+	for i = 1, 3 do
+		tries = i
+		Nav.touchStone(near)
+		okC, a, b = pcall(function()
+			return service('WaypointService'):RequestTeleport(far.name):await()
+		end)
+		if not (okC and a == true and b == false) or not alive then
+			break
+		end
+		task.wait(0.8)
+	end
 	Nav.closeStoneMenu()
-	G.FTHopLast = ('%s %s -> %s: ok=%s %s %s'):format(os.date('%H:%M:%S'), near.name, far.name, tostring(okC), tostring(a), tostring(b))
+	G.FTHopLast = ('%s %s -> %s: ok=%s %s %s (try %d)'):format(os.date('%H:%M:%S'), near.name, far.name, tostring(okC), tostring(a), tostring(b), tries)
+	if okC and a == true and b == false then
+		Nav.hopBad = os.clock() + 300 -- (refused three times: no point waiting 8 s for an arrival)
+		return false
+	end
 	local t0 = os.clock()
 	while alive and os.clock() - t0 < 8 do
 		local _, h = char()
@@ -1422,12 +1458,35 @@ local function tweenTo(cf, opts)
 	local trip = { dest = typeof(cf) == 'CFrame' and cf.Position or cf }
 	if not (opts and opts.noHop) then
 		pcall(Nav.unlockNear, opts)
-		pcall(Nav.hop, trip.dest, opts)
+		-- (v187: waypoint hops are off unless settings.useWaypoints is set by hand. The user wants a
+		-- straight trip; the long glide below does 1,000 studs in about 16 s; and measured: a stone
+		-- refuses a teleport asked for in the first seconds after arriving at it.)
+		if settings.useWaypoints == true then
+			pcall(Nav.hop, trip.dest, opts)
+		end
 	end
 	G.FTTrips = G.FTTrips or {}
 	table.insert(G.FTTrips, trip)
 	G.FTTravel = trip.dest
-	local ok, a, b = pcall(tweenToRaw, cf, opts)
+	-- A long trip is glided over in one go (v187). Measured on the way from town to the Oni cave,
+	-- 935 studs: the walk planner went by known spots to (473,81,38), found no path on from there,
+	-- and only then glided - 54 s in all, 12-18 of them standing still. The glide alone, at the
+	-- same speed, is about 16 s.
+	local ok, a, b
+	do
+		local _, hf0 = char()
+		if hf0 and (trip.dest - hf0.Position).Magnitude > 300 and not (opts and opts.noFly) then
+			Nav.flyAt = os.clock()
+			local okF, res, off = pcall(Nav.fly, trip.dest, opts, true)
+			G.FTFlyLast = ('%s first-choice glide: %s %s'):format(os.date('%H:%M:%S'), tostring(okF), tostring(res))
+			if okF and res then
+				ok, a, b = true, true, nil
+			end
+		end
+	end
+	if ok == nil then
+		ok, a, b = pcall(tweenToRaw, cf, opts)
+	end
 	if ok and a == false and alive and not (opts and opts.abort and opts.abort()) then
 		local _, hf = char()
 		if hf and (trip.dest - hf.Position).Magnitude > 25 and os.clock() - (Nav.flyAt or -1e9) > 3 then
@@ -2165,6 +2224,16 @@ local function rockList()
 		for _, e in ipairs(list) do
 			if e.m.Name == G.FTQuestRock or (G.FTQuestRocks and G.FTQuestRocks[e.m.Name]) then
 				e.score -= 1e6
+			end
+		end
+	end
+	-- Waiting for a focused quest's mobs to respawn (v185): mine the rocks around where they live,
+	-- not wherever another quest points (measured: 1,000 studs away in the bamboo while the
+	-- Frostburn Onis respawned in their cave).
+	if G.FTCamp then
+		for _, e in ipairs(list) do
+			if e.hb and (e.hb.Position - G.FTCamp).Magnitude <= 280 then
+				e.score -= 2e6
 			end
 		end
 	end
@@ -3604,10 +3673,10 @@ function Threat.keyIs(key)
 		Threat.kind[key] = nil
 		rec = nil
 	end
-	return rec ~= nil and (rec.hit >= 0.12 or rec.hit / 3 > Threat.heal + 0.02)
+	return rec ~= nil and (rec.hit >= 0.25 or rec.hit / 3 > Threat.heal + 0.02)
 end
 function Threat.recIs(rec, m)
-	return rec.hit >= 0.12 or rec.hit / Threat.period(m) > Threat.heal + 0.02 -- (a clear net drain: 2%/s more than we heal back)
+	return rec.hit >= 0.25 or rec.hit / Threat.period(m) > Threat.heal + 0.02 -- (a clear net drain: 2%/s more than we heal back)
 end
 function Threat.is(m)
 	if settings.dodgeWhat == 'Everything' or Threat.pressure then
@@ -3667,7 +3736,7 @@ task.spawn(function()
 						rec.n += 1
 						rec.at, rec.max = os.time(), mx
 						Threat.kind[key] = rec
-						local is = rec.hit >= 0.12 or rec.hit / per > Threat.heal + 0.02
+						local is = rec.hit >= 0.25 or rec.hit / per > Threat.heal + 0.02
 						if Threat.told[key] ~= is then
 							Threat.told[key] = is
 							statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. (is
@@ -4228,6 +4297,29 @@ do
 	G.FTHitDelay = G.FTHitDelay or {} -- [animation id] = seconds from wind-up start to the hit
 	local hitDelay = G.FTHitDelay
 	local pending = {} -- recent attack wind-ups near us: { id, t }
+	-- The parry cue (v190). The game adds an Attachment "ParryWindow" (the shine) to the mob's root
+	-- part a moment before the hit. The user's own testing: blocking exactly on the shine, or just
+	-- before it, always parries; after it is too late. The old timing (0.2 s before the learned hit)
+	-- came ~0.15 s AFTER the shine. So: learn, per attack animation, how long after its start the
+	-- shine appears, and block "parry lead" before that. An animation not seen yet is blocked the
+	-- instant its shine appears.
+	G.FTShineDelay = G.FTShineDelay or {}
+	G.FTShineGap2 = G.FTShineGap2 or {} -- [animation id] = { d = seconds from the shine to the hit, n }
+	Block.cues = {}
+	Block.lastShine = setmetatable({}, { __mode = 'k' }) -- [mob] = when it last shone
+	G.FTShinePeriod = G.FTShinePeriod or {} -- [mob kind] = seconds between its attacks (shine to shine)
+	Block.period = G.FTShinePeriod
+	G.FTShineCombo = G.FTShineCombo or {} -- [mob kind] = longest gap between the hits of one combo
+	Block.combo = G.FTShineCombo
+	G.FTShineIvB = G.FTShineIvB or {} -- [mob kind] = { { iv = seconds from a shine to the next, n = times seen, id } }
+	Block.ivs = G.FTShineIvB -- (also [kind .. '#' .. id of the gap before] = the same, after that gap)
+	Block.prevB = setmetatable({}, { __mode = 'k' }) -- [mob] = which of its kind's gaps came before its last shine
+	G.FTShineGmin = G.FTShineGmin or {} -- [mob kind] = shortest shine-to-hit time used for it
+	Block.gmin = G.FTShineGmin
+	Block.hits = {} -- expected hit times still to be parried, soonest first
+	local shineDelay = G.FTShineDelay
+	G.FTParryStats = { shines = 0, early = 0, onShine = 0, parry = 0, blockHit = 0, presses = 0, by = {} }
+	local PStats = G.FTParryStats
 
 	-- A hit / parry just happened: credit it to the most recent wind-up 0.2-1.6 s ago.
 	local function learn()
@@ -4254,6 +4346,36 @@ do
 	pcall(function()
 		blockConns[#blockConns + 1] = workspace:WaitForChild('Debris', 5).ChildAdded:Connect(function(x)
 			if x.Name == 'Parry' or x.Name == 'BlockHit' then
+				if x.Name == 'Parry' then
+					PStats.parry += 1
+				else
+					PStats.blockHit += 1
+				end
+				-- (which kind of press earned it, and how long after the press)
+				-- shine -> hit, per attack animation: the oldest cue still waiting for its hit
+				for i, cue in ipairs(Block.cues) do
+					local g = os.clock() - cue.t
+					if g > 0.15 and g < 0.7 then
+						if cue.id then
+							local rec = G.FTShineGap2[cue.id]
+							if rec then
+								rec.d = rec.d * 0.6 + g * 0.4
+								rec.n += 1
+							else
+								G.FTShineGap2[cue.id] = { d = g, n = 1 }
+							end
+						end
+						table.remove(Block.cues, i)
+						break
+					end
+				end
+				if Block.pressedAt and os.clock() - Block.pressedAt < 1.2 then
+					local k = tostring(Block.pressKind) .. ' ' .. x.Name
+					local b = PStats.by[k] or { n = 0, sum = 0 }
+					b.n += 1
+					b.sum += os.clock() - Block.pressedAt
+					PStats.by[k] = b
+				end
 				learn()
 			end
 		end)
@@ -4278,15 +4400,28 @@ do
 	end
 
 	local stopping = false
-	local function holdBlock(untilT)
+	local function holdBlock(untilT, kind)
 		local tc = controller('ToolController')
 		local ch = LocalPlayer.Character
 		if not tc or not (ch and ch:FindFirstChild('Weapon')) then
 			return
 		end
-		blockUntil = math.max(blockUntil, untilT)
+		-- (v191. Measured with v190: 51 shines, only 8 parries and 11 plain blocks. A parry is a fresh
+		-- press: the game's StartBlock does nothing while a block is already held, and the old hold ran
+		-- 0.7 s past the shine, into the next mob's attack. So every cue is its own press - let go and
+		-- press again - unless the last press was under 0.15 s ago, which is the same moment.)
+		local nowB = os.clock()
+		if tc.isBlocking and nowB - (Block.pressedAt or 0) >= 0.15 then
+			pcall(tc.StopBlock, tc)
+		end
 		if not tc.isBlocking then
 			pcall(tc.StartBlock, tc)
+			Block.pressedAt = nowB
+			Block.pressKind = kind or '?'
+			PStats.presses += 1
+			blockUntil = untilT
+		else
+			blockUntil = math.max(blockUntil, untilT)
 		end
 		if stopping then
 			return
@@ -4323,7 +4458,8 @@ do
 		end
 		local id = tostring(track.Animation and track.Animation.AnimationId or track.Name)
 		local hitAt = hitDelay[id] or math.min(0.9, len * 0.55)
-		pending[#pending + 1] = { id = id, t = t0, m = m, r = r, hitAt = hitAt }
+		local entry = { id = id, t = t0, m = m, r = r, hitAt = hitAt }
+		pending[#pending + 1] = entry
 		-- Block / parry style only (hit & run dodges instead).
 		if settings.combatStyle ~= 'Block / parry' or not settings.autoBlock or not c:FindFirstChild('Weapon') then
 			return
@@ -4331,10 +4467,273 @@ do
 		if (r.Position - hrp.Position).Magnitude > 16 then
 			return
 		end
-		local lead = (tonumber(settings.parryLead) or 20) / 100
-		local startIn = math.max(0, hitAt - lead) - (os.clock() - t0)
+		local sd = shineDelay[id]
+		-- (v192. Measured with v191: a press 0.08 s BEFORE the shine was a plain block 6 times out of
+		-- 6 - it costs stamina and still takes damage - while a press ON the shine was the real, orange
+		-- parry 3 times out of 4, the hit landing 0.35 s later. So nothing is pressed ahead of the
+		-- shine any more; the learned timing is only used to keep the sword back just before it.)
+		do
+			-- (no new swing from the wind-up on: a swing takes ~0.6 s and the shine comes 0.2-0.5 s in)
+			local due = t0 + (sd and sd.d or 0.5)
+			if not Block.dueAt or due > Block.dueAt or os.clock() > Block.dueAt + 0.2 then
+				Block.dueAt = due
+			end
+		end
+		if true then
+			return
+		end
+		local lead = math.clamp((tonumber(settings.parryShineLead) or 8) / 100, 0, 0.4)
+		local startIn = math.max(0, sd.d - lead) - (os.clock() - t0)
+		entry.blocked = true
 		task.delay(math.max(0, startIn), function()
-			holdBlock(t0 + hitAt + 0.3)
+			Block.dueAt = nil
+			if alive and m.Parent then
+				PStats.early += 1
+				holdBlock(t0 + sd.d + 0.5, 'early')
+			end
+		end)
+		-- (no new swing in the last 0.3 s before a press: Block.soon() holds the sword back)
+		local due = t0 + math.max(0, sd.d - lead)
+		if not Block.dueAt or due < Block.dueAt or os.clock() > Block.dueAt then
+			Block.dueAt = due
+		end
+	end
+	-- the shine itself
+	local function onShine(m)
+		local now = os.clock()
+		Block.anyShineAt = now
+		PStats.shines += 1
+		-- each mob's own rhythm: the time from one shine to its next (follow-ups inside a combo,
+		-- under 0.9 s, are not a rhythm)
+		do
+			local last = Block.lastShine[m]
+			local kind = baseName(m.Name)
+			if last and now - last > 0.9 and now - last < 6 then
+				local iv = now - last
+				local per = Block.period[kind]
+				Block.period[kind] = per and (iv < per and iv or (per * 0.9 + iv * 0.1)) or iv
+			elseif last and now - last <= 0.9 then
+				-- (a follow-up inside a combo: the longest such gap seen for this kind)
+				Block.combo[kind] = math.max(Block.combo[kind] or 0, now - last)
+			end
+			if last and now - last > 0.08 and now - last < 6 then
+				-- (v198: every shine-to-next-shine time this kind has shown, in buckets - combos included)
+				local iv = now - last
+				local list = Block.ivs[kind]
+				if not list then
+					list = {}
+					Block.ivs[kind] = list
+				end
+				local found
+				for _, b in ipairs(list) do
+					if math.abs(b.iv - iv) <= 0.12 then
+						b.iv = b.iv * 0.8 + iv * 0.2
+						b.n += 1
+						found = b
+						break
+					end
+				end
+				if not found and #list < 24 then
+					found = { iv = iv, n = 1, id = #list + 1 }
+					list[#list + 1] = found
+				end
+				-- (v200: and the same, told apart by which gap came BEFORE - inside a combo the time to the
+				-- next shine depends on where in the combo the mob is)
+				local key = kind .. '#' .. tostring(Block.prevB[m] or 0)
+				local l2 = Block.ivs[key]
+				if not l2 then
+					l2 = {}
+					Block.ivs[key] = l2
+				end
+				local f2
+				for _, b in ipairs(l2) do
+					if math.abs(b.iv - iv) <= 0.12 then
+						b.iv = b.iv * 0.8 + iv * 0.2
+						b.n += 1
+						f2 = true
+						break
+					end
+				end
+				if not f2 and #l2 < 12 then
+					l2[#l2 + 1] = { iv = iv, n = 1 }
+				end
+				Block.prevB[m] = found and found.id or 0
+			else
+				Block.prevB[m] = 0
+			end
+			Block.lastShine[m] = now
+		end
+		local best
+		for _, p in ipairs(pending) do
+			if p.m == m and not p.shone and now - p.t < 2.5 and (not best or p.t > best.t) then
+				best = p
+			end
+		end
+		if best then
+			best.shone = true
+			local d = now - best.t
+			local sd = shineDelay[best.id]
+			if sd then
+				-- (an animation whose shine comes at very different moments cannot be timed ahead)
+				sd.dev = sd.dev * 0.7 + math.abs(d - sd.d) * 0.3
+				sd.d = sd.d * 0.6 + d * 0.4
+				sd.n += 1
+			else
+				shineDelay[best.id] = { d = d, dev = 0, n = 1 }
+			end
+		end
+		local c, hrp = char()
+		local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+		if settings.combatStyle ~= 'Block / parry' or not settings.autoBlock or not (c and hrp and r and c:FindFirstChild('Weapon'))
+			or (r.Position - hrp.Position).Magnitude > 16 then
+			return
+		end
+		PStats.onShine += 1
+		-- (v194. Measured on our own character: after a press the game's "Parrying" state lasts
+		-- 0.24-0.30 s, our own swing ("Attacking") lasts 0.54-0.67 s, and a block asked for while
+		-- Attacking simply does not come up - 9 of the hits that got through were that, 5 more were a
+		-- block still held from the attack before, whose Parrying had run out. So each expected hit
+		-- (shine + the learned shine-to-hit time, ~0.34 s) gets its own press, sent about a quarter
+		-- of a second before it, held back while our swing is still out, and asked for again if the
+		-- Parrying state does not show up.)
+		local gap = best and G.FTShineGap2[best.id]
+		local g = gap and math.clamp(gap.d, 0.2, 0.6) or 0.34
+		-- (v198, traced on the Savage Ape: its combo opener shines in the very frame its animation
+		-- starts and the hit lands 0.08-0.23 s later, where the press used to go out 0.25 s after the
+		-- shine. An animation known to shine without a wind-up, caught at its start, is pressed at once.)
+		pcall(function()
+			local mh = m:FindFirstChildOfClass('Humanoid')
+			local an = mh and mh:FindFirstChildOfClass('Animator')
+			for _, tr in ipairs(an and an:GetPlayingAnimationTracks() or {}) do
+				local sd0 = tr.Animation and shineDelay[tr.Animation.AnimationId]
+				if sd0 and sd0.d < 0.1 and tr.TimePosition < 0.12 then
+					g = math.min(g, 0.15)
+				end
+			end
+		end)
+		g += math.clamp((tonumber(settings.parryShineLead) or 0) / 100, 0, 0.3)
+		do
+			local kind = baseName(m.Name)
+			Block.gmin[kind] = math.min(Block.gmin[kind] or 0.34, g)
+		end
+		Block.cues[#Block.cues + 1] = { t = now, id = best and best.id or nil }
+		while Block.cues[1] and now - Block.cues[1].t > 1 do
+			table.remove(Block.cues, 1)
+		end
+		table.insert(Block.hits, now + g)
+		Block.hitMob = Block.hitMob or {}
+		Block.hitMob[now + g] = r
+		table.sort(Block.hits)
+		if Block.running then
+			return
+		end
+		Block.running = true
+		task.spawn(function()
+			local tc = controller('ToolController')
+			local lastPress, confirmed = 0, false
+			local atkSeen, blkSeen = 0, 0 -- when our swing / our block was last seen still out
+			local blkUpAt, blkWas = 0, false -- when our block last came up
+			local steppedFor = nil
+			local okRun, errRun = pcall(function()
+				while alive and Block.hits[1] do
+					local ch = LocalPlayer.Character
+					local st = ch and ch:FindFirstChild('Status')
+					if not (tc and st and ch:FindFirstChild('Weapon')) or settings.combatStyle ~= 'Block / parry' or not settings.autoBlock then
+						break
+					end
+					local t = os.clock()
+					while Block.hits[1] and Block.hits[1] < t - 0.06 do
+						table.remove(Block.hits, 1)
+					end
+					local H = Block.hits[1]
+					if not H then
+						break
+					end
+					blockUntil = H + 0.1
+					local parrying = st:FindFirstChild('Parrying') ~= nil
+					local attacking = st:FindFirstChild('Attacking') ~= nil
+					local blockUp = st:FindFirstChild('Blocking') ~= nil
+					if parrying or (blockUp and lastPress > 0 and t - lastPress > 0.03) then
+						confirmed = true
+					end
+					if attacking then
+						atkSeen = t
+					end
+					if blockUp then
+						blkSeen = t
+						if not blkWas then
+							blkUpAt = t
+						end
+					end
+					blkWas = blockUp
+					-- (v201: the hits still getting through were ones no press could stop - our own swing, or a
+					-- stun, still running when the hit is 0.16 s away. Those are stepped out of instead, with the
+					-- same hop Hit & run uses; the fight loop walks straight back in.)
+					-- (v202: also when the block cannot come up in time because the last one came up under 0.26 s
+					-- ago - two mobs hitting a quarter of a second apart, traced on the Onis: 16% a hit.)
+					local cov0 = lastPress > 0 and H <= lastPress + 0.29 and (parrying or t - lastPress < 0.12)
+					if t >= H - 0.16 and t < H - 0.02 and steppedFor ~= H and Block.dodge and not cov0
+						and (attacking or st:FindFirstChild('Stun') ~= nil or t - blkUpAt < 0.26 or t - atkSeen < 0.03) then
+						steppedFor = H
+						local src = Block.hitMob and Block.hitMob[H]
+						local okStep = src ~= nil and src.Parent ~= nil and Block.dodge(src.Position, 24)
+						if okStep then
+							PStats.stepped = (PStats.stepped or 0) + 1
+						end
+						G.FTStepLog = G.FTStepLog or {}
+						if #G.FTStepLog < 200 then
+							local _, h1 = char()
+							G.FTStepLog[#G.FTStepLog + 1] = { t = t, ok = okStep, lead = H - t, d = (src and src.Parent and h1) and (src.Position - h1.Position).Magnitude or -1,
+								why = attacking and 'swing' or (st:FindFirstChild('Stun') and 'stun') or 'block just used' }
+						end
+					end
+					-- is the next hit inside the window of the press we already made?
+					-- (v197: a press shows up as Blocking 0.05-0.11s later; one that has not by 0.13s was refused)
+					local covered = lastPress > 0 and H <= lastPress + 0.29 and (parrying or t - lastPress < (confirmed and 0.16 or 0.12))
+					-- (v197, measured over 57 presses: a block asked for in the very frame our swing ends, or
+					-- within 0.05s of the old block ending, is silently refused - 6 of 6 - while 0.05s after the
+					-- swing and 0.09s after a block it always came up. So the old block is let go early, and
+					-- the press waits those few hundredths unless the hit is too close to wait.)
+					local urgent = t >= H - 0.10
+					if not covered and tc.isBlocking and t >= H - 0.42 and not attacking then
+						pcall(tc.StopBlock, tc) -- (let go of the old / refused block; pressed again once it is down)
+						if lastPress > 0 and not confirmed then
+							PStats.refused = (PStats.refused or 0) + 1
+						end
+						lastPress = 0
+					elseif not covered and t >= H - 0.26 then
+						if attacking then
+							PStats.waitedSwing = (PStats.waitedSwing or 0) + 1 -- (our swing is still out: next frame)
+						elseif tc.isBlocking then
+							pcall(tc.StopBlock, tc)
+							lastPress = 0
+						-- (v198, traced: a press 0.08 s after the old block went down was refused 3 of 3, and the ones
+						-- that came up were all 0.33 s or more after the old block came UP)
+						elseif not urgent and (t - atkSeen < 0.05 or t - blkSeen < 0.10 or t - blkUpAt < 0.34) then
+							PStats.settled = (PStats.settled or 0) + 1 -- (too soon after our swing / block: next frame)
+						elseif t < H - 0.03 then
+							pcall(tc.StartBlock, tc)
+							lastPress, confirmed = t, false
+							Block.pressedAt = t
+							Block.pressKind = 'run'
+							PStats.presses += 1
+						end
+					end
+					task.wait()
+				end
+			end)
+			if tc and tc.isBlocking then
+				pcall(tc.StopBlock, tc)
+			end
+			table.clear(Block.hits)
+			if Block.hitMob then
+				table.clear(Block.hitMob)
+			end
+			blockUntil = 0
+			Block.running = false
+			if not okRun then
+				warn('[ForgeTools] parry: ' .. tostring(errRun))
+			end
 		end)
 	end
 	-- Soonest incoming hit from a mob within radius: returns attacker position, seconds until it lands.
@@ -4376,6 +4775,11 @@ do
 		blockConns[#blockConns + 1] = an.AnimationPlayed:Connect(function(track)
 			task.spawn(onAnim, m, track)
 		end)
+		blockConns[#blockConns + 1] = m.DescendantAdded:Connect(function(d)
+			if d.Name == 'ParryWindow' and d:IsA('Attachment') then
+				onShine(m)
+			end
+		end)
 	end
 	local living = workspace:FindFirstChild('Living')
 	if living then
@@ -4396,6 +4800,109 @@ do
 			task.wait(2)
 		end
 	end)
+	Block.nearSince = setmetatable({}, { __mode = 'k' }) -- [mob] = since when it has been within 8 studs of us
+	local nearAt = 0
+	function Block.soon()
+		local d = Block.dueAt
+		local now = os.clock()
+		if Block.running == true or (d ~= nil and d - now < 0.75 and d - now > -0.1) then
+			return true
+		end
+		-- (v199, traced: 6 of the 7 swings still caught by a shine were pressed within 0.1 s of the mob
+		-- STARTING its attack, after it had been quiet for 2-7 s: we step up to it, it attacks the moment
+		-- we are in reach, and we swing the same moment. So next to a mob that has not attacked lately
+		-- the first swing waits 0.4 s: if it winds up, the wind-up rule above holds the sword.)
+		if settings.combatStyle == 'Block / parry' and settings.autoBlock then
+			local _, hrp0 = char()
+			local living = workspace:FindFirstChild('Living')
+			if hrp0 and living then
+				if now - nearAt > 0.3 then
+					table.clear(Block.nearSince) -- (not looked at for a while: start counting again)
+				end
+				if now - nearAt >= 0.06 then
+					nearAt = now
+					for _, m in ipairs(living:GetChildren()) do
+						if m:GetAttribute('IsNpc') then
+							local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+							local mh = m:FindFirstChildOfClass('Humanoid')
+							if r and mh and mh.Health > 0 and (r.Position - hrp0.Position).Magnitude <= 8 then
+								Block.nearSince[m] = Block.nearSince[m] or now
+							else
+								Block.nearSince[m] = nil
+							end
+						end
+					end
+				end
+				for m, t0 in pairs(Block.nearSince) do
+					local last = Block.lastShine[m]
+					if now - t0 < 0.4 and (not last or now - last > 2) then
+						return true
+					end
+				end
+			end
+		end
+		-- (v195. Measured with v194: no plain blocks left, 33 parries, and all 14 hits that got through
+		-- came while our own swing was still out when the shine appeared - a swing lasts ~0.6 s and
+		-- cannot be called back. So a swing only starts when it will be over before the next shine
+		-- of every mob in reach: after its hit has landed, and at least 0.75 s before its rhythm
+		-- says the next one is due.)
+		local _, hrp = char()
+		if not hrp then
+			return false
+		end
+		local hold, hot = false, false
+		for m, last in pairs(Block.lastShine) do
+			local r = m.Parent and (m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart)
+			if r and now - last < 8 and (r.Position - hrp.Position).Magnitude <= 16 then
+				-- (v196. With v195 the hits left were a mob's attack after a pause, and the later hits of
+				-- a combo. So a mob that has attacked in the last 8 s only leaves one opening: after its
+				-- hit - and after its combo, if its kind has one - until 0.75 s before its rhythm says
+				-- the next attack is due. Outside that opening the sword stays back.)
+				local since = now - last
+				local kind = baseName(m.Name)
+				-- (v198: v196's rule left no opening at all against a Savage Ape - 0 swings in 150 s. Now the
+				-- next shine is read off the times this kind has actually shown between two shines: a swing
+				-- may start once the last hit has landed, if it is over - 0.67 s swing, then the block has to
+				-- come up - before the earliest next hit this kind could still throw.)
+				local list = Block.ivs[kind]
+				-- (v200: v198's list mixed every gap of a combo together, which against a lone Savage Ape -
+				-- shines 0.16 / 0.44 / 0.86 / 0.30 / 1.23 s apart - left no opening: 0 swings in 180 s. The
+				-- gaps seen after THIS point of its pattern are used once there are 3 of them.)
+				local l2 = Block.ivs[kind .. '#' .. tostring(Block.prevB[m] or 0)]
+				local seen2 = 0
+				for _, b in ipairs(l2 or {}) do
+					seen2 += b.n
+				end
+				if seen2 >= 3 then
+					list = l2
+				end
+				local nextIv
+				for _, b in ipairs(list or {}) do
+					if b.n >= 2 and b.iv > since - 0.15 and (not nextIv or b.iv < nextIv) then
+						nextIv = b.iv
+					end
+				end
+				local need = 0.85 - (Block.gmin[kind] or 0.34)
+				if since < 0.4 then
+					hot = true
+				end
+				if since < 0.4 or (nextIv ~= nil and nextIv - since < need) then
+					hold = true
+				end
+			end
+		end
+		-- (v200: an opening that never comes must not mean never attacking: after 4 s of holding, the
+		-- sword goes out at the first moment no hit is on its way)
+		if hold then
+			Block.heldAt = Block.heldAt or now
+			if hot or now - Block.heldAt < 4 then
+				return true
+			end
+			PStats.forcedSwing = (PStats.forcedSwing or 0) + 1
+		end
+		Block.heldAt = nil
+		return false
+	end
 	function Block.active()
 		return os.clock() < blockUntil
 	end
@@ -4481,6 +4988,7 @@ local function dodgeFrom(fromPos, distOverride)
 	end
 	return false
 end
+Block.dodge = dodgeFrom
 -- how far to step to end up clear of a mob at `pos` that is winding up
 local function clearDist(pos)
 	local _, hrp = char()
@@ -5060,7 +5568,7 @@ local function fightOnce(forced)
 		if strikeAt and now > strikeEnd then
 			strikeAt = nil
 		end
-		if strikeAt or now < nextSwingAt or Block.active() or not target.r.Parent then
+		if strikeAt or now < nextSwingAt or Block.active() or Block.soon() or not target.r.Parent then
 			return
 		end
 		local _, h = char()
@@ -5193,8 +5701,11 @@ local function fightOnce(forced)
 			swingTick(reach)
 		elseif settings.combatStyle == 'Block / parry' and settings.autoBlock then
 			-- Hold block for the whole warned swing (halves the hit, parries it when the timing lines up).
+			-- (v202, traced with two Onis: this hold and the shine presses fought over the block - 30
+			-- press / release pairs in 3 s, none came up, and a block that IS held through a shine has
+			-- no parry left when the hit lands. While mobs here are showing shines, the shine does it alone.)
 			local wPos, wEnd = attackThreat(reach + 6)
-			if wPos then
+			if wPos and os.clock() - (Block.anyShineAt or -1e9) > 30 then
 				Block.hold(wEnd - os.clock())
 			end
 		end
@@ -6380,6 +6891,7 @@ do
 		QS.storyMobs, QS.storyMine = false, false
 		G.FTQuestRock = nil
 		G.FTQuestRocks = nil
+		G.FTCamp = nil
 		G.FTReserve = {}
 		local d = data()
 		if not d then
@@ -6549,9 +7061,68 @@ do
 						local t, target = p.questType, tostring(p.target)
 						if (t == 'Kill' or t == 'Mine' or t == 'Collect') and not Here.can(p) then
 							-- (its mob / rock is not on this island: nothing to do for it from here)
+							-- ...unless it is the focused quest and we know where its mobs live: wait there,
+							-- mining what is around, and they are picked up the moment they respawn.
+							local isFocusKill = t == 'Kill' and settings.focusQuest ~= 'Auto' and lockId == settings.focusQuest
+							local seenAt = isFocusKill and G.FTMobSeen and G.FTMobSeen[target] or nil
+							if isFocusKill and not seenAt then
+								-- never seen alive this session: its relatives (same last word: "... Oni") show the area
+								local fam = string.match(target, '(%a+)$')
+								local lv0 = workspace:FindFirstChild('Living')
+								local sum, n = Vector3.zero, 0
+								for _, m in ipairs(fam and lv0 and lv0:GetChildren() or {}) do
+									if m:GetAttribute('IsNpc') and string.match((string.gsub(m.Name, '%d+$', '')), '(%a+)$') == fam then
+										local r0 = mobRoot(m)
+										if r0 then
+											sum += r0.Position
+											n += 1
+										end
+									end
+								end
+								if n > 0 then
+									seenAt = sum / n
+								end
+							end
+							if seenAt and not G.FTCamp then
+								G.FTCamp = seenAt
+								G.FTCampFor = target
+								engaged = true
+								-- (v186, a test the user asked for: no Frostburn Oni anywhere for 10+ minutes while
+								-- 11 Brute Onis stood there. If the kinds share spawn places, killing the quest's
+								-- other, already finished, mob makes room. So: fight that one while waiting.)
+								local kin
+								for _, p2 in ipairs(qd.Progress) do
+									local t2 = tostring(p2.target)
+									if p2 ~= p and p2.questType == 'Kill' and Here.specificMob(t2) and Here.mob(t2) then
+										kin = t2
+										break
+									end
+								end
+								G.FTCampKill = kin
+								if kin and not QS.mobTarget then
+									QS.wantMobs = true
+									QS.mobTarget = kin
+								else
+									QS.wantMine = true
+								end
+							end
 						elseif t == 'Kill' then
 							QS.wantMobs = true
 							engaged = true
+							-- (remember where this kind lives, for the wait while they are all dead)
+							if Here.specificMob(target) then
+								local lv0 = workspace:FindFirstChild('Living')
+								for _, m in ipairs(lv0 and lv0:GetChildren() or {}) do
+									if m:GetAttribute('IsNpc') and mobMatches((string.gsub(m.Name, '%d+$', '')), target) then
+										local r0 = mobRoot(m)
+										if r0 then
+											G.FTMobSeen = G.FTMobSeen or {}
+											G.FTMobSeen[target] = r0.Position
+											break
+										end
+									end
+								end
+							end
 							if pri then
 								QS.storyMobs = true
 							end
@@ -7831,7 +8402,7 @@ MobBox:AddButton('Forget deadly mobs', function()
 	Deadly.clear()
 	setStatus('deadly list cleared' .. (was ~= '' and (' (was: ' .. was .. ')') or ''))
 end)
-bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything' }, 'Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 12% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
+bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything' }, 'Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 25% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
 bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Block / parry' }, 'Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Block / parry: stands and blocks. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)')
 bindSlider(MobBox, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
 bindToggle(MobBox, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
@@ -7839,7 +8410,10 @@ bindToggle(MobBox, 'FTAutoBoss', 'autoBoss', 'Auto boss (this island)', 'UNTESTE
 bindToggle(MobBox, 'FTAutoCards', 'autoCards', 'Auto pick abyss cards', 'Picks a card for you after each floor, even when you play the Abyss yourself.')
 bindDropdown(MobBox, 'FTCardFocus', 'cardFocus', 'Card priority', { 'Best overall', 'Damage', 'Survival', 'Loot' }, 'Best overall: rarest card (Abyssal > Fusion > Epic > Rare > Common). Damage / Survival / Loot: that kind of card first, then rarity.')
 bindToggle(MobBox, 'FTAutoBlock', 'autoBlock', 'Auto block (F)', 'Blocks right before a mob\'s attack lands, then goes back to swinging.')
-bindSlider(MobBox, 'FTParryLead', 'parryLead', 'Parry lead (x10 ms before the hit)', 5, 50, 'Blocks this long before each attack lands. It learns every mob attack\'s timing by itself; ~20 parries best. Raise it if hits get through, lower it if you block but don\'t parry.')
+if (tonumber(settings.parryShineLead) or 0) == 8 then
+	settings.parryShineLead = 0 -- (v190-v191 default: before the shine, which only ever gave a plain block)
+end
+bindSlider(MobBox, 'FTParryShineLead', 'parryShineLead', 'Parry delay (x10 ms after the shine)', 0, 30, 'The block is pressed when the parry shine appears on the mob. 0 = that instant, which measured as a real parry. Raise it only if you see plain blocks (stamina lost, some damage) instead of the orange parry.')
 bindSlider(MobBox, 'FTSwitchMins', 'switchMins', 'With auto mine on, switch every (min)', 1, 15, 'Mobs and mining take turns so you still get ores to forge with.')
 local QuestBox = Tab:AddRightGroupbox('Quests')
 
