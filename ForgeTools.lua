@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v163'
+local BUILD = 'forge-tools-v174'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -890,6 +890,12 @@ local function walkPathRaw(cf, opts)
 		local wps = computePath(hrp.Position, goals)
 		local partial = false
 		if not wps then
+			-- (a spot close by with no direct route - a boulder up on a ledge: measured, 13 seconds
+			-- went on the fallbacks below before giving up. The caller glides over instead.)
+			if replans == 0 and partials == 0 and (target - hrp.Position).Magnitude < 150 then
+				G.FTNavDbg = ('no direct path to a spot %.0f studs away'):format((target - hrp.Position).Magnitude)
+				return false, 'nopath'
+			end
 			if replans == 0 and partials == 0 and not startOnMesh(hrp.Position) then
 				unwedge()
 				return false, 'wedged'
@@ -1290,7 +1296,7 @@ local function tweenTo(cf, opts)
 	table.insert(G.FTTrips, trip)
 	G.FTTravel = trip.dest
 	local ok, a, b = pcall(tweenToRaw, cf, opts)
-	if ok and a == false and b == 'nopath' and alive and not (opts and opts.abort and opts.abort()) then
+	if ok and a == false and alive and not (opts and opts.abort and opts.abort()) then
 		local _, hf = char()
 		if hf and (trip.dest - hf.Position).Magnitude > 25 and os.clock() - (Nav.flyAt or -1e9) > 3 then
 			Nav.flyAt = os.clock()
@@ -1615,6 +1621,98 @@ local stats = { mined = 0, sold = 0, forged = 0, kills = 0 }
 -- Mining
 ---------------------------------------------------------------------------
 local tooStrong = {} -- rock type name -> true (pickaxe did no damage)
+G.FTTooStrong = tooStrong
+-- Rock kinds we have damaged before can not be "too strong" (measured: Glowy Rock, 14 already mined
+-- for a quest, was written off after three swings that missed from a ledge - and the quest with it).
+local canBreak = G.FTCanBreak or {}
+G.FTCanBreak = canBreak
+-- Rocks carry a RequiredDamage attribute. When the game says "You need to deal at least N base
+-- damage to mine this rock!", every rock type needing N or more is out of reach for this pickaxe:
+-- skip them all at once instead of waiting out 3 no-damage rocks. Cleared when the pickaxe changes.
+local ReqDmg = { limit = nil, added = {}, pick = nil }
+G.FTReqDmg = ReqDmg
+function ReqDmg.pickName()
+	return LocalPlayer:GetAttribute('GolemPickaxe')
+end
+function ReqDmg.reset()
+	for name in pairs(ReqDmg.added) do
+		tooStrong[name] = nil
+	end
+	table.clear(ReqDmg.added)
+	ReqDmg.limit = nil
+	ReqDmg.pick = ReqDmg.pickName()
+end
+function ReqDmg.learn(n)
+	if ReqDmg.pick ~= ReqDmg.pickName() then
+		ReqDmg.reset()
+	end
+	if ReqDmg.limit and ReqDmg.limit <= n then
+		return
+	end
+	ReqDmg.limit = n
+	local rocks = workspace:FindFirstChild('Rocks')
+	local names = {}
+	for _, d in ipairs(rocks and rocks:GetDescendants() or {}) do
+		if d:IsA('Model') then
+			local req = d:GetAttribute('RequiredDamage')
+			if type(req) == 'number' and req >= n and not tooStrong[d.Name] then
+				tooStrong[d.Name] = true
+				ReqDmg.added[d.Name] = true
+				names[#names + 1] = d.Name
+			end
+		end
+	end
+	if setStatus and #names > 0 then
+		pcall(setStatus, ('pickaxe can\'t mine rocks needing %d+ damage — skipping %s'):format(n, table.concat(names, ', ')))
+	end
+end
+-- (a rock type whose RequiredDamage is already known to be too much, seen after learning)
+function ReqDmg.blocks(m)
+	local req = ReqDmg.limit and m:GetAttribute('RequiredDamage')
+	return type(req) == 'number' and req >= ReqDmg.limit
+end
+do
+	if G.FTReqDmgConn then
+		pcall(function()
+			G.FTReqDmgConn:Disconnect()
+		end)
+	end
+	local function check(lbl)
+		local txt = tostring(lbl.Text or '')
+		local n = txt:match('deal at least (%d+) base damage')
+		if n then
+			ReqDmg.learn(tonumber(n))
+		end
+	end
+	local pg = LocalPlayer:WaitForChild('PlayerGui', 10)
+	if pg then
+		G.FTReqDmgConn = pg.DescendantAdded:Connect(function(d)
+			if d:IsA('TextLabel') then
+				task.defer(function()
+					pcall(check, d)
+					pcall(function()
+						local c
+						c = d:GetPropertyChangedSignal('Text'):Connect(function()
+							if not d.Parent then
+								c:Disconnect()
+								return
+							end
+							pcall(check, d)
+						end)
+						task.delay(10, function()
+							c:Disconnect()
+						end)
+					end)
+				end)
+			end
+		end)
+	end
+	pcall(function()
+		track(LocalPlayer:GetAttributeChangedSignal('GolemPickaxe'):Connect(function()
+			ReqDmg.reset()
+		end))
+	end)
+end
 local noDamage = {} -- rock type name -> rocks in a row that took no damage
 local unreachable = setmetatable({}, { __mode = 'k' }) -- rock Model -> os.clock() until which we skip it
 local unreachFails = setmetatable({}, { __mode = 'k' }) -- rock Model -> times we failed to get to it
@@ -1623,6 +1721,21 @@ local zoneBlocked = {} -- zone name -> os.clock() until which the whole zone is 
 local MineHooks = {} -- .clear(pos) is filled in by the mob code: kill mobs around a rock first
 
 -- Living mobs within radius of a position: count, list.
+-- Mobs to leave alone altogether (the user's call: "ignore spirit golem mob they take too long to
+-- kill, if its for mining then focus on mining if they are nearby" / "same for hellbringer").
+-- Never picked as a fight, and invisible to the mining safety checks: no clearing them first, no
+-- fighting back, no moving off. Their attacks are still dodged like any other mob's if they turn
+-- out to be a real threat.
+local IGNORE_MOBS = { 'spirit golem', 'hellbringer' }
+local function mobIgnored(m)
+	local n = string.lower(m.Name)
+	for _, k in ipairs(IGNORE_MOBS) do
+		if string.find(n, k, 1, true) then
+			return true
+		end
+	end
+	return false
+end
 local function mobsNear(pos, radius)
 	local living = workspace:FindFirstChild('Living')
 	local list = {}
@@ -1630,7 +1743,7 @@ local function mobsNear(pos, radius)
 		return 0, list
 	end
 	for _, m in ipairs(living:GetChildren()) do
-		if m:GetAttribute('IsNpc') and not Players:GetPlayerFromCharacter(m) then
+		if m:GetAttribute('IsNpc') and not Players:GetPlayerFromCharacter(m) and not mobIgnored(m) then
 			local h = m:FindFirstChildOfClass('Humanoid')
 			local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
 			if h and r and h.Health > 0 then
@@ -1704,7 +1817,30 @@ do
 	-- "Avoid mobs that killed me" is on.
 	function Deadly.big(h)
 		local _, _, hum = char()
-		return hum ~= nil and h ~= nil and h.MaxHealth < 1e8 and (h.MaxHealth > math.min(hum.MaxHealth * 8, 5000) or (h.Parent ~= nil and string.find(h.Parent.Name, 'Prismarine', 1, true) ~= nil))
+		if hum == nil or h == nil or h.MaxHealth >= 1e8 then
+			return false
+		end
+		if h.Parent ~= nil and string.find(h.Parent.Name, 'Prismarine', 1, true) ~= nil then
+			return true
+		end
+		if h.MaxHealth > math.min(hum.MaxHealth * 8, 5000) then
+			-- (size alone is not danger any more: only a big mob the threat ledger counts as a threat)
+			local T = G.FTThreat
+			if h.Parent == nil or T == nil then
+				return true
+			end
+			if not T.is(h.Parent) then
+				return false
+			end
+			-- (one recorded hit is not enough to run from a kind on sight: a single reading can be
+			-- several mobs landing at once. Its attacks are still dodged; keeping away needs two.)
+			local rec = T.kind[T.key(h.Parent)]
+			if rec and (rec.n or 0) < 2 and not T.pressure then
+				return false
+			end
+			return true
+		end
+		return false
 	end
 	function Deadly.avoid(m)
 		return Deadly.is(m) or Deadly.big(m:FindFirstChildOfClass('Humanoid'))
@@ -1763,13 +1899,18 @@ local function mineThreat()
 	if dead then
 		return dead
 	end
+	local shrug = MineHooks.shrug
 	local _, list = mobsNear(hrp.Position, 12)
 	for _, e in ipairs(list) do
-		if e.h.MaxHealth < 1e8 and not e.m.Name:find('Dummy') then
+		if e.h.MaxHealth < 1e8 and not e.m.Name:find('Dummy') and not (shrug and (shrug[e.m] or 0) > os.clock()) then
 			return e
 		end
 	end
-	return MineHooks.attacker and MineHooks.attacker() or nil
+	local att = MineHooks.attacker and MineHooks.attacker() or nil
+	if att and att.m and (mobIgnored(att.m) or (shrug and (shrug[att.m] or 0) > os.clock())) then
+		att = nil
+	end
+	return att
 end
 
 -- Where we can walk depends on where we are: forget the skip lists after a respawn.
@@ -1800,7 +1941,7 @@ local function rockList()
 				local m = sp:FindFirstChildWhichIsA('Model')
 				local hb = m and m:FindFirstChild('Hitbox')
 				local hp = m and m:GetAttribute('Health')
-				if hb and type(hp) == 'number' and hp > 0 and not tooStrong[m.Name]
+				if hb and type(hp) == 'number' and hp > 0 and not tooStrong[m.Name] and not ReqDmg.blocks(m)
 					and not (unreachable[m] and os.clock() < unreachable[m])
 					and not ((settings.skipLucky or G.FTQuestWantsOre) and string.find(m.Name, 'Lucky', 1, true))
 					and not Deadly.near(hb.Position, Deadly.RANGE + 8)
@@ -2092,9 +2233,14 @@ local function mineOnce()
 			stats.mined += 1
 			break
 		end
+		if tooStrong[target.m.Name] then
+			break -- (just learned this type needs more damage than the pickaxe has)
+		end
 		if hp ~= lastHp then
 			lastHp, lastChange = hp, os.clock()
 			noDamage[target.m.Name] = nil
+			canBreak[target.m.Name] = true
+			tooStrong[target.m.Name] = nil
 		elseif os.clock() - lastChange > 4 then
 			local bagUsed, bagCap = bagCapacity()
 			if bagUsed and bagCap and bagUsed >= bagCap then
@@ -2110,7 +2256,7 @@ local function mineOnce()
 			local away = h4 and (h4.Position - target.hb.Position).Magnitude or -1
 			unreachable[target.m] = os.clock() + 180
 			noDamage[target.m.Name] = (noDamage[target.m.Name] or 0) + 1
-			if noDamage[target.m.Name] >= 3 then
+			if noDamage[target.m.Name] >= 3 and not canBreak[target.m.Name] then
 				tooStrong[target.m.Name] = true
 				setStatus(target.m.Name .. ' too strong for your pickaxe — skipping that type')
 				else
@@ -3325,10 +3471,10 @@ function Threat.keyIs(key)
 		Threat.kind[key] = nil
 		rec = nil
 	end
-	return rec ~= nil and (rec.hit >= 0.12 or rec.hit / 3 > Threat.heal)
+	return rec ~= nil and (rec.hit >= 0.12 or rec.hit / 3 > Threat.heal + 0.02)
 end
 function Threat.recIs(rec, m)
-	return rec.hit >= 0.12 or rec.hit / Threat.period(m) > Threat.heal
+	return rec.hit >= 0.12 or rec.hit / Threat.period(m) > Threat.heal + 0.02 -- (a clear net drain: 2%/s more than we heal back)
 end
 function Threat.is(m)
 	if settings.dodgeWhat == 'Everything' or Threat.pressure then
@@ -3388,7 +3534,7 @@ task.spawn(function()
 						rec.n += 1
 						rec.at, rec.max = os.time(), mx
 						Threat.kind[key] = rec
-						local is = rec.hit >= 0.12 or rec.hit / per > Threat.heal
+						local is = rec.hit >= 0.12 or rec.hit / per > Threat.heal + 0.02
 						if Threat.told[key] ~= is then
 							Threat.told[key] = is
 							statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. (is
@@ -3654,13 +3800,37 @@ end
 -- it is picked by name as the Target.
 local function mobTooBig(h)
 	local _, _, hum = char()
-	return hum ~= nil and (h.MaxHealth > math.min(hum.MaxHealth * 8, 5000) or (h.Parent ~= nil and string.find(h.Parent.Name, 'Prismarine', 1, true) ~= nil))
+	if hum == nil then
+		return false
+	end
+	if h.Parent ~= nil and string.find(h.Parent.Name, 'Prismarine', 1, true) ~= nil then
+		return true
+	end
+	-- Size alone no longer makes a mob "too big" (measured: a 7,800 HP Samurai Ape that hits for
+	-- 2.4% of our health was walked away from, rock after rock). A big mob is only left alone when
+	-- it is also a threat: its hits are on record as outpacing our healing, or it has never hit us
+	-- and is over 20x our health.
+	if h.MaxHealth > math.min(hum.MaxHealth * 8, 5000) then
+		return h.Parent == nil or Threat.is(h.Parent)
+	end
+	return false
 end
 
 -- Mobs no route was found to (measured: stood in town for minutes "fighting" apes 500-750 studs
 -- away on another level, every route "no path"). Left alone for 3 minutes; quests see them as absent.
 local mobNoRoute = setmetatable({}, { __mode = 'k' })
 G.FTMobNoRoute = mobNoRoute
+-- The "max mob health" slider, except for the mobs a quest the user FOCUSED asks for: picking that
+-- quest is the user saying to fight them (measured: focus on a Monk Panda 10,000 HP / Samurai Ape
+-- 7,100-9,200 HP quest with the slider on 7,018 = standing idle, nothing allowed).
+local function mobCap(m)
+	local cap = tonumber(settings.maxMobHp) or 0
+	if cap > 0 and settings.focusQuest ~= 'Auto' and G.FTQuestLock == settings.focusQuest
+		and type(QS.mobTarget) == 'string' and QS.mobTarget ~= 'Any' and mobMatches(baseName(m.Name), QS.mobTarget) then
+		return 0
+	end
+	return cap
+end
 local function mobList()
 	local _, hrp = char()
 	local living = workspace:FindFirstChild('Living')
@@ -3693,9 +3863,10 @@ local function mobList()
 		if not players[m] and m:GetAttribute('IsNpc') then
 			local h = m:FindFirstChildOfClass('Humanoid')
 			local r = mobRoot(m)
-			local cap = tonumber(settings.maxMobHp) or 0
+			local cap = mobCap(m)
 			if h and r and h.Health > 0 and m:GetAttribute('KillCredited') ~= true
 				and (mobNoRoute[m] or 0) < os.clock()
+				and not mobIgnored(m)
 				and mobMatches(baseName(m.Name), filter)
 				and (cap <= 0 or h.MaxHealth <= cap)
 				and h.MaxHealth < 1e8 and not m.Name:find('Dummy') -- training dummies never die
@@ -5057,7 +5228,7 @@ end
 
 -- Mining safety: clear the mobs standing around a rock before mining it.
 local function mobFightable(e)
-	local cap = tonumber(settings.maxMobHp) or 0
+	local cap = mobCap(e.m)
 	return (LocalPlayer.Backpack:FindFirstChild('Weapon') or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('Weapon')))
 		and (cap <= 0 or e.h.MaxHealth <= cap)
 		and e.h.MaxHealth < 1e8 and not e.m.Name:find('Dummy')
@@ -5174,9 +5345,23 @@ MineHooks.defend = function(th)
 			fightOnce(th)
 		end
 	else
-		setStatus(th.m.Name .. ' is too strong to fight — moving to another rock')
-		pcall(dodgeFrom, th.r.Position)
-		task.wait(0.3)
+		-- Not one we fight (over the "max mob health" slider, no weapon, ...). Only a reason to move
+		-- if it is also a threat; otherwise it is left to hit us and the mining goes on.
+		local cap = tonumber(settings.maxMobHp) or 0
+		local whyNot = (cap > 0 and th.h.MaxHealth > cap) and ('%d HP is over your max mob health of %d'):format(th.h.MaxHealth, cap)
+			or Deadly.is(th.m) and 'on the killed-me list'
+			or mobTooBig(th.h) and 'a big mob that is a threat'
+			or 'no weapon found'
+		if Threat.is(th.m) or Deadly.is(th.m) then
+			setStatus(('%s is too strong to fight (%s) — moving to another rock'):format(th.m.Name, whyNot))
+			pcall(dodgeFrom, th.r.Position)
+			task.wait(0.3)
+		else
+			MineHooks.shrug = MineHooks.shrug or setmetatable({}, { __mode = 'k' })
+			MineHooks.shrug[th.m] = os.clock() + 60
+			statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('not fighting %s (%s) and it is no threat — mining on'):format(th.m.Name, whyNot)
+			G.FTShrugWhy = th.m.Name .. ': ' .. whyNot
+		end
 	end
 end
 
@@ -5990,7 +6175,7 @@ do
 	function Here.mob(target)
 		local lv = workspace:FindFirstChild('Living')
 		for _, m in ipairs(lv and lv:GetChildren() or {}) do
-			if m:GetAttribute('IsNpc') and (mobNoRoute[m] or 0) < os.clock()
+			if m:GetAttribute('IsNpc') and (mobNoRoute[m] or 0) < os.clock() and not mobIgnored(m)
 				and (target == nil or mobMatches((string.gsub(m.Name, '%d+$', '')), target)) then
 				return true
 			end
@@ -6006,14 +6191,15 @@ do
 		if t == 'Kill' then
 			return Here.mob(Here.specificMob(target) and target or nil)
 		elseif t == 'Mine' then
-			return target == 'Any' or target == 'Rock' or Here.rock(target)
+			-- (a rock the pickaxe cannot hurt - Hana Pebble needs 777 base damage - is not work we can do)
+			return target == 'Any' or target == 'Rock' or (Here.rock(target) and not tooStrong[target])
 		elseif t == 'Collect' and target ~= 'Ore' and not (ShopData and ShopData[target]) then
 			local src = Here.sources(target)
 			if next(src) == nil then
 				return true -- (no rock lists it: unknown, the old behaviour)
 			end
 			for name in pairs(src) do
-				if Here.rock(name) then
+				if Here.rock(name) and not tooStrong[name] then
 					return true
 				end
 			end
@@ -6067,6 +6253,15 @@ do
 				order[#order + 1] = id
 			end
 			local focusId = settings.focusQuest ~= 'Auto' and d.Quests[settings.focusQuest] ~= nil and settings.focusQuest or nil
+			-- (a rock kind a quest has already counted as mined is one the pickaxe can break)
+			for _, qd0 in pairs(d.Quests) do
+				for _, p in ipairs(type(qd0) == 'table' and qd0.Progress or {}) do
+					if p.questType == 'Mine' and (tonumber(p.currentProgress) or 0) > 0 then
+						canBreak[tostring(p.target)] = true
+						tooStrong[tostring(p.target)] = nil
+					end
+				end
+			end
 			local hereQ, fracQ, mineQ = {}, {}, {}
 			for _, id in ipairs(order) do
 				hereQ[id] = Here.quest(d.Quests[id])
@@ -6133,10 +6328,22 @@ do
 				local sig = progSig(d.Quests[lockId])
 				if sig ~= lockSig then
 					lockSig, lockAt = sig, nowQ
-				elseif nowQ - lockAt > 360 then
-					stalled[lockId] = nowQ + 600
-					setStatus(('quest %s: no progress for 6 min — trying another one for a while'):format(tostring(lockId)))
-					lockId = nil
+				else
+					-- (measured: the quest picked under "Focus quest" - 3 Fruite, a rare drop from Hana
+					-- Pebbles - was dropped after 6 minutes without one, for a kill quest. The focused
+					-- quest is never dropped for slow progress, and one waiting on an ore drop gets
+					-- 30 minutes.)
+					local waitsOnOre = false
+					for _, p in ipairs(type(d.Quests[lockId]) == 'table' and d.Quests[lockId].Progress or {}) do
+						if p.questType == 'Collect' and (tonumber(p.currentProgress) or 0) < (tonumber(p.requiredAmount) or 1) then
+							waitsOnOre = true
+						end
+					end
+					if lockId ~= focusId and nowQ - lockAt > (waitsOnOre and 1800 or 360) then
+						stalled[lockId] = nowQ + 600
+						setStatus(('quest %s: no progress for %d min — trying another one for a while'):format(tostring(lockId), waitsOnOre and 30 or 6))
+						lockId = nil
+					end
 				end
 			end
 			-- (a quest with nothing to do right now is set aside and the next one tried in the same
@@ -8428,7 +8635,12 @@ local function mainLoop(myGen)
 					task.wait(1)
 				end
 			else
-				setStatus('idle')
+				local cap = tonumber(settings.maxMobHp) or 0
+				if farm == 'mobs' and cap > 0 then
+					setStatus(('nothing to fight: every %s here is over your max mob health of %d'):format(tostring(QS.mobTarget or settings.mobFilter), cap))
+				else
+					setStatus('idle')
+				end
 				task.wait(0.5)
 			end
 		end)
