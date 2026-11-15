@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v174'
+local BUILD = 'forge-tools-v179'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -1835,7 +1835,7 @@ do
 			-- (one recorded hit is not enough to run from a kind on sight: a single reading can be
 			-- several mobs landing at once. Its attacks are still dodged; keeping away needs two.)
 			local rec = T.kind[T.key(h.Parent)]
-			if rec and (rec.n or 0) < 2 and not T.pressure then
+			if rec and not T.pressure then -- (v178: a measured kind is only kept away from while health is actually going down)
 				return false
 			end
 			return true
@@ -4761,6 +4761,7 @@ local function fightOnce(forced)
 	end
 	G.FTSwingLog = G.FTSwingLog or {}
 	local pend
+	local forcedStrike = false -- (this swing went out after being held 2.5s: step in for it whatever is winding up)
 	local function track(flush)
 		if not pend then
 			return
@@ -4944,9 +4945,18 @@ local function fightOnce(forced)
 		-- be early for the same reason.)
 		STRIKE_LEAD = ht >= 0.6 and 0.42 or 0.3
 		local lag = 0 -- (tried staying 0.3s longer for server lag: no better, 16 hits of 31, and more damage taken)
-		if hitRun and not (strikeSafe(reach, ht - STRIKE_LEAD) and strikeSafe(reach, ht - STRIKE_LEAD / 2) and strikeSafe(reach, ht) and strikeSafe(reach, ht + hd)
+		-- (several mobs winding up one after another around the target: some hit is always about to
+		-- land, so the swing used to be held for as long as they kept attacking. After 2.5s of holding
+		-- it goes out anyway: trading a hit beats not attacking at all.)
+		local held = now - math.max(nextSwingAt, t0)
+		G.FTHoldMax = math.max(G.FTHoldMax or 0, held)
+		if hitRun and held < 2.5 and not (strikeSafe(reach, ht - STRIKE_LEAD) and strikeSafe(reach, ht - STRIKE_LEAD / 2) and strikeSafe(reach, ht) and strikeSafe(reach, ht + hd)
 			and strikeSafe(reach, ht + lag / 2) and strikeSafe(reach, ht + lag) and strikeSafe(reach, ht + lag + hd)) then
 			return -- this swing's hitbox would come out while a mob's hit is landing: hold it a moment
+		end
+		forcedStrike = hitRun and held >= 2.5
+		if forcedStrike then
+			G.FTForcedSwings = (G.FTForcedSwings or 0) + 1
 		end
 		if hitRun then
 			-- Counter-attack instead of swinging on cooldown. Measured with a great sword (hitbox 0.9s
@@ -5073,7 +5083,7 @@ local function fightOnce(forced)
 		end
 		local inRange = hrp and (hrp.Position - target.r.Position).Magnitude <= reach - 1 + math.max(target.r.Size.X, target.r.Size.Z) / 2
 		local striking = hitRun and strikeAt and now >= strikeAt - STRIKE_LEAD and now <= strikeEnd
-		if striking and hrp and (strikeSafe(reach, 0) or (now <= strikeEnd - 0.05 and strikeSafe(reach, 0, 0.08))) and not (rem and rem > 0 and rem < 0.25) then
+		if striking and hrp and (forcedStrike or ((strikeSafe(reach, 0) or (now <= strikeEnd - 0.05 and strikeSafe(reach, 0, 0.08))) and not (rem and rem > 0 and rem < 0.25))) then
 			-- Our hitbox is (about to be) out and no hit is landing on us: be on the mob for it.
 			G.FTStrikeUntil = strikeEnd -- (the strafe above leaves us alone while our own hitbox is out)
 			-- (measured: standing still 2-5 studs off, every swing hit; with the mob lunging into / through
@@ -5098,7 +5108,7 @@ local function fightOnce(forced)
 				if hitRun then
 					swingTick(reach) -- keep the combo going from out here
 					local n2 = os.clock()
-					if strikeAt and n2 >= strikeAt - STRIKE_LEAD and n2 <= strikeEnd and strikeSafe(reach, 0) then
+					if strikeAt and n2 >= strikeAt - STRIKE_LEAD and n2 <= strikeEnd and (forcedStrike or strikeSafe(reach, 0)) then
 						break -- our hitbox is due and their swing is over: go land it
 					end
 				end
@@ -5352,7 +5362,7 @@ MineHooks.defend = function(th)
 			or Deadly.is(th.m) and 'on the killed-me list'
 			or mobTooBig(th.h) and 'a big mob that is a threat'
 			or 'no weapon found'
-		if Threat.is(th.m) or Deadly.is(th.m) then
+		if Threat.pressure or Deadly.is(th.m) then
 			setStatus(('%s is too strong to fight (%s) — moving to another rock'):format(th.m.Name, whyNot))
 			pcall(dodgeFrom, th.r.Position)
 			task.wait(0.3)
@@ -6483,7 +6493,8 @@ do
 			end
 			if lockId and not engaged then
 				-- nothing the bot can do for this one right now: next quest, come back in 5 min
-				stalled[lockId] = os.clock() + 300
+				-- (the quest the user focused is only waiting for its mobs to respawn: look again in 15 s)
+				stalled[lockId] = os.clock() + ((settings.focusQuest ~= 'Auto' and lockId == settings.focusQuest) and 15 or 300)
 				lockId = nil
 			end
 			if lockId then
