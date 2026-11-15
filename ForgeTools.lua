@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v202'
+local BUILD = 'forge-tools-v206'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -4672,8 +4672,11 @@ do
 					-- (v202: also when the block cannot come up in time because the last one came up under 0.26 s
 					-- ago - two mobs hitting a quarter of a second apart, traced on the Onis: 16% a hit.)
 					local cov0 = lastPress > 0 and H <= lastPress + 0.29 and (parrying or t - lastPress < 0.12)
-					if t >= H - 0.16 and t < H - 0.02 and steppedFor ~= H and Block.dodge and not cov0
-						and (attacking or st:FindFirstChild('Stun') ~= nil or t - blkUpAt < 0.26 or t - atkSeen < 0.03) then
+					-- (v203: 5 of 23 steps at 0.16 s still took the hit. A swing pressed so late that it cannot be
+					-- over in time - it shows for at least 0.61 s after the press - is stepped out of at 0.26 s.)
+					local lead = 0.16 -- (v204: stepping at 0.26 s was worse, 14 of 36 still hit against 5 of 23 - the mob still turns and lunges that early)
+					if t >= H - lead and t < H - 0.02 and steppedFor ~= H and Block.dodge and not cov0
+						and (attacking or st:FindFirstChild('Stun') ~= nil or blkUpAt + 0.34 > H - 0.20 or t - atkSeen < 0.03) then
 						steppedFor = H
 						local src = Block.hitMob and Block.hitMob[H]
 						local okStep = src ~= nil and src.Parent ~= nil and Block.dodge(src.Position, 24)
@@ -4695,21 +4698,28 @@ do
 					-- swing and 0.09s after a block it always came up. So the old block is let go early, and
 					-- the press waits those few hundredths unless the hit is too close to wait.)
 					local urgent = t >= H - 0.10
+					-- (v206, traced in fights: the block only cuts a swing short in its first 0.3 s - 7 of 7 up to
+					-- 0.32 s after the swing was sent, 0 of 3 from 0.39 s on, where the block stays refused until
+					-- the swing is over. So a swing that is still young is cut a little early, while it still can be.)
+					local locked = attacking and t - (Block.swingAt or 0) >= 0.30
 					if not covered and tc.isBlocking and t >= H - 0.42 and not attacking then
 						pcall(tc.StopBlock, tc) -- (let go of the old / refused block; pressed again once it is down)
 						if lastPress > 0 and not confirmed then
 							PStats.refused = (PStats.refused or 0) + 1
 						end
 						lastPress = 0
-					elseif not covered and t >= H - 0.26 then
-						if attacking then
+					elseif not covered and t >= H - ((attacking and not locked) and 0.29 or 0.26) then
+						-- (v205, tested directly: a block asked for DURING our swing cuts the swing short and comes up
+						-- with its parry 0.06 s later - 5 of 5, asked 0.07-0.32 s into the swing. A swing asked for
+						-- during a block is refused and the block stays. So the press no longer waits for the swing.)
+						if attacking and (locked or G.FTSwingCancel == false) then
 							PStats.waitedSwing = (PStats.waitedSwing or 0) + 1 -- (our swing is still out: next frame)
 						elseif tc.isBlocking then
 							pcall(tc.StopBlock, tc)
 							lastPress = 0
 						-- (v198, traced: a press 0.08 s after the old block went down was refused 3 of 3, and the ones
 						-- that came up were all 0.33 s or more after the old block came UP)
-						elseif not urgent and (t - atkSeen < 0.05 or t - blkSeen < 0.10 or t - blkUpAt < 0.34) then
+						elseif not urgent and ((not attacking and t - atkSeen < 0.05) or t - blkSeen < 0.10 or t - blkUpAt < 0.34) then
 							PStats.settled = (PStats.settled or 0) + 1 -- (too soon after our swing / block: next frame)
 						elseif t < H - 0.03 then
 							pcall(tc.StartBlock, tc)
@@ -4805,6 +4815,15 @@ do
 	function Block.soon()
 		local d = Block.dueAt
 		local now = os.clock()
+		if G.FTSwingCancel ~= false then
+			-- (v205: since the block cancels a swing, a swing only has to be held back when it could not
+			-- reach its own hitbox - about 0.35 s after the press - before the block has to go up)
+			local H1 = Block.hits[1]
+			if (H1 ~= nil and H1 - now < 0.82 and H1 - now > -0.1) or (d ~= nil and d - now < 0.47 and d - now > -0.1) then
+				return true
+			end
+			return false
+		end
 		if Block.running == true or (d ~= nil and d - now < 0.75 and d - now > -0.1) then
 			return true
 		end
@@ -5636,6 +5655,7 @@ local function fightOnce(forced)
 		end
 		swingIdx = idx
 		swing(tool)
+		Block.swingAt = now
 		lastSwingAt, sentAt = now, now
 		-- (a great axe's swing plays for 1.6s but its cooldown says 1.5: a press in between is dropped)
 		local dur = combat and type(combat.AttackDuration) == 'table' and tonumber(combat.AttackDuration[idx]) or 0
