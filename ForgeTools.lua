@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v206'
+local BUILD = 'forge-tools-v264'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -141,6 +141,7 @@ local defaults = {
 	mobFilter = 'Any',
 	retreatHp = 45,
 	healTo = 60,
+	kiteHp = 40,
 	mineRocks = {},
 	mineMutations = {},
 	mineMeteors = false,
@@ -151,6 +152,9 @@ local defaults = {
 	autoload = true,
 	focusQuest = 'Auto',
 	keepOres = {},
+	keepTraitOres = false,
+	raidTier = 1,
+	raidRetries = 0,
 	autoCards = false,
 	cardFocus = 'Best overall',
 	allowCursed = false,
@@ -162,6 +166,20 @@ for k, v in pairs(defaults) do
 end
 if settings.combatStyle == 'Float above' then
 	settings.combatStyle = 'Hit & run' -- tested: mobs hit straight up, so floating doesn't protect you
+end
+-- (v238, asked for: "parry on asura, no parry on normal mobs") the island boss is always fought
+-- with Block / parry when the style is Attack only; everything else uses the style as set.
+local function combatStyle()
+	if G.FTBossFight and settings.combatStyle == 'Attack only' then
+		return 'Block / parry'
+	end
+	-- (v252, asked for: "crowd mode". Measured in the Abyss with 8-10 mobs around: 2.5 attack shines
+	-- a second, 167 of 394 block presses refused, 61 hits in 75 s. A block cannot cover hits that
+	-- close together, so with 5 or more mobs in reach a Block / parry fight is fought as Hit & run.)
+	if G.FTCrowdMode and not G.FTBossFight and settings.combatStyle == 'Block / parry' then
+		return 'Hit & run'
+	end
+	return settings.combatStyle
 end
 local function save()
 	pcall(writefile, SETTINGS_PATH, HttpService:JSONEncode(settings))
@@ -231,6 +249,67 @@ local function wireTracersPill()
 	return true
 end
 
+-- (v220) ores still missing for a craft the user asked for: G.FTCraftNeed = { ore = count }.
+-- While any is short, mining runs (as if Auto mine were ticked) and G.FTCraftRocks come first.
+local function craftWant()
+	local need = G.FTCraftNeed
+	if type(need) ~= 'table' then
+		return false
+	end
+	local d = data()
+	local inv = d and d.Inventory or {}
+	for ore, n in pairs(need) do
+		if (tonumber(inv[ore]) or 0) < n then
+			return true
+		end
+	end
+	return false
+end
+-- (v230) drops still missing that the user asked for: G.FTDropNeed = { { ore = 'Yin', n = 5,
+-- mob = 'Pale Oni' }, ... }. While one is short its mob is the fight target, ahead of quests.
+-- (v245) is one of the rocks wanted for a craft (G.FTCraftRocks) standing in the world right now?
+local function craftRockUp()
+	local rocks = workspace:FindFirstChild('Rocks')
+	if type(G.FTCraftRocks) ~= 'table' or not rocks then
+		return false
+	end
+	for _, r in ipairs(rocks:GetDescendants()) do
+		if r:IsA('Model') and G.FTCraftRocks[r.Name] then
+			return true
+		end
+	end
+	return false
+end
+local function dropTarget()
+	local need = G.FTDropNeed
+	if type(need) ~= 'table' then
+		return nil
+	end
+	local d = data()
+	local inv = d and d.Inventory or {}
+	-- (v231: the first short one whose mob is alive right now - with no Spirit Golem up it fought
+	-- any mob at all instead of moving on to the Pale Onis)
+	local living = workspace:FindFirstChild('Living')
+	local first
+	for _, e in ipairs(need) do
+		if type(e) == 'table' and (tonumber(inv[e.ore]) or 0) < (tonumber(e.n) or 0) then
+			first = first or e.mob
+			for _, m in ipairs(living and living:GetChildren() or {}) do
+				if string.sub(m.Name, 1, #e.mob) == e.mob and m:GetAttribute('IsNpc') then
+					local h = m:FindFirstChildOfClass('Humanoid')
+					if h and h.Health > 0 then
+						return e.mob
+					end
+				end
+			end
+		end
+	end
+	if not first then
+		G.FTDropNeed = nil
+	end
+	return first
+end
+
 local function char()
 	local c = LocalPlayer.Character
 	local hrp = c and c:FindFirstChild('HumanoidRootPart')
@@ -255,6 +334,97 @@ track(RunService.Stepped:Connect(function()
 end))
 
 local currentTween
+-- (v223) Island 3's locked Red Cave door ("Heart Door", an invisible barrier 29 x 47 x 54 at
+-- 375,31,83, about 330 studs from the spawn). Measured: every trip that cut through it with
+-- collisions off was sent back to the spawn a second later - 51 times in a row on the way to
+-- Morveth. Its prompt is disabled on this account, so the door is simply not ours to pass.
+-- So: glides go round it, and anything else that drifts into it is put back where it came from.
+local Door = { on = game.PlaceId == 131884594917121 }
+-- (v227) Not just the door: the whole Red Cave behind it is off limits until the door is unlocked
+-- (Raven 2's key). Measured: glides that clipped through the cave at (631,17,-60), (526,50,-41),
+-- (474,59,-35), (628,68,-65) were all sent back to the spawn. The game marks its zones with flat
+-- plates in workspace.Debris.Regions; everything UNDER an "Island3RedCave..." plate is the cave
+-- (the peak caves lie above those plates and are fine). Morveth, Raven 3, Auron and Mjelatkhan
+-- stand inside it.
+function Door.boxes()
+	if not Door.on then
+		return nil
+	end
+	if Door.list and os.clock() - Door.at < 20 then
+		return Door.list
+	end
+	Door.at = os.clock()
+	local d = data()
+	if d and type(d.MiscDialogues) == 'table' and d.MiscDialogues.UnlockedRedCaveDoor then
+		Door.list = {} -- (unlocked: nothing to keep out of)
+		return Door.list
+	end
+	local list = {}
+	local function add(part, top)
+		local p, sz = part.Position, part.Size
+		list[#list + 1] = { p.X - sz.X / 2, p.X + sz.X / 2, p.Z - sz.Z / 2, p.Z + sz.Z / 2, top }
+	end
+	local deb = workspace:FindFirstChild('Debris')
+	local regs = deb and deb:FindFirstChild('Regions')
+	for _, r in ipairs(regs and regs:GetChildren() or {}) do
+		if r:IsA('BasePart') and string.sub(r.Name, 1, 14) == 'Island3RedCave' then
+			add(r, r.Position.Y + 3)
+		end
+	end
+	local a = workspace:FindFirstChild('Assets')
+	local hd = a and a:FindFirstChild('Heart Door')
+	local b = hd and hd:FindFirstChild('Barrier')
+	if b then
+		add(b, b.Position.Y + b.Size.Y / 2 + 5)
+	end
+	Door.list = list
+	return list
+end
+-- is this spot inside the locked cave (grown by m studs sideways)?
+function Door.inPoint(p, m)
+	for _, b in ipairs(Door.boxes() or {}) do
+		if p.X > b[1] - m and p.X < b[2] + m and p.Z > b[3] - m and p.Z < b[4] + m and p.Y < b[5] then
+			return true
+		end
+	end
+	return false
+end
+-- does the straight move a -> b pass through the locked cave? Returns the highest plate crossed.
+function Door.hits(a, b, m)
+	local low = math.min(a.Y, b.Y)
+	local top
+	for _, bx in ipairs(Door.boxes() or {}) do
+		if low < bx[5] then
+			local t0, t1, hit = 0, 1, true
+			for _, v in ipairs({ { b.X - a.X, a.X, bx[1] - m, bx[2] + m }, { b.Z - a.Z, a.Z, bx[3] - m, bx[4] + m } }) do
+				local dd, o, lo, hi = v[1], v[2], v[3], v[4]
+				if math.abs(dd) < 1e-6 then
+					if o <= lo or o >= hi then
+						hit = false
+						break
+					end
+				else
+					local ta, tb = (lo - o) / dd, (hi - o) / dd
+					if ta > tb then
+						ta, tb = tb, ta
+					end
+					t0, t1 = math.max(t0, ta), math.min(t1, tb)
+					if t0 >= t1 then
+						hit = false
+						break
+					end
+				end
+			end
+			if hit then
+				top = math.max(top or -math.huge, bx[5])
+			end
+		end
+	end
+	return top ~= nil, top
+end
+-- (v226: the v223 guard that put the character back at the door is gone - it fired 7,696 times
+-- and pinned the character there. Routes are refused before they start instead.)
+
 local function stopTween()
 	if currentTween then
 		pcall(function()
@@ -960,13 +1130,31 @@ local function walkPathRaw(cf, opts)
 					goal = Vector3.new(goal.X, lavaY + 6, goal.Z) -- lava under this stretch: pass above it
 				end
 				local speed = math.max(10, tonumber(settings.tweenSpeed) or 55)
+				if Door.hits(hrp.Position, goal, 6) then
+					G.FTNavDbg = 'this route goes through the locked Red Cave door - not taken'
+					return false, 'nopath'
+				end
 				noclip = true
+				-- (v226: this loop used to run on after Unload - it never looked at `alive` - and a
+				-- stretch it could never finish kept dragging the character about. Now it stops with
+				-- the script, and gives a stretch up after 4 s without getting closer.)
+				local bestD, bestAt = math.huge, os.clock()
 				while true do
 					local dt = task.wait()
 					local _, h, hm = char()
-					if not h or not hm or hm.Health <= 0 then
+					if not alive or not h or not hm or hm.Health <= 0 then
 						noclip = false
 						return false, 'stuck'
+					end
+					do
+						local dNow = (goal - h.Position).Magnitude
+						if dNow < bestD - 2 then
+							bestD, bestAt = dNow, os.clock()
+						elseif os.clock() - bestAt > 4 then
+							noclip = false
+							G.FTNavDbg = 'glide along the route made no headway for 4 s'
+							return false, 'stuck'
+						end
 					end
 					hrp, hum = h, hm
 					if (opts.abort and opts.abort()) or near() then
@@ -1014,7 +1202,7 @@ local function walkPathRaw(cf, opts)
 			while true do
 				task.wait() -- every frame: at boosted speed 0.1s is several studs
 				local _, h, hm = char()
-				if not h or not hm or hm.Health <= 0 then
+				if not alive or not h or not hm or hm.Health <= 0 then
 					return false, 'stuck'
 				end
 				hrp, hum = h, hm
@@ -1199,6 +1387,10 @@ local function tweenToRaw(cf, opts)
 			end
 		end
 	end
+	if Door.hits(hrp.Position, cf.Position, 6) then
+		G.FTNavDbg = 'straight move would cross the locked Red Cave door - not taken'
+		return false, 'nopath'
+	end
 	stopTween()
 	noclip = true
 	local speed = math.max(10, tonumber(settings.tweenSpeed) or 55)
@@ -1255,6 +1447,18 @@ function Nav.fly(dest, opts, first)
 	end
 	local from = hrp.Position
 	local alt = math.max(from.Y, dest.Y) + 40
+	if Door.inPoint(dest, 0) then
+		G.FTNavDbg = 'that spot is inside the locked Red Cave - not going'
+		return false
+	end
+	do
+		-- (island 3: a glide whose line passes over the locked Red Cave goes above its plates)
+		local lowA, lowB = Vector3.new(from.X, -1e4, from.Z), Vector3.new(dest.X, -1e4, dest.Z)
+		local crosses, top = Door.hits(lowA, lowB, 10)
+		if crosses and alt < top + 15 then
+			alt = top + 15
+		end
+	end
 	local legs = { Vector3.new(from.X, alt, from.Z), Vector3.new(dest.X, alt, dest.Z), dest }
 	local hp0 = hum.Health
 	local speed = math.clamp(tonumber(settings.tweenSpeed) or 55, 30, 70)
@@ -1274,11 +1478,23 @@ function Nav.fly(dest, opts, first)
 	local calledOff = false
 	local okRun, done = pcall(function()
 		for _, goal in ipairs(legs) do
+			-- (v225: a leg that gets no closer for 4 s is given up. Measured on island 3: something
+			-- kept moving us off the end point next to an orc and this loop ran for 8 minutes.)
+			local bestD, bestAt = math.huge, os.clock()
 			while true do
 				local dt = task.wait()
 				local _, h, hm = char()
 				if not alive or not h or not hm or hm.Health <= 0 or hm.Health < hp0 * 0.8 then
 					return false
+				end
+				do
+					local dNow = (goal - h.Position).Magnitude
+					if dNow < bestD - 2 then
+						bestD, bestAt = dNow, os.clock()
+					elseif os.clock() - bestAt > 4 then
+						G.FTFlyStall = (G.FTFlyStall or 0) + 1
+						return false
+					end
 				end
 				if opts and opts.abort and opts.abort() then
 					-- called off in the air: set down on the ground below, not dropped from 40 studs up
@@ -1311,6 +1527,7 @@ function Nav.fly(dest, opts, first)
 	if h2 then
 		h2.AssemblyLinearVelocity = Vector3.zero
 	end
+	G.FTFlyDbg = ('%s fly ended: %s %s (legs %d)'):format(os.date('%H:%M:%S'), tostring(okRun), tostring(done), #legs)
 	return okRun and done == true, calledOff
 end
 
@@ -1456,6 +1673,23 @@ end
 
 local function tweenTo(cf, opts)
 	local trip = { dest = typeof(cf) == 'CFrame' and cf.Position or cf }
+	if workspace:GetAttribute('AbyssRun') == true and not G.FTAbyssBack then
+		-- (v251, seen live: in an Abyss run it set off on a 6,732 stud glide out over the void, 6,000
+		-- studs past its floor. A floor is a few hundred studs across; the game moves us between
+		-- floors itself. No trip longer than that is ever right in there.)
+		local _, hA = char()
+		if hA and (trip.dest - hA.Position).Magnitude > 800 then
+			G.FTNavDbg = ('abyss: refused a %.0f stud trip'):format((trip.dest - hA.Position).Magnitude)
+			G.FTAbyssRefused = (G.FTAbyssRefused or 0) + 1
+			task.wait(0.3)
+			return false
+		end
+	end
+	if Door.inPoint(trip.dest, 0) then
+		G.FTNavDbg = 'that spot is inside the locked Red Cave - not going'
+		G.FTDoorRefused = (G.FTDoorRefused or 0) + 1
+		return false
+	end
 	if not (opts and opts.noHop) then
 		pcall(Nav.unlockNear, opts)
 		-- (v187: waypoint hops are off unless settings.useWaypoints is set by hand. The user wants a
@@ -1475,7 +1709,10 @@ local function tweenTo(cf, opts)
 	local ok, a, b
 	do
 		local _, hf0 = char()
-		if hf0 and (trip.dest - hf0.Position).Magnitude > 300 and not (opts and opts.noFly) then
+		-- (v221, the user on island 3: "going through too many walls seems to backtrack you back to the
+		-- spawn ... just walk through the areas like you did before". Measured there: 340 studs glided,
+		-- 330 snapped back, over and over for 4 minutes. So no first-choice glide on island 3.)
+		if hf0 and ((trip.dest - hf0.Position).Magnitude > 300 or Door.hits(hf0.Position, trip.dest, 8)) and not (opts and opts.noFly) then
 			Nav.flyAt = os.clock()
 			local okF, res, off = pcall(Nav.fly, trip.dest, opts, true)
 			G.FTFlyLast = ('%s first-choice glide: %s %s'):format(os.date('%H:%M:%S'), tostring(okF), tostring(res))
@@ -1586,6 +1823,12 @@ function Nav.cross(hb, label)
 	local okRun, done = pcall(function()
 		for i = 2, #wps do
 			local goal = wps[i].Position + Vector3.new(0, 3.5, 0)
+			do
+				local _, hd = char()
+				if hd and Door.hits(hd.Position, goal, 6) then
+					return false -- (island 3: never through the locked Red Cave door)
+				end
+			end
 			while true do
 				local dt = task.wait()
 				local _, h, hm = char()
@@ -1918,7 +2161,7 @@ local MineHooks = {} -- .clear(pos) is filled in by the mob code: kill mobs arou
 -- Never picked as a fight, and invisible to the mining safety checks: no clearing them first, no
 -- fighting back, no moving off. Their attacks are still dodged like any other mob's if they turn
 -- out to be a real threat.
-local IGNORE_MOBS = { 'spirit golem', 'hellbringer' }
+local IGNORE_MOBS = {} -- (v216, the user: "dont skip no more mobs"; was spirit golem + hellbringer)
 local function mobIgnored(m)
 	local n = string.lower(m.Name)
 	for _, k in ipairs(IGNORE_MOBS) do
@@ -1976,6 +2219,9 @@ do
 		return (string.gsub(m.Name, '%d+$', ''))
 	end
 	function Deadly.is(m)
+		do
+			return false -- (v246: no mob is left alone for having killed us)
+		end
 		return settings.fleeDeadly ~= false and Deadly.names[kind(m)] == true
 	end
 	function Deadly.list()
@@ -2008,6 +2254,9 @@ do
 	-- kept away from like a mob that has killed us - and from 15 studs further out - whether or not
 	-- "Avoid mobs that killed me" is on.
 	function Deadly.big(h)
+		do
+			return false -- (v246)
+		end
 		local _, _, hum = char()
 		if hum == nil or h == nil or h.MaxHealth >= 1e8 then
 			return false
@@ -2142,7 +2391,7 @@ local function rockList()
 					-- Rocks with mobs around them count as much farther away, so clear ones win.
 					local danger = mobsNear(hb.Position, 22)
 					local d = (hb.Position - hrp.Position).Magnitude
-					local want = ((G.FTQuestRock and m.Name == G.FTQuestRock) or (G.FTQuestRocks and G.FTQuestRocks[m.Name])) and -350 or 0 -- quest asks for this rock type (or for an ore only these rocks give)
+					local want = ((G.FTQuestRock and m.Name == G.FTQuestRock) or (G.FTQuestRocks and G.FTQuestRocks[m.Name]) or (G.FTCraftRocks and G.FTCraftRocks[m.Name] and craftWant())) and -350 or 0 -- quest asks for this rock type (or for an ore only these rocks give)
 					local climb = math.abs(hb.Position.Y - hrp.Position.Y)
 					-- someone else is already on this rock: leave it to them (unless we are on it too)
 					local taken = 0
@@ -2224,6 +2473,13 @@ local function rockList()
 		for _, e in ipairs(list) do
 			if e.m.Name == G.FTQuestRock or (G.FTQuestRocks and G.FTQuestRocks[e.m.Name]) then
 				e.score -= 1e6
+			end
+		end
+	end
+	if G.FTCraftRocks and craftWant() then
+		for _, e in ipairs(list) do
+			if G.FTCraftRocks[e.m.Name] then
+				e.score -= 3e6
 			end
 		end
 	end
@@ -2533,6 +2789,27 @@ local function sellNeeded()
 	return total >= 30
 end
 
+-- (v212) ores that give a trait to anything (the game's own ore data), for "keep trait ores"
+local traitOreSet
+local function oreHasTrait(name)
+	if not traitOreSet then
+		local set = {}
+		local okT = pcall(function()
+			for _, o in pairs(require(RS.Shared.Data.Ore)) do
+				if type(o) == 'table' and o.Name and type(o.Traits) == 'table' and next(o.Traits) ~= nil then
+					set[o.Name] = true
+				end
+			end
+		end)
+		if not okT then
+			return true -- (cannot tell: keep it)
+		end
+		traitOreSet = set
+		G.FTTraitOres = set
+	end
+	return traitOreSet[name] == true
+end
+
 local function sellOres()
 	local npc = workspace:FindFirstChild('Proximity') and workspace.Proximity:FindFirstChild('Greedy Cey')
 	if not npc then
@@ -2544,6 +2821,9 @@ local function sellOres()
 	local basket, count = {}, 0
 	for name, n in pairs(ores) do
 		local sell = n - keep
+		if settings.keepTraitOres and oreHasTrait(name) then
+			sell = 0
+		end
 		if sell > 0 then
 			basket[name] = sell
 			count += sell
@@ -2932,7 +3212,7 @@ end
 local turnStart, turnMobs = os.clock(), true
 local function chooseFarm()
 	local mobs = settings.autoMobs or QS.wantMobs
-	local mine = settings.autoMine or QS.wantMine
+	local mine = settings.autoMine or QS.wantMine or craftWant()
 	if questForgeType() then
 		local _, total = oreCounts()
 		if total < 3 then
@@ -2943,7 +3223,7 @@ local function chooseFarm()
 		-- Story quests (one-time) beat repeatable ones like "Rotten Depths".
 		-- The side the quest does not need but the user ticked themselves still gets its turn
 		-- (measured on island 3: a spider-kill quest plus Auto mine = 5 minutes without one rock).
-		local userOther = (QS.wantMobs and not QS.wantMine and settings.autoMine)
+		local userOther = (QS.wantMobs and not QS.wantMine and (settings.autoMine or craftWant()))
 			or (QS.wantMine and not QS.wantMobs and settings.autoMobs)
 		if not userOther then
 			if QS.storyMine ~= QS.storyMobs then
@@ -3461,8 +3741,20 @@ local function forgeOnce()
 		setStatus('forge not found')
 		return false
 	end
-	local itemType = forgeTypeNow()
-	local ores, got = pickForgeOres(itemType)
+	-- (v234) a recipe the user asked for by hand: G.FTForgeRecipe = { type = 'Weapon', ores = { ore = n } }.
+	-- Forged once, exactly as given, with no mold.
+	local rec = type(G.FTForgeRecipe) == 'table' and type(G.FTForgeRecipe.ores) == 'table' and G.FTForgeRecipe or nil
+	G.FTForgeRecipe = nil
+	local itemType = rec and rec.type or forgeTypeNow()
+	local ores, got
+	if rec then
+		ores, got = rec.ores, 0
+		for _, n in pairs(ores) do
+			got += n
+		end
+	else
+		ores, got = pickForgeOres(itemType)
+	end
 	if got < 3 then
 		return false
 	end
@@ -3519,7 +3811,7 @@ local function forgeOnce()
 		for _, n in pairs(ores) do
 			total += n
 		end
-		if moldName and total >= moldMin then
+		if moldName and total >= moldMin and not rec then
 			F.MoldItem, F.MoldCount = moldName, moldCount
 			G.FTLastMold = ('%s with %d molds'):format(moldName, moldCount)
 		else
@@ -3665,6 +3957,9 @@ function Threat.period(m)
 	return math.clamp(gap + ((G.FTAtkDur or {})[k] or 1), 1, 6)
 end
 function Threat.keyIs(key)
+	if combatStyle() == 'Attack only' then
+		return false
+	end
 	if settings.dodgeWhat == 'Everything' or Threat.pressure then
 		return true
 	end
@@ -3679,6 +3974,9 @@ function Threat.recIs(rec, m)
 	return rec.hit >= 0.25 or rec.hit / Threat.period(m) > Threat.heal + 0.02 -- (a clear net drain: 2%/s more than we heal back)
 end
 function Threat.is(m)
+	if combatStyle() == 'Attack only' then
+		return false
+	end
 	if settings.dodgeWhat == 'Everything' or Threat.pressure then
 		return true
 	end
@@ -4001,6 +4299,9 @@ end
 -- hits to bring it down. Left alone unless it is the only thing to fight (a tower wave's boss) or
 -- it is picked by name as the Target.
 local function mobTooBig(h)
+	do
+		return false -- (v246, the user: remove everything that makes the bot leave a mob alone - "the health pool, strong mob, etc")
+	end
 	local _, _, hum = char()
 	if hum == nil then
 		return false
@@ -4026,6 +4327,9 @@ G.FTMobNoRoute = mobNoRoute
 -- quest is the user saying to fight them (measured: focus on a Monk Panda 10,000 HP / Samurai Ape
 -- 7,100-9,200 HP quest with the slider on 7,018 = standing idle, nothing allowed).
 local function mobCap(m)
+	do
+		return 0 -- (v246: the max mob health slider no longer excludes anything)
+	end
 	local cap = tonumber(settings.maxMobHp) or 0
 	if cap > 0 and settings.focusQuest ~= 'Auto' and G.FTQuestLock == settings.focusQuest
 		and type(QS.mobTarget) == 'string' and QS.mobTarget ~= 'Any' and mobMatches(baseName(m.Name), QS.mobTarget) then
@@ -4048,7 +4352,7 @@ local function mobList()
 	end
 	-- A saved "Target" that doesn't live on this island (e.g. Zombie after moving to island 2)
 	-- used to leave it idle forever: fall back to any mob.
-	local filter = QS.mobTarget or settings.mobFilter
+	local filter = dropTarget() or QS.mobTarget or settings.mobFilter
 	if filter ~= 'Any' then
 		local exists = false
 		for _, m in ipairs(living:GetChildren()) do
@@ -4075,10 +4379,24 @@ local function mobList()
 				and not Deadly.is(m) -- never pick a fight with a mob that has killed us (quests included)
 				and not string.find(m.Name, 'Bomber', 1, true) -- (they explode in melee range)
 				and not Lava.at(r.Position) -- (standing in lava: we would have to stand in it too)
+				and (G.FTAbyssAll or workspace:GetAttribute('AbyssRun') ~= true or (r.Position - hrp.Position).Magnitude <= 800) -- (v251: only this floor's mobs)
 			then
 				list[#list + 1] = { m = m, h = h, r = r, d = (r.Position - hrp.Position).Magnitude, big = mobTooBig(h) }
 			end
 		end
+	end
+	-- (v240) waiting where the quest's mob lives (G.FTCampStay): only mobs of that area count -
+	-- within 260 studs sideways and on the same level (v239 measured the straight distance, and
+	-- the bot flew up to the Frostburn Onis one floor above the spirit area).
+	if G.FTCamp and type(G.FTCampStay) == 'table' and G.FTCampStay[tostring(G.FTCampFor)] then
+		local camp, kept = G.FTCamp, {}
+		for _, e in ipairs(list) do
+			local dv = e.r.Position - camp
+			if math.abs(dv.Y) <= 45 and Vector3.new(dv.X, 0, dv.Z).Magnitude <= 260 then
+				kept[#kept + 1] = e
+			end
+		end
+		list = kept
 	end
 	if filter == 'Any' then
 		-- (and nothing standing within 45 studs of one, while there is anything else to fight:
@@ -4104,6 +4422,30 @@ local function mobList()
 		elseif #small > 0 then
 			list = small
 		end
+	end
+	-- (v259, asked for: "when its like this, mobs all over, single out the further enemies that are
+	-- by themselves and kill those first".) With 6 or more mobs about, the ones with no other mob
+	-- within 16 studs come first (nearest of those first), then the rest by distance.
+	if #list >= 6 then
+		for _, a in ipairs(list) do
+			local nb = 0
+			for _, b in ipairs(list) do
+				if b ~= a and (b.r.Position - a.r.Position).Magnitude <= 16 then
+					nb += 1
+				end
+			end
+			a.alone = nb == 0
+		end
+		table.sort(list, function(a, b)
+			if a.alone ~= b.alone then
+				return a.alone
+			end
+			return a.d < b.d
+		end)
+		if list[1] and list[1].alone then
+			G.FTAlonePicks = (G.FTAlonePicks or 0) + 1
+		end
+		return list
 	end
 	table.sort(list, function(a, b)
 		return a.d < b.d
@@ -4320,6 +4662,86 @@ do
 	local shineDelay = G.FTShineDelay
 	G.FTParryStats = { shines = 0, early = 0, onShine = 0, parry = 0, blockHit = 0, presses = 0, by = {} }
 	local PStats = G.FTParryStats
+	-- (v257, asked for: "a system that learns".) Traced in the Abyss: every parry came 0.34-0.36 s
+	-- after the mob's shine - the one timing the press assumed - while the hits that got through came
+	-- 0.05-0.3 s or 0.5-0.9 s after it (Monk Panda 0.87, Savage Ape 0.65, Crystal Centipede 0.76).
+	-- Those were never learned: only a parry taught the timing, so a mob that never got parried
+	-- stayed wrong forever. Now every parry AND every hit taken with exactly one shine waiting (so
+	-- we know whose it was) is a sample of that mob's shine-to-hit time, kept per mob kind and
+	-- attack animation, saved to a file so it carries over runs and sessions. At a shine, the times
+	-- that mob has actually hit at are each given their own press.
+	local LEARN_PATH = 'PlayerTools/forgetools_parrylearn.json'
+	if type(G.FTGapLearn) ~= 'table' then
+		G.FTGapLearn = {}
+		pcall(function()
+			if isfile(LEARN_PATH) then
+				local t = HttpService:JSONDecode(readfile(LEARN_PATH))
+				if type(t) == 'table' then
+					G.FTGapLearn = t
+				end
+			end
+		end)
+	end
+	local Learn = { dirty = false }
+	Block.Learn = Learn
+	function Learn.add(kind, id, age, how)
+		if type(kind) ~= 'string' or type(age) ~= 'number' or age < 0.03 or age > 1 then
+			return
+		end
+		for _, key in ipairs({ kind .. '|' .. tostring(id or ''), kind }) do
+			local list = G.FTGapLearn[key]
+			if type(list) ~= 'table' then
+				list = {}
+				G.FTGapLearn[key] = list
+			end
+			list[#list + 1] = math.floor(age * 100 + 0.5) / 100
+			while #list > 40 do
+				table.remove(list, 1)
+			end
+		end
+		Learn.dirty = true
+		PStats.learned = (PStats.learned or 0) + 1
+		if how == 'hit' then
+			PStats.learnedHit = (PStats.learnedHit or 0) + 1
+		end
+	end
+	-- The times (seconds after the shine) this mob's hits have landed at: samples within 0.12 s of
+	-- each other are one timing; a timing counts once it has 3 samples and a fifth of all of them.
+	function Learn.modes(kind, id)
+		local list = G.FTGapLearn[kind .. '|' .. tostring(id or '')]
+		if type(list) ~= 'table' or #list < 4 then
+			list = G.FTGapLearn[kind]
+		end
+		if type(list) ~= 'table' or #list < 4 then
+			return nil
+		end
+		local sorted = table.clone(list)
+		table.sort(sorted)
+		local out, i = {}, 1
+		while i <= #sorted do
+			local j = i
+			while j < #sorted and sorted[j + 1] - sorted[j] < 0.12 and sorted[j + 1] - sorted[i] < 0.2 do
+				j += 1
+			end
+			local cnt = j - i + 1
+			if cnt >= 3 and cnt >= #sorted / 5 then
+				out[#out + 1] = sorted[i + math.floor(cnt / 2)]
+			end
+			i = j + 1
+		end
+		return #out > 0 and out or nil
+	end
+	task.spawn(function()
+		while alive and G.FTBlockConns == blockConns do
+			task.wait(30)
+			if Learn.dirty then
+				Learn.dirty = false
+				pcall(function()
+					writefile(LEARN_PATH, HttpService:JSONEncode(G.FTGapLearn))
+				end)
+			end
+		end
+	end)
 
 	-- A hit / parry just happened: credit it to the most recent wind-up 0.2-1.6 s ago.
 	local function learn()
@@ -4356,6 +4778,11 @@ do
 				for i, cue in ipairs(Block.cues) do
 					local g = os.clock() - cue.t
 					if g > 0.15 and g < 0.7 then
+						G.FTHitGapLog = G.FTHitGapLog or {}
+						if #G.FTHitGapLog < 800 then
+							table.insert(G.FTHitGapLog, { ev = x.Name, k = cue.k, id = cue.id, age = g, g = cue.g, live = #Block.cues, press = os.clock() - (Block.pressedAt or 0) })
+						end
+						Learn.add(cue.k, cue.id, g, 'parry')
 						if cue.id then
 							local rec = G.FTShineGap2[cue.id]
 							if rec then
@@ -4391,6 +4818,44 @@ do
 			local last = hum.Health
 			hpConn = hum.HealthChanged:Connect(function(h)
 				if h < last - 0.5 then
+					-- (v256 trace: which shines were waiting when a hit got through, and how old)
+					G.FTHitGapLog = G.FTHitGapLog or {}
+					if #G.FTHitGapLog > 800 then
+						table.clear(G.FTHitGapLog)
+					end
+					do
+						local nowH, live = os.clock(), 0
+						for _, cue in ipairs(Block.cues) do
+							if nowH - cue.t < 1 then
+								live += 1
+							end
+						end
+						for _, cue in ipairs(Block.cues) do
+							if nowH - cue.t < 1 then
+								table.insert(G.FTHitGapLog, { ev = 'hit', k = cue.k, id = cue.id, age = nowH - cue.t, g = cue.g, live = live, dmg = last - h,
+									press = nowH - (Block.pressedAt or 0) })
+							end
+						end
+						if live == 1 then
+							for _, cue in ipairs(Block.cues) do
+								if nowH - cue.t < 1 and not cue.learned then
+									cue.learned = true
+									Learn.add(cue.k, cue.id, nowH - cue.t, 'hit')
+								end
+							end
+						end
+						if live == 0 then
+							local nearK = {}
+							pcall(function()
+								local _, hN = char()
+								local _, lst = mobsNear(hN.Position, 60)
+								for _, e in ipairs(lst) do
+									nearK[#nearK + 1] = ('%s %.0f'):format(baseName(e.m.Name), (e.r.Position - hN.Position).Magnitude)
+								end
+							end)
+							table.insert(G.FTHitGapLog, { ev = 'hit', k = 'NO SHINE', age = -1, live = 0, dmg = last - h, press = nowH - (Block.pressedAt or 0), near = table.concat(nearK, ', ') })
+						end
+					end
 					learn()
 				end
 				last = h
@@ -4461,7 +4926,7 @@ do
 		local entry = { id = id, t = t0, m = m, r = r, hitAt = hitAt }
 		pending[#pending + 1] = entry
 		-- Block / parry style only (hit & run dodges instead).
-		if settings.combatStyle ~= 'Block / parry' or not settings.autoBlock or not c:FindFirstChild('Weapon') then
+		if combatStyle() ~= 'Block / parry' or not settings.autoBlock or not c:FindFirstChild('Weapon') then
 			return
 		end
 		if (r.Position - hrp.Position).Magnitude > 16 then
@@ -4584,9 +5049,31 @@ do
 		end
 		local c, hrp = char()
 		local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
-		if settings.combatStyle ~= 'Block / parry' or not settings.autoBlock or not (c and hrp and r and c:FindFirstChild('Weapon'))
-			or (r.Position - hrp.Position).Magnitude > 16 then
+		if combatStyle() ~= 'Block / parry' or not settings.autoBlock or not (c and hrp and r and c:FindFirstChild('Weapon')) then
 			return
+		end
+		-- (v260, asked for: the Spirit Golem's ranged attack. Traced: the golem shines before it fires
+		-- from 66 studs, and every shine from further than 16 studs used to be ignored. A far shine is
+		-- now remembered under "<mob> @far"; when a hit follows it with no other shine waiting, that
+		-- time is learned like any other - and once that mob's far timing is known (3 samples), its far
+		-- shines get a parry press too.)
+		local farK
+		local dS = (r.Position - hrp.Position).Magnitude
+		if dS > 16 then
+			if dS > 130 then
+				return
+			end
+			farK = baseName(m.Name) .. (dS > 40 and ' @long' or ' @far')
+			PStats.farShines = (PStats.farShines or 0) + 1
+			if not Learn.modes(farK, nil) then
+				Block.cues[#Block.cues + 1] = { t = now, k = farK, g = 0 }
+				while Block.cues[1] and now - Block.cues[1].t > 1.5 do
+					table.remove(Block.cues, 1)
+				end
+				return
+			end
+			PStats.farPress = (PStats.farPress or 0) + 1
+			best = nil
 		end
 		PStats.onShine += 1
 		-- (v194. Measured on our own character: after a press the game's "Parrying" state lasts
@@ -4616,13 +5103,75 @@ do
 			local kind = baseName(m.Name)
 			Block.gmin[kind] = math.min(Block.gmin[kind] or 0.34, g)
 		end
-		Block.cues[#Block.cues + 1] = { t = now, id = best and best.id or nil }
+		local extraG = {}
+		do
+			local modes = Learn.modes(farK or baseName(m.Name), best and best.id or nil)
+			if modes then
+				local first
+				for _, mg in ipairs(modes) do
+					if mg >= 0.12 then
+						if not first then
+							first = mg
+						elseif mg - first >= 0.3 then
+							extraG[#extraG + 1] = mg -- (a second timing far enough behind the first for its own press)
+						end
+					end
+				end
+				if first then
+					g = first
+					PStats.usedLearn = (PStats.usedLearn or 0) + 1
+				end
+			end
+		end
+		Block.cues[#Block.cues + 1] = { t = now, id = best and best.id or nil, k = farK or baseName(m.Name), g = g }
+		-- (v211, traced on Asura: 14 of 19 hits taken were the SECOND hit of a combo, 0.6-0.75 s after
+		-- the first shine. Our swing went out right after the first parry and was past its cancel window
+		-- when the second shine came. So which shine of which animation is followed by another one, and
+		-- how long after, is learned here; Block.soon holds the sword around the expected one.)
+		pcall(function()
+			local mh = m:FindFirstChildOfClass('Humanoid')
+			local an = mh and mh:FindFirstChildOfClass('Animator')
+			local tr0
+			for _, tr in ipairs(an and an:GetPlayingAnimationTracks() or {}) do
+				if not tr.Looped and tr.Animation and (not tr0 or tr.TimePosition < tr0.TimePosition) then
+					tr0 = tr
+				end
+			end
+			if not tr0 then
+				return
+			end
+			local aid = tr0.Animation.AnimationId
+			local key = aid .. '@' .. math.floor(tr0.TimePosition / 0.3 + 0.5)
+			G.FTComboNext = G.FTComboNext or {}
+			local CN = G.FTComboNext
+			Block.lastKey = Block.lastKey or setmetatable({}, { __mode = 'k' })
+			local prev = Block.lastKey[m]
+			if prev and prev.aid == aid and prev.key ~= key and now - prev.t > 0.15 and now - prev.t < 1.7 then
+				local rec = CN[prev.key]
+				if rec then
+					rec.gap = rec.n == 0 and (now - prev.t) or (rec.gap * 0.7 + (now - prev.t) * 0.3)
+					rec.n += 1
+				end
+			end
+			local rec = CN[key]
+			if not rec then
+				rec = { gap = 0, n = 0, seen = 0 }
+				CN[key] = rec
+			end
+			rec.seen += 1
+			Block.lastKey[m] = { aid = aid, key = key, t = now }
+			Block.expect = (rec.n >= 1 and rec.n / rec.seen >= 0.4) and (now + rec.gap) or nil
+		end)
 		while Block.cues[1] and now - Block.cues[1].t > 1 do
 			table.remove(Block.cues, 1)
 		end
 		table.insert(Block.hits, now + g)
 		Block.hitMob = Block.hitMob or {}
 		Block.hitMob[now + g] = r
+		for _, mg in ipairs(extraG) do
+			table.insert(Block.hits, now + mg)
+			Block.hitMob[now + mg] = r
+		end
 		table.sort(Block.hits)
 		if Block.running then
 			return
@@ -4638,7 +5187,7 @@ do
 				while alive and Block.hits[1] do
 					local ch = LocalPlayer.Character
 					local st = ch and ch:FindFirstChild('Status')
-					if not (tc and st and ch:FindFirstChild('Weapon')) or settings.combatStyle ~= 'Block / parry' or not settings.autoBlock then
+					if not (tc and st and ch:FindFirstChild('Weapon')) or combatStyle() ~= 'Block / parry' or not settings.autoBlock then
 						break
 					end
 					local t = os.clock()
@@ -4674,8 +5223,17 @@ do
 					local cov0 = lastPress > 0 and H <= lastPress + 0.29 and (parrying or t - lastPress < 0.12)
 					-- (v203: 5 of 23 steps at 0.16 s still took the hit. A swing pressed so late that it cannot be
 					-- over in time - it shows for at least 0.61 s after the press - is stepped out of at 0.26 s.)
+					-- (v264, traced on floor 61-65: 5 of 6 stuns began with a hit landing 0.03-0.10 s after our
+					-- own guard went DOWN - it was dropped to raise a fresh parry for that hit, but a guard that
+					-- came up under 0.4 s ago cannot be re-raised in time. So in that case the guard we have
+					-- stays up through the hit: a plain block instead of an open hit.)
+					local holdThrough = G.FTHoldThrough ~= false and blockUp and not attacking and blkUpAt + 0.40 > H
+					if holdThrough and Block.heldFor ~= H then
+						Block.heldFor = H
+						PStats.heldThrough = (PStats.heldThrough or 0) + 1
+					end
 					local lead = 0.16 -- (v204: stepping at 0.26 s was worse, 14 of 36 still hit against 5 of 23 - the mob still turns and lunges that early)
-					if t >= H - lead and t < H - 0.02 and steppedFor ~= H and Block.dodge and not cov0
+					if t >= H - lead and t < H - 0.02 and steppedFor ~= H and Block.dodge and not cov0 and not holdThrough
 						and (attacking or st:FindFirstChild('Stun') ~= nil or blkUpAt + 0.34 > H - 0.20 or t - atkSeen < 0.03) then
 						steppedFor = H
 						local src = Block.hitMob and Block.hitMob[H]
@@ -4702,7 +5260,9 @@ do
 					-- 0.32 s after the swing was sent, 0 of 3 from 0.39 s on, where the block stays refused until
 					-- the swing is over. So a swing that is still young is cut a little early, while it still can be.)
 					local locked = attacking and t - (Block.swingAt or 0) >= 0.30
-					if not covered and tc.isBlocking and t >= H - 0.42 and not attacking then
+					if holdThrough then
+						-- (guard stays up)
+					elseif not covered and tc.isBlocking and t >= H - 0.42 and not attacking then
 						pcall(tc.StopBlock, tc) -- (let go of the old / refused block; pressed again once it is down)
 						if lastPress > 0 and not confirmed then
 							PStats.refused = (PStats.refused or 0) + 1
@@ -4822,6 +5382,13 @@ do
 			if (H1 ~= nil and H1 - now < 0.82 and H1 - now > -0.1) or (d ~= nil and d - now < 0.47 and d - now > -0.1) then
 				return true
 			end
+			-- (v211: a follow-up shine is expected at P. A swing sent now must either be over before the
+			-- press for it (~0.62 s) or still be cancellable then (sent no more than 0.2 s before P).)
+			local P = Block.expect
+			if P ~= nil and now > P - 0.62 and now < P - 0.20 then
+				PStats.heldCombo = (PStats.heldCombo or 0) + 1
+				return true
+			end
 			return false
 		end
 		if Block.running == true or (d ~= nil and d - now < 0.75 and d - now > -0.1) then
@@ -4831,7 +5398,7 @@ do
 		-- STARTING its attack, after it had been quiet for 2-7 s: we step up to it, it attacks the moment
 		-- we are in reach, and we swing the same moment. So next to a mob that has not attacked lately
 		-- the first swing waits 0.4 s: if it winds up, the wind-up rule above holds the sword.)
-		if settings.combatStyle == 'Block / parry' and settings.autoBlock then
+		if combatStyle() == 'Block / parry' and settings.autoBlock then
 			local _, hrp0 = char()
 			local living = workspace:FindFirstChild('Living')
 			if hrp0 and living then
@@ -4999,6 +5566,9 @@ end
 -- back 8 studs does nothing against that: callers ask for enough to end up ~30 studs from the mob.
 -- In a tight cave the long step may not fit, so shorter ones are tried after it.
 local function dodgeFrom(fromPos, distOverride)
+	if combatStyle() == 'Attack only' then
+		return false -- (v236, asked for: no dodging, no blocking, just stand in reach and swing)
+	end
 	if dodgeOnce(fromPos, distOverride) then
 		return true
 	end
@@ -5008,6 +5578,108 @@ local function dodgeFrom(fromPos, distOverride)
 	return false
 end
 Block.dodge = dodgeFrom
+-- (v218, asked for after two raids lost to crowds: "when low health, step out ... always staying
+-- far from enemies".) Below "Back off below % health" the fight stops and we keep our distance from
+-- every mob - one step away at a time, no faster than the normal glide - until health is back at
+-- "heal to". Parries of anything that still reaches us keep running on their own.
+local function kiteLow()
+	local _, _, hum = char()
+	local k = tonumber(settings.kiteHp) or 0
+	return k > 0 and hum ~= nil and hum.MaxHealth > 0 and hum.Health > 0 and hum.Health / hum.MaxHealth * 100 < k
+end
+local function kiteHeal()
+	local t0, lastHop, hops = os.clock(), 0, 0
+	local _, _, hum0 = char()
+	local from = hum0 and hum0.MaxHealth > 0 and hum0.Health / hum0.MaxHealth * 100 or 0
+	local goal = math.clamp(tonumber(settings.healTo) or 60, math.min((tonumber(settings.kiteHp) or 40) + 25, 95), 100)
+	while alive and os.clock() - t0 < 45 do
+		local _, hrp, hum = char()
+		if not hrp or not hum or hum.Health <= 0 then
+			break
+		end
+		local pct = hum.Health / hum.MaxHealth * 100
+		if pct >= goal then
+			break
+		end
+		local sum, wsum, n, nearD = Vector3.zero, 0, 0, nil
+		local living = workspace:FindFirstChild('Living')
+		for _, m in ipairs(living and living:GetChildren() or {}) do
+			if m:GetAttribute('IsNpc') then
+				local h = m:FindFirstChildOfClass('Humanoid')
+				local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+				if h and r and h.Health > 0 and h.MaxHealth < 1e8 then
+					local d = (r.Position - hrp.Position).Magnitude
+					if d < 50 then
+						local wt = 1 / math.max(d, 4)
+						sum += r.Position * wt
+						wsum += wt
+						n += 1
+						if not nearD or d < nearD then
+							nearD = d
+						end
+					end
+				end
+			end
+		end
+		setStatus(('low health (%d%%) — keeping away from %d mobs until %d%%'):format(pct, n, goal))
+		-- (v258, asked for: "low health dodge need to be improved". It stepped 24 studs once a mob was
+		-- within 34, at most every 0.6 s, and looked at nothing else. Now: a mob winding up within 26
+		-- studs, or a shot coming, is stepped away from at once; and the ordinary step is 30 studs,
+		-- from 42 studs out, every 0.4 s.)
+		local wK = attackThreat(26) or Attack.rangedThreat(30)
+		if wK and os.clock() - lastHop >= 0.2 then
+			lastHop = os.clock()
+			if dodgeFrom(wK, 30) then
+				hops += 1
+				G.FTKiteFast = (G.FTKiteFast or 0) + 1
+			end
+		elseif nearD and nearD < 42 and os.clock() - lastHop >= 0.4 then
+			lastHop = os.clock()
+			if dodgeFrom(sum / wsum, 30) then
+				hops += 1
+			end
+		end
+		task.wait(0.05)
+	end
+	local _, _, hum1 = char()
+	G.FTKite = G.FTKite or { n = 0, hops = 0, died = 0 }
+	G.FTKite.n += 1
+	G.FTKite.hops += hops
+	if not hum1 or hum1.Health <= 0 then
+		G.FTKite.died += 1
+	end
+	statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('backed off at %d%% health: %d steps in %.0fs, now %d%%'):format(from, hops, os.clock() - t0, hum1 and hum1.MaxHealth > 0 and hum1.Health / hum1.MaxHealth * 100 or 0)
+end
+-- (v262, asked for: "purely random whether I survive ... we need to do better". Traced on floor 65:
+-- a hit taken builds up to a 2 s "Stun" (a value in the character's Status folder). Stunned, no
+-- parry goes up, and the crowd's next hits land in full - 661 and 1,165 within 0.5 s of one stun,
+-- each adding a 3 s burn on top. So the moment a stun lands we leave the crowd: one 30 stud step
+-- away from the mobs around us, again every 0.3 s for as long as the stun lasts and a mob is close.)
+task.spawn(function()
+	local lastHop = 0
+	while alive do
+		task.wait(0.04)
+		local c, hrp, hum = char()
+		local st = c and c:FindFirstChild('Status')
+		if st and hrp and hum and hum.Health > 0 and st:FindFirstChild('Stun') and combatStyle() ~= 'Attack only'
+			and os.clock() - lastHop >= 0.3 then
+			local _, near = mobsNear(hrp.Position, 20)
+			if near and #near > 0 then
+				local sum = Vector3.zero
+				for _, e in ipairs(near) do
+					sum += e.r.Position
+				end
+				lastHop = os.clock()
+				if dodgeFrom(sum / #near, 30) then
+					G.FTStunEscapes = (G.FTStunEscapes or 0) + 1
+					setStatus(('stunned — stepped away from %d mobs'):format(#near))
+				else
+					G.FTStunStuck = (G.FTStunStuck or 0) + 1
+				end
+			end
+		end
+	end
+end)
 -- how far to step to end up clear of a mob at `pos` that is winding up
 local function clearDist(pos)
 	local _, hrp = char()
@@ -5029,6 +5701,81 @@ pcall(function()
 	G.FTHazardConn = workspace:WaitForChild('Debris', 10).ChildAdded:Connect(function(x)
 		if x:IsA('BasePart') or x:IsA('Model') then
 			Hazard.seen[x] = { t = os.clock() }
+		end
+		if x.Name == 'ChargeIndicator' and x:IsA('BasePart') then
+			-- (v261, asked for: the beam. Traced: a flat strip "ChargeIndicator", 7 studs wide and 30-70
+			-- long, is drawn on the floor and the beam fires down it about 0.3 s later - nothing flies, so
+			-- the projectile dodge never saw it. While the strip is there we do not stand in it: one step
+			-- sideways across it, checked every 0.04 s for as long as it lasts.)
+			task.spawn(function()
+				local tC = os.clock()
+				G.FTBeamSeen = (G.FTBeamSeen or 0) + 1
+				while alive and x.Parent and os.clock() - tC < 1.2 do
+					local _, hV, humV = char()
+					if not hV or not humV or humV.Health <= 0 or combatStyle() == 'Attack only' then
+						break
+					end
+					local okL, loc = pcall(function()
+						return x.CFrame:PointToObjectSpace(hV.Position)
+					end)
+					if not okL then
+						break
+					end
+					local sz = x.Size
+					local longX = sz.X >= sz.Z
+					local along = longX and loc.X or loc.Z
+					local across = longX and loc.Z or loc.X
+					local halfL, halfW = math.max(sz.X, sz.Z) / 2, math.min(sz.X, sz.Z) / 2
+					if math.abs(along) < halfL + 6 and math.abs(across) < halfW + 4 and math.abs(loc.Y) < 25 then
+						local perp = (longX and x.CFrame.LookVector or x.CFrame.RightVector) * Vector3.new(1, 0, 1)
+						if perp.Magnitude > 0.1 then
+							perp = perp.Unit
+							-- the shorter way out first
+							local side = (hV.Position - x.Position):Dot(perp) >= 0 and 1 or -1
+							if Hazard.sidestep(hV, perp * side) then
+								Hazard.last = os.clock()
+								G.FTBeamSteps = (G.FTBeamSteps or 0) + 1
+								setStatus('stepped out of a beam line')
+							else
+								G.FTBeamStuck = (G.FTBeamStuck or 0) + 1
+							end
+						end
+					end
+					task.wait(0.04)
+				end
+			end)
+		end
+		if x.Name == 'bulletCharge' and os.clock() - (Hazard.volleyAt or 0) > 1.5 then
+			-- (v259, traced on a Spirit Golem: its ranged attack is one shine, then 13 shards 0.13 s
+			-- apart over 1.7 s. A block comes back up every ~0.4 s at best, so a parry stops 4 of the 13.
+			-- Instead: keep moving across its line of fire for as long as it shoots.)
+			Hazard.volleyAt = os.clock()
+			task.spawn(function()
+				local okP, src = pcall(function()
+					return x:IsA('Model') and x:GetPivot().Position or x.Position
+				end)
+				if not okP or combatStyle() == 'Attack only' then
+					return
+				end
+				local tV = os.clock()
+				while alive and os.clock() - tV < 1.9 do
+					local _, hV, humV = char()
+					if not hV or not humV or humV.Health <= 0 then
+						break
+					end
+					local rel = (hV.Position - src) * Vector3.new(1, 0, 1)
+					if rel.Magnitude > 160 or rel.Magnitude < 1 then
+						break
+					end
+					local perp = rel.Unit:Cross(Vector3.yAxis)
+					if Hazard.sidestep(hV, perp) then
+						Hazard.last = os.clock()
+						G.FTVolleySteps = (G.FTVolleySteps or 0) + 1
+						setStatus('moving across a Spirit Golem volley')
+					end
+					task.wait(0.3)
+				end
+			end)
 		end
 	end)
 end)
@@ -5135,9 +5882,10 @@ function Hazard.step()
 					local flat = (me - cf.Position) * Vector3.new(1, 0, 1)
 					if flat.Magnitude < rad + 2 and math.abs(me.Y - cf.Position.Y) < 20 then
 						Hazard.last = now
-						if not Threat.keyIs('attack marker') then
-							Threat.hazAt = { key = 'attack marker', t = now } -- (stood in it: what it costs gets measured)
-						elseif dodgeFrom(cf.Position, math.max(10, rad + 6 - flat.Magnitude)) then
+						-- (v258, asked for: "watching out for projectiles". These used to be stood in / taken once
+						-- to measure what they cost before any was dodged - and that memory is lost on every
+						-- teleport. On floor 60+ one costs 400-700 health. Now always dodged.)
+						if dodgeFrom(cf.Position, math.max(10, rad + 6 - flat.Magnitude)) then
 							Hazard.n.ground += 1
 							setStatus('stepping out of an attack marker')
 						end
@@ -5169,9 +5917,7 @@ function Hazard.step()
 							end
 							Hazard.last = now
 							e.done = true
-							if not Threat.keyIs('shot ' .. x.Name) then
-								Threat.hazAt = { key = 'shot ' .. x.Name, t = now }
-							elseif Hazard.sidestep(hrp, perp) then
+							if combatStyle() ~= 'Attack only' and Hazard.sidestep(hrp, perp) then
 								Hazard.n.proj += 1
 								setStatus(('dodged a projectile (%s)'):format(x.Name))
 							end
@@ -5205,9 +5951,7 @@ function Hazard.step()
 							end
 							Hazard.last = now
 							e.done = true
-							if not Threat.keyIs('shot ' .. x.Name) then
-								Threat.hazAt = { key = 'shot ' .. x.Name, t = now }
-							elseif Hazard.sidestep(hrp, perp) then
+							if combatStyle() ~= 'Attack only' and Hazard.sidestep(hrp, perp) then
 								Hazard.n.proj += 1
 								setStatus(('dodged a projectile (%s)'):format(x.Name))
 							end
@@ -5333,7 +6077,10 @@ local function fightOnce(forced)
 		setStatus('no weapon — forge one first')
 		return false
 	end
-	if lowHp() then
+	if kiteLow() then
+		kiteHeal()
+		return true
+	elseif lowHp() then
 		retreatAndHeal()
 		return true
 	end
@@ -5350,7 +6097,25 @@ local function fightOnce(forced)
 	-- (0.25s for a dagger, 1.4s for a great axe), while a mob's hit lands ~0.6s after it winds up.
 	-- So: start swings whenever the cooldown allows (even while standing clear), and be on the mob,
 	-- facing it, just for the moment the hitbox is out. Never stand next to a mob mid wind-up.
-	local hitRun = settings.combatStyle == 'Hit & run'
+	local function crowdCheck()
+		if os.clock() < (G.FTCrowdAt or 0) then
+			return G.FTCrowdMode == true
+		end
+		G.FTCrowdAt = os.clock() + 0.5
+		local _, hC = char()
+		local nC = hC and mobsNear(hC.Position, 16) or 0
+		-- (on at 5, off again only at 2 or fewer: no flipping back and forth at the edge)
+		if false and nC >= 5 and not G.FTCrowdMode then -- (v253: crowd mode OFF. Measured: Hit & run 46 hits / 20,229 hp in 37 s, parry 35 hits / 13,556 hp in 71 s, and a death. The user: revert.)
+			G.FTCrowdMode = true
+			G.FTCrowdFlips = (G.FTCrowdFlips or 0) + 1
+		elseif nC <= 2 and G.FTCrowdMode then
+			G.FTCrowdMode = nil
+		end
+		return G.FTCrowdMode == true
+	end
+	local crowd0 = crowdCheck()
+	local hitRun = combatStyle() == 'Hit & run'
+	local atkOnly = combatStyle() == 'Attack only' -- (v237: no swing is ever held back for a block)
 	local swingIdx, lastSwingAt, nextSwingAt, sentAt, ownAnimAt, animWorks = 0, 0, 0, nil, 0, false
 	local strikeAt, strikeEnd = nil, 0 -- when our hitbox comes out / is gone again
 	local STRIKE_LEAD = 0.12 -- be in place this long before the hitbox (position has to reach the server)
@@ -5587,7 +6352,7 @@ local function fightOnce(forced)
 		if strikeAt and now > strikeEnd then
 			strikeAt = nil
 		end
-		if strikeAt or now < nextSwingAt or Block.active() or Block.soon() or not target.r.Parent then
+		if strikeAt or now < nextSwingAt or (not atkOnly and (Block.active() or Block.soon())) or not target.r.Parent then
 			return
 		end
 		local _, h = char()
@@ -5660,13 +6425,21 @@ local function fightOnce(forced)
 		-- (a great axe's swing plays for 1.6s but its cooldown says 1.5: a press in between is dropped)
 		local dur = combat and type(combat.AttackDuration) == 'table' and tonumber(combat.AttackDuration[idx]) or 0
 		nextSwingAt = now + math.max(cd, dur) + 0.05
+		G.FTSwingDbg = { idx = idx, hits = hits, cd = cd, dur = dur, ht = ht, gap = now - (G.FTSwingDbgAt or now), n = ((G.FTSwingDbg and G.FTSwingDbg.n) or 0) + 1 }
+		G.FTSwingDbgAt = now
 		strikeAt, strikeEnd = now + ht, now + ht + lag + (ht >= 0.6 and hd + 0.22 or 0.06)
 		track(true) -- (close the books on the previous swing)
 		pend = { at = now + ht, lag = lag, hd = hd, ht = ht, idx = idx, reach = reach, hp = target.h.Health, why = hitRun and G.FTSwingWhy or 'n/a', tool = tool and tool.Parent and tool.Parent.ClassName or 'nil' }
 	end
 	local retargetAt, regroupAt = os.clock() + 1, 0
 	while alive and allowed() and target.m.Parent and target.h.Health > 0 and os.clock() - t0 < 45 do
-		if lowHp() then
+		if crowdCheck() ~= crowd0 and not strikeAt then
+			return true -- (the crowd came or went: start over in the other style)
+		end
+		if kiteLow() then
+			kiteHeal()
+			return true
+		elseif lowHp() then
 			retreatAndHeal()
 			return true
 		end
@@ -5719,7 +6492,7 @@ local function fightOnce(forced)
 				G.FTWarnEnd = nil
 			end
 			swingTick(reach)
-		elseif settings.combatStyle == 'Block / parry' and settings.autoBlock then
+		elseif combatStyle() == 'Block / parry' and settings.autoBlock then
 			-- Hold block for the whole warned swing (halves the hit, parries it when the timing lines up).
 			-- (v202, traced with two Onis: this hold and the shine presses fought over the block - 30
 			-- press / release pairs in 3 s, none came up, and a block that IS held through a shine has
@@ -5835,10 +6608,10 @@ local function fightOnce(forced)
 						for _, om in ipairs(lvN and lvN:GetChildren() or {}) do
 							local orr = om:GetAttribute('IsNpc') and (om:FindFirstChild('HumanoidRootPart') or om.PrimaryPart)
 							if orr and (orr.Position - target.r.Position).Magnitude <= 200 then
-								mobNoRoute[om] = os.clock() + 180
+								mobNoRoute[om] = os.clock() + 20
 							end
 						end
-						mobNoRoute[target.m] = os.clock() + 180
+						mobNoRoute[target.m] = os.clock() + 20
 					end
 					G.FTFightStrand = G.FTFightStrand or { n = 0 }
 					local S = G.FTFightStrand
@@ -5846,6 +6619,33 @@ local function fightOnce(forced)
 						S.n += 1
 					else
 						S.pos, S.n = hs.Position, 1
+					end
+					-- (v263, seen live on floor 65: a dodge put it on a ledge just outside the arena wall,
+					-- 19 studs from the mobs - safe, but "no way out on foot ... and no clear way over", for
+					-- good. An Abyss floor is one walled room: after two failed tries we go back in the way
+					-- we came out - steps of at most 28 studs, straight to the mob's own floor.)
+					if S.n >= 2 and workspace:GetAttribute('AbyssRun') == true and target.r and target.r.Parent
+						and (target.r.Position - hs.Position).Magnitude < 400 and not kiteLow() then
+						S.n = 0
+						setStatus('abyss: outside the room — stepping back in')
+						for _ = 1, 16 do
+							local _, hb = char()
+							if not hb or not target.r.Parent then
+								break
+							end
+							local goal = target.r.Position + Vector3.new(0, 3, 0)
+							local left = goal - hb.Position
+							if left.Magnitude <= 6 then
+								break
+							end
+							local nextPos = left.Magnitude <= 28 and (goal - left.Unit * 4) or (hb.Position + left.Unit * 28)
+							hb.CFrame = hb.CFrame.Rotation + nextPos
+							hb.AssemblyLinearVelocity = Vector3.zero
+							task.wait(0.25)
+						end
+						G.FTAbyssStepIn = (G.FTAbyssStepIn or 0) + 1
+						statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. 'abyss: was outside the room with no route — stepped back in to ' .. target.m.Name
+						break
 					end
 					if S.n >= 3 then
 						S.n = 0
@@ -5875,10 +6675,44 @@ local function fightOnce(forced)
 						end
 					end
 				end
+				-- (v250, asked for) Stay BEHIND the mob while hitting it, at a gap set by the weapon's range.
+				-- Mobs turn to face us, so this is checked all the time: whenever we are not within the rear
+				-- third of the mob, hop to the spot behind its back - unless that spot is a wall, a drop or
+				-- lava, and never in the instant our own hitbox is coming out.
+				if not hitRun and os.clock() >= (G.FTBehindAt or 0) and not (pend and math.abs(os.clock() - pend.at) < 0.15) then
+					G.FTBehindAt = os.clock() + 0.1
+					local tpB = target.r.Position
+					local lookB = target.r.CFrame.LookVector * Vector3.new(1, 0, 1)
+					local toUsB = (hrp.Position - tpB) * Vector3.new(1, 0, 1)
+					if lookB.Magnitude > 0.1 and toUsB.Magnitude > 0.1 and lookB.Unit:Dot(toUsB.Unit) > -0.5 then
+						G.FTBehindAt = os.clock() + 0.45
+						local gapB = math.clamp(reach - 3.5, 1.5, 4)
+						local spotB = tpB - lookB.Unit * (math.max(target.r.Size.X, target.r.Size.Z) / 2 + gapB)
+						local rpB = RaycastParams.new()
+						rpB.FilterType = Enum.RaycastFilterType.Exclude
+						rpB.RespectCanCollide = true -- (hit effects were read as walls)
+						rpB.FilterDescendantsInstances = { (char()), workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+						local floorB = workspace:Raycast(spotB + Vector3.new(0, 6, 0), Vector3.new(0, -20, 0), rpB)
+						if floorB and math.abs(floorB.Position.Y + 3 - hrp.Position.Y) <= 10 and not Lava.at(floorB.Position + Vector3.new(0, 3, 0))
+							and not workspace:Raycast(tpB, spotB - tpB, rpB) and (spotB - hrp.Position).Magnitude <= 30 then
+							spotB = Vector3.new(spotB.X, floorB.Position.Y + 3, spotB.Z)
+							hrp.CFrame = CFrame.lookAt(spotB, Vector3.new(tpB.X, spotB.Y, tpB.Z))
+							hrp.AssemblyLinearVelocity = Vector3.zero
+							G.FTBehindN = (G.FTBehindN or 0) + 1
+						else
+							G.FTBehindBlocked = (G.FTBehindBlocked or 0) + 1
+							local wallB = floorB and workspace:Raycast(tpB, spotB - tpB, rpB)
+							G.FTBehindWhy = G.FTBehindWhy or {}
+							local whyB = (not floorB and 'nofloor') or (math.abs(floorB.Position.Y + 3 - hrp.Position.Y) > 10 and ('height %.0f'):format(floorB.Position.Y + 3 - hrp.Position.Y))
+								or (Lava.at(floorB.Position + Vector3.new(0, 3, 0)) and 'lava') or (wallB and ('wall ' .. wallB.Instance:GetFullName():sub(1, 60))) or 'far'
+							G.FTBehindWhy[whyB .. ' @' .. target.m.Name:gsub('%d+$', '')] = (G.FTBehindWhy[whyB .. ' @' .. target.m.Name:gsub('%d+$', '')] or 0) + 1
+						end
+					end
+				end
 				-- keep facing the mob every frame: the hitbox comes out in front of us a moment after the swing
 				hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.r.Position.X, hrp.Position.Y, target.r.Position.Z))
 			end
-			if Block.active() then
+			if Block.active() and not atkOnly then
 				task.wait(0.05) -- holding block through an incoming hit
 			else
 				if not hitRun then
@@ -6153,6 +6987,11 @@ do
 		if (d.Quests or {})[id] then
 			return false
 		end
+		-- (v213, asked for: daily quests handed out by NPCs, e.g. Daily_Farmer, are not taken.
+		-- settings.acceptDaily = true by hand brings them back.)
+		if settings.acceptDaily ~= true and (string.find(tostring(id), 'Daily') ~= nil or q.Daily == true or q.Type == 'Daily') then
+			return false
+		end
 		if (d.CompletedQuests or {})[id] and not q.Repeatable then
 			return false
 		end
@@ -6379,6 +7218,293 @@ do
 		return buy(pick)
 	end
 	Quest.buyBestPickaxe = buyBestIslandPickaxe
+
+	-- (v241, asked for) Pickaxe plan, one-shot: G.FTPickPlan = { item = 'Yin-Yang Pickaxe',
+	-- sell = 'Oni Pickaxe', race = 'Goblin' }. Waits until gold + what the old pickaxe sells for
+	-- (75% of its shop price, read from the game's own sell code) covers the new one at the
+	-- race's shop discount. Then: switch to that race, MEASURE the discount on the cheapest stall
+	-- item here (nothing is sold on an assumed discount), sell the old pickaxe at Marbles (the
+	-- game hides a worn item from the sell list, so the spare one is worn first), buy, equip,
+	-- switch the race back, and mine the rocks only the new pickaxe can break. Every step is
+	-- checked; anything unexpected stops the plan and puts the race / pickaxe back.
+	local function planLog(msg)
+		local line = os.date('%H:%M:%S ') .. 'pickaxe plan: ' .. msg
+		statusLog[#statusLog + 1] = line
+		setStatus('pickaxe plan: ' .. msg)
+		G.FTPickPlanLog = G.FTPickPlanLog or {}
+		table.insert(G.FTPickPlanLog, line)
+		pcall(function()
+			local wf = isfile('PlayerTools/forgetools_pickplan.txt') and appendfile or writefile
+			wf('PlayerTools/forgetools_pickplan.txt', line .. '\n')
+		end)
+	end
+	local function gold()
+		local d = data()
+		return d and tonumber(d.Gold) or 0
+	end
+	local function ownsItem(name)
+		local d = data()
+		for _, e in ipairs(d and d.Inventory and d.Inventory.Equipments or {}) do
+			if type(e) == 'table' and (e.Name or e.Type) == name then
+				return e
+			end
+		end
+		return nil
+	end
+	local function wornPick()
+		local d = data()
+		local cur = d and d.Equipped and d.Equipped.Pickaxe
+		return type(cur) == 'table' and (cur.Name or cur.Type) or nil
+	end
+	local function wear(name)
+		local e = ownsItem(name)
+		if not e then
+			return false
+		end
+		pcall(function()
+			service('CharacterService'):EquipItem(e)
+		end)
+		local t0 = os.clock()
+		while os.clock() - t0 < 5 and wornPick() ~= name do
+			task.wait(0.25)
+		end
+		return wornPick() == name
+	end
+	local function setRace(name)
+		local d = data()
+		if not d or d.Race == name then
+			return d ~= nil
+		end
+		local idx
+		for i, n in pairs(type(d.RaceSlots) == 'table' and d.RaceSlots or {}) do
+			if n == name then
+				idx = i
+			end
+		end
+		if not idx then
+			return false
+		end
+		-- (v243) the switch has a cooldown: a second one a few seconds after the first is refused
+		-- (measured: back to Angel 8 s after going Goblin did nothing, 2 minutes later it went at once)
+		for _ = 1, 6 do
+			pcall(function()
+				service('RaceService'):SwitchSlot(idx):await()
+			end)
+			local t0 = os.clock()
+			while os.clock() - t0 < 6 and data().Race ~= name do
+				task.wait(0.25)
+			end
+			if data().Race == name then
+				return true
+			end
+			task.wait(10)
+		end
+		return data().Race == name
+	end
+	Quest.pickPlan = function()
+		local plan = G.FTPickPlan
+		if type(plan) ~= 'table' or type(plan.item) ~= 'string' then
+			return false
+		end
+		if G.FTBossFight or os.clock() < (plan.nextAt or 0) then
+			return false
+		end
+		local shop, old = ShopData and ShopData[plan.item], ShopData and ShopData[plan.sell]
+		local d = data()
+		if not shop or not old or not d then
+			return false
+		end
+		if ownsItem(plan.item) then
+			G.FTPickPlan = nil
+			return false
+		end
+		local price, sellFor = tonumber(shop.Price) or math.huge, 0.75 * (tonumber(old.Price) or 0)
+		local disc = tonumber(plan.disc) or 0.88
+		plan.need = price * disc - sellFor + 2000
+		if gold() < plan.need then
+			return false
+		end
+		do
+			-- (v243: it started inside the Asura arena, 5,000 studs from every stall)
+			local st0 = npcModel(plan.item)
+			local _, h0 = char()
+			local okp, p0 = pcall(function()
+				return st0:IsA('BasePart') and st0.Position or st0:GetPivot().Position
+			end)
+			if not (st0 and h0 and okp) or (p0 - h0.Position).Magnitude > 3000 then
+				plan.nextAt = os.clock() + 15
+				return false
+			end
+		end
+		plan.nextAt = os.clock() + 60
+		if not ownsItem(plan.sell) and not plan.sold then
+			planLog(('no %s to sell - plan stopped'):format(plan.sell))
+			G.FTPickPlan = nil
+			return true
+		end
+		if shop.Condition then
+			local okc, res = pcall(shop.Condition)
+			if not (okc and res) then
+				planLog(('the stall will not sell %s yet (%s) - waiting'):format(plan.item, tostring(res)))
+				plan.nextAt = os.clock() + 300
+				return true
+			end
+		end
+		local race0 = d.Race
+		planLog(('gold %.0f covers %s at x%.2f after selling %s for %.0f - starting'):format(gold(), plan.item, disc, plan.sell, sellFor))
+		if not setRace(plan.race) then
+			planLog(('could not switch to %s - plan stopped'):format(tostring(plan.race)))
+			G.FTPickPlan = nil
+			return true
+		end
+		local function back(why, stop)
+			planLog(why)
+			if type(race0) == 'string' and not setRace(race0) then
+				planLog(('could not switch back to %s'):format(race0))
+			end
+			if stop then
+				G.FTPickPlan = nil
+			end
+			return true
+		end
+		if not plan.disc and not plan.sold then
+			-- measure the discount on the cheapest thing a stall here sells
+			-- (v242: the first try went through the quest "buy" helper and nothing was bought. Now the
+			-- way the potion top-up does it, which is known to work: stand at the stall, Purchase, await.)
+			local prox = workspace:FindFirstChild('Proximity')
+			local _, hp = char()
+			local function ownedQty(name)
+				for _, it in pairs(data().Inventory.Misc or {}) do
+					if type(it) == 'table' and it.Name == name then
+						return tonumber(it.Quantity) or 0
+					end
+				end
+				return 0
+			end
+			local cheap, cheapPrice, cheapPos
+			for _, c in ipairs(prox and prox:GetChildren() or {}) do
+				local sh = ShopData and ShopData[c.Name]
+				local pr = sh and tonumber(sh.Price)
+				local okp, pos = pcall(function()
+					return c:IsA('BasePart') and c.Position or c:GetPivot().Position
+				end)
+				if pr and okp and hp and pr >= 50 and pr <= 20000 and not sh.Condition and not sh.LockedText and not string.find(c.Name, 'Pickaxe', 1, true)
+					and ownedQty(c.Name) < (tonumber(sh.MaxPurchaseLimit) or 1e9) and (pos - hp.Position).Magnitude < 3000 then
+					if not cheapPrice or pr < cheapPrice or (pr == cheapPrice and (pos - hp.Position).Magnitude < (cheapPos - hp.Position).Magnitude) then
+						cheap, cheapPrice, cheapPos = c.Name, pr, pos
+					end
+				end
+			end
+			if not cheap then
+				return back('no cheap stall item here to measure the discount on - plan stopped', true)
+			end
+			if (hp.Position - cheapPos).Magnitude > 9 and not tweenTo(CFrame.new(cheapPos + Vector3.new(0, 1, 5))) then
+				plan.nextAt = os.clock() + 120
+				return back(('could not get to the %s stall - trying again later'):format(cheap), false)
+			end
+			task.wait(0.3)
+			local g0 = gold()
+			pcall(function()
+				PS:Purchase(cheap, 1):await()
+			end)
+			local tb = os.clock()
+			while os.clock() - tb < 4 and gold() == g0 do
+				task.wait(0.1)
+			end
+			task.wait(0.5)
+
+			local ratio = (g0 - gold()) / cheapPrice
+			planLog(('bought 1 %s listed at %d as %s: paid %.0f (x%.3f)'):format(cheap, cheapPrice, tostring(plan.race), g0 - gold(), ratio))
+			if ratio > 0.5 and ratio < 0.965 then
+				plan.disc = ratio
+			elseif ratio >= 0.965 and ratio < 1.05 then
+				plan.disc = 1
+			else
+				return back('that purchase did not go through as expected - plan stopped', true)
+			end
+			disc = plan.disc
+			plan.need = price * disc - sellFor + 2000
+			if gold() < plan.need then
+				plan.nextAt = 0
+				return back(('the real discount is x%.3f: %.0f gold needed, have %.0f - waiting on'):format(disc, plan.need, gold()), false)
+			end
+		end
+		if not plan.sold then
+		-- sell the old pickaxe (a spare one is worn meanwhile: a worn item is not sellable)
+		local spare
+		for _, e in ipairs(data().Inventory.Equipments or {}) do
+			local nm = type(e) == 'table' and (e.Name or e.Type)
+			if nm and nm ~= plan.sell and string.find(tostring(nm), 'Pickaxe', 1, true) then
+				spare = nm
+			end
+		end
+		if not spare then
+			return back('no second pickaxe to hold while selling (the game keeps one) - plan stopped', true)
+		end
+		local npc = npcModel('Marbles')
+		if not npc or not goTo(npc) then
+			plan.nextAt = os.clock() + 120
+			return back('could not get to Marbles - trying again later', false)
+		end
+		if not wear(spare) then
+			return back(('could not put on %s - plan stopped'):format(spare), true)
+		end
+		local g1 = gold()
+		pcall(function()
+			PS:ForceDialogue(npc, 'SellConfirm')
+		end)
+		task.wait(0.6)
+		pcall(function()
+			DS:RunCommand('SellConfirm', { Basket = { [plan.sell] = true } })
+		end)
+		local t0 = os.clock()
+		while os.clock() - t0 < 8 and ownsItem(plan.sell) do
+			task.wait(0.3)
+		end
+		task.wait(0.5)
+		closeDialogue()
+		planLog(('sold %s: gold %.0f -> %.0f, still owned %s'):format(plan.sell, g1, gold(), tostring(ownsItem(plan.sell) ~= nil)))
+		if ownsItem(plan.sell) then
+			wear(plan.sell)
+			return back('the sale did not go through - old pickaxe back on, plan stopped', true)
+		end
+		plan.sold = true
+		end
+		if gold() < price * disc - 1 then
+			return back(('SOLD, but gold %.0f is short of %.0f - not buying. Plan stopped: tell Claude.'):format(gold(), price * disc), true)
+		end
+		local stand = npcModel(plan.item)
+		local okSp, standPos = pcall(function()
+			return stand:IsA('BasePart') and stand.Position or stand:GetPivot().Position
+		end)
+		local _, hb = char()
+		-- (v244: the first purchase did not land after the quest-style walk; now right at the stall,
+		-- like the potion top-up, and what the game answers is written down)
+		if not (stand and okSp and hb) or ((hb.Position - standPos).Magnitude > 8 and not tweenTo(CFrame.new(standPos + Vector3.new(0, 1, 4)))) then
+			return back(('SOLD, but could not get to the %s stall. Plan stopped: tell Claude.'):format(plan.item), true)
+		end
+		task.wait(0.5)
+		local g2 = gold()
+		local _, hb2 = char()
+		local okB, a1, a2 = pcall(function()
+			return PS:Purchase(plan.item, 1):await()
+		end)
+		planLog(('purchase asked as %s, %.0f studs from the stall, gold %.0f: %s %s %s'):format(tostring(data().Race), hb2 and (hb2.Position - standPos).Magnitude or -1, g2, tostring(okB), tostring(a1), tostring(a2)))
+		local t1 = os.clock()
+		while os.clock() - t1 < 10 and not ownsItem(plan.item) do
+			task.wait(0.3)
+		end
+		if not ownsItem(plan.item) then
+			return back(('SOLD, but the purchase of %s did not land (gold %.0f). Plan stopped: tell Claude.'):format(plan.item, gold()), true)
+		end
+		wear(plan.item)
+		planLog(('bought %s for %.0f, wearing %s'):format(plan.item, g2 - gold(), tostring(wornPick())))
+		if type(plan.rocks) == 'table' then
+			G.FTCraftRocks = plan.rocks
+			G.FTCraftNeed = plan.oreNeed
+		end
+		return back('done', true)
+	end
 
 	local function sellSpare(target)
 		local d = data()
@@ -6912,6 +8038,35 @@ do
 		G.FTQuestRock = nil
 		G.FTQuestRocks = nil
 		G.FTCamp = nil
+		-- (v245) a drop still wanted (G.FTDropNeed) whose mob is dead right now: wait where it lives,
+		-- like a quest kill - it used to wander off to whatever else was alive (the apes)
+		do
+			local dn, d0 = G.FTDropNeed, data()
+			local inv0 = d0 and d0.Inventory or {}
+			local lv0 = workspace:FindFirstChild('Living')
+			for _, e in ipairs(type(dn) == 'table' and dn or {}) do
+				if type(e) == 'table' and type(e.mob) == 'string' and (tonumber(inv0[e.ore]) or 0) < (tonumber(e.n) or 0) then
+					local up = false
+					for _, m in ipairs(lv0 and lv0:GetChildren() or {}) do
+						if m:GetAttribute('IsNpc') and string.sub(m.Name, 1, #e.mob) == e.mob then
+							local h = m:FindFirstChildOfClass('Humanoid')
+							local r0 = mobRoot(m)
+							if h and h.Health > 0 and r0 then
+								up = true
+								G.FTMobSeen = G.FTMobSeen or {}
+								G.FTMobSeen[e.mob] = r0.Position
+							end
+						end
+					end
+					local at = (G.FTMobSeen and G.FTMobSeen[e.mob]) or e.at
+					if not up and typeof(at) == 'Vector3' then
+						G.FTCamp = at
+						G.FTCampFor = e.mob
+					end
+					break
+				end
+			end
+		end
 		G.FTReserve = {}
 		local d = data()
 		if not d then
@@ -7195,7 +8350,47 @@ do
 							end
 						elseif t == 'Extra' then
 							local desc = q.Objectives and q.Objectives[pi] and q.Objectives[pi].Description
-							if target == 'None' or parseBring(desc) then
+							-- (v229, measured on "Cleansing the Holy Tree - 1": its last step "Return to the Shogun's
+							-- Spirit" is marked TurnInOnly. The bot walked to him for it while the kills were still
+							-- short, got nothing, and was then backing off when the kills were finally done.
+							-- Such a step is only tried once every other step is complete.)
+							local odef = q.Objectives and q.Objectives[pi]
+							local handIn = type(odef) == 'table' and odef.TurnInOnly == true
+							local restDone = true
+							for pj, p2 in ipairs(qd.Progress or {}) do
+								if pj ~= pi and (tonumber(p2.currentProgress) or 0) < (tonumber(p2.requiredAmount) or 1) then
+									restDone = false
+								end
+							end
+							local bring = type(odef) == "table" and type(odef.Bring) == "table" and odef.Bring or nil
+							if bring then
+								-- (v247: "Bring 12 Oni Mask and 5 Yin-Yang to the Shogun's Spirit" - two items in one
+								-- sentence was read as one item named "Oni Mask and 5 Yin-Yang", so it never went.
+								-- The step carries the list itself: go once everything on it is held.)
+								local have = true
+								for item, n in pairs(bring) do
+									local ore = oreKey(item)
+									if ore then
+										G.FTReserve[ore] = math.max(G.FTReserve[ore] or 0, tonumber(n) or 0)
+									end
+									if itemCount(item) < (tonumber(n) or 1) then
+										have = false
+									end
+								end
+								if have and restDone and os.clock() - (turnInAt[id] or 0) > 30 then
+									turnInAt[id] = os.clock()
+									if visit(target, "deliver") then
+										return true
+									end
+								end
+							elseif handIn then
+								if restDone and os.clock() - (turnInAt[id] or 0) > 30 then
+									turnInAt[id] = os.clock()
+									if visit(target, 'hand in') then
+										return true
+									end
+								end
+							elseif target == 'None' or parseBring(desc) then
 								if deliverItem(id, q, desc) then
 									return true
 								end
@@ -7246,11 +8441,43 @@ do
 			G.FTQuestLock = lockId
 		end
 		-- A quest that needs ore: don't sit on a 10,000 HP Lucky Block.
-		G.FTQuestWantsOre = QS.wantMine
+		G.FTQuestWantsOre = QS.wantMine or craftWant()
 		-- (new quests are only looked for when there is no quest left to work on)
-		if settings.autoAcceptQuests and lockId == nil and os.clock() - lastAcceptScan > 20 then
+		-- (v215: with quests still to work on, an NPC is visited all the same when the game's quest
+		-- data says it hands out a quest we do not have yet - e.g. Hayato = "Shogun'sGuard" - but each
+		-- such NPC only once every 10 minutes.)
+		local busy = lockId ~= nil
+		local givers = {}
+		if busy and settings.autoAcceptQuests and os.clock() - lastAcceptScan > 20 then
+			for qid, q in pairs(QuestData or {}) do
+				if type(q) == 'table' and type(q.Npc) == 'string' and eligible(qid) then
+					givers[q.Npc] = true
+				end
+			end
+		end
+		if settings.autoAcceptQuests and os.clock() - lastAcceptScan > 20 then
 			lastAcceptScan = os.clock()
 			local prox = workspace:FindFirstChild('Proximity')
+			-- (v228, the user at Shogun's Spirit: "it keeps coming here to talk to this ... even though i
+			-- have his quest already". A quest giver that handed over nothing on two visits in a row is
+			-- left alone until some quest gets completed (which is what can unlock a new one).
+			local fruit = type(G.FTFruitless) == 'table' and G.FTFruitless or {}
+			G.FTFruitless = fruit
+			local function tally(t)
+				local n = 0
+				for _ in pairs(type(t) == 'table' and t or {}) do
+					n += 1
+				end
+				return n
+			end
+			do
+				local d0 = data()
+				local cq = tally(d0 and d0.CompletedQuests)
+				if G.FTFruitCQ ~= cq then
+					G.FTFruitCQ = cq
+					table.clear(fruit)
+				end
+			end
 			for _, npc in ipairs(prox and prox:GetChildren() or {}) do
 				local isTalker = DialogueNpcs and (DialogueNpcs[npc.Name] or false)
 				-- Only scout NPCs reasonably close (some sit thousands of studs away in side areas).
@@ -7259,10 +8486,15 @@ do
 					local _, hrp = char()
 					near = hrp and (npc:GetPivot().Position - hrp.Position).Magnitude <= (tonumber(settings.questRange) or 1000)
 				end)
+				if busy and not (givers[npc.Name] and (not visited[npc.Name] or os.clock() - visited[npc.Name] > 600)) then
+					near = false
+				end
 				if isTalker and near and npc:IsA('Model') then
 					local tree = treeOf[npc.Name]
 					local want = false
-					if not tree then
+					if busy then
+						want = true
+					elseif not tree then
 						want = not visited[npc.Name] or os.clock() - visited[npc.Name] > 900
 					else
 						for _, g in ipairs(treeCommands(tree).give) do
@@ -7272,8 +8504,22 @@ do
 						end
 						want = want and (not visited[npc.Name] or os.clock() - visited[npc.Name] > 60)
 					end
-					if want and visit(npc.Name, 'looking for quests') then
-						return true
+					if want and not craftWant() and (fruit[npc.Name] or 0) < 2 then -- (v224: ores for a craft first, quest givers after)
+						local d1 = data()
+						local had = tally(d1 and d1.Quests)
+						if visit(npc.Name, 'looking for quests') then
+							task.wait(1)
+							local d2 = data()
+							if tally(d2 and d2.Quests) > had then
+								fruit[npc.Name] = 0
+							else
+								fruit[npc.Name] = (fruit[npc.Name] or 0) + 1
+								if fruit[npc.Name] == 2 then
+									statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('quest giver %s gave nothing twice — leaving it alone until a quest is completed'):format(npc.Name)
+								end
+							end
+							return true
+						end
 					end
 				end
 			end
@@ -7530,11 +8776,25 @@ do
 		local text = string.lower(tostring(card.Text or ''))
 		-- Never take a card with a downside (all Cursed cards, Deep Pact, anything with a Cost or
 		-- that makes enemies stronger / you take more damage / lowers a stat).
-		if card.Cost ~= nil or card.Enemy ~= nil or card.Rarity == 'Cursed'
-			or text:find('more damage') or text:find('stronger') or text:find('%-%d') then
+		-- (v255, the user: Greed - enemies 30% stronger, floor rewards x2 - counts as a good card)
+		-- (v257, the user: "take beneficial ones that arent fully maxed out". The game sends the deck
+		-- with every pick; a card already held as many times as it allows is passed over.)
+		local deck = G.FTAbyssDeck
+		if type(deck) == 'table' and tonumber(card.Max) and (tonumber(deck[card.Id]) or 0) >= tonumber(card.Max) then
+			return -900
+		end
+		local greed = card.Id == 'Greed'
+		if greed then
+			text = 'floor rewards x2'
+		end
+		if not greed and (card.Cost ~= nil or card.Enemy ~= nil or card.Rarity == 'Cursed'
+			or text:find('more damage') or text:find('stronger') or text:find('%-%d')) then
 			return -1000
 		end
 		local score = RANK[tostring(card.Rarity)] or 5
+		if greed then
+			return 1000 -- (v256, the user: "if the card is seen pick it")
+		end
 		local focus = settings.cardFocus
 		local dmg = text:find('damage') and not text:find('less damage') and not text:find('more damage')
 		local surv = text:find('health') or text:find('less damage') or text:find('heal') or text:find('survive')
@@ -7571,8 +8831,11 @@ do
 			G.FTAbyssPickedConn:Disconnect()
 		end
 		local AS = service('AbyssService')
-		G.FTAbyssPickedConn = AS.CardPicked:Connect(function()
+		G.FTAbyssPickedConn = AS.CardPicked:Connect(function(_, _, deck)
 			lastPicked = os.clock()
+			if type(deck) == 'table' then
+				G.FTAbyssDeck = deck
+			end
 		end)
 		G.FTAbyssCardConn = AS.CardOffer:Connect(function(offer)
 			if not (settings.autoCards or settings.autoAbyss) or type(offer) ~= 'table' or type(offer.Cards) ~= 'table' then
@@ -7587,7 +8850,7 @@ do
 					if os.clock() - offeredAt > 9 then
 						break
 					end
-					if cardScore(A and A.GetCard and A.GetCard(cards[slot])) > -1000 then
+					if cardScore(A and A.GetCard and A.GetCard(cards[slot])) > -800 then -- (downside or already maxed: reroll)
 						break
 					end
 					local ok, a, b, c = pcall(function()
@@ -7636,7 +8899,41 @@ do
 		local prox = workspace:FindFirstChild('Proximity')
 		local cage = prox and prox:FindFirstChild('AbyssCreateParty')
 		if not cage then
-			return false
+			-- (v248: after dying in a run the game drops you on an island with no cage - seen on
+			-- Island 1 - and the bot sat idle. The Events page "Abyss" button works from anywhere.)
+			if os.clock() - lastTry < 40 then
+				return false
+			end
+			lastTry = os.clock()
+			setStatus('abyss: no cage here - teleporting to the Abyss lobby')
+			local okE, rE, vE = pcall(function()
+				return service('AbyssService'):Enter():await()
+			end)
+			G.FTAbyssEnter = { ok = okE, res = tostring(rE) .. ' ' .. tostring(vE), at = os.time() }
+			if not (okE and rE and vE ~= false) then
+				-- (v249, measured on Island 1: Enter answers false there - the Abyss opens from Island 2.
+				-- Back to the furthest island that is unlocked, and in from there.)
+				local dest
+				pcall(function()
+					local IM = require(RS.Shared.Data.Islands)
+					for _, isl in ipairs(IM.Data or {}) do
+						local okS, st = pcall(IM.GetRequirementStatus, isl.Name, data())
+						if okS and type(st) == 'table' and st.AllMet then
+							dest = isl.Name
+						end
+					end
+				end)
+				local d0 = data()
+				if dest and d0 and d0.CurrentIsland ~= dest then
+					setStatus('abyss: not open from this island - travelling to ' .. dest)
+					local okT, aT, bT = pcall(function()
+						return service('PortalService'):TeleportToIsland(dest):await()
+					end)
+					G.FTAbyssEnter.travel = dest .. ': ' .. tostring(okT) .. ' ' .. tostring(aT) .. ' ' .. tostring(bT)
+				end
+			end
+			task.wait(8)
+			return true
 		end
 		lastTry = os.clock()
 		local ok, pos = pcall(function()
@@ -7699,8 +8996,36 @@ end
 -- The gate shows a countdown; whether it counts to "opens" or "closes" is not known, so a start is
 -- tried once right away and after that only around the moment the countdown runs out.
 ---------------------------------------------------------------------------
-local Boss = { lastTry = -1e9, fails = 0, pauseUntil = 0, first = true }
+local Boss = { lastTry = -1e9, fails = 0, pauseUntil = os.clock() + math.max(0, (tonumber(G.FTBossPauseT) or 0) - os.time()), first = true } -- (v244: a reload no longer forgets that the boss was just killed)
 do
+	-- (v208: the boss's change into its second form plays a cutscene with a Skip button - the game
+	-- puts a "BossCutscene" screen with a button named Skip in front of us. It is pressed for you.)
+	pcall(function()
+		if G.FTCutsceneConn then
+			G.FTCutsceneConn:Disconnect()
+		end
+		local pg = LocalPlayer:FindFirstChildOfClass('PlayerGui')
+		G.FTCutsceneConn = pg and pg.DescendantAdded:Connect(function(d)
+			if not alive or d.Name ~= 'Skip' or not d:IsA('GuiButton') or not d:FindFirstAncestor('BossCutscene') then
+				return
+			end
+			task.wait(0.3)
+			for _ = 1, 8 do
+				if not alive or not d.Parent then
+					break
+				end
+				pcall(function()
+					firesignal(d.Activated)
+				end)
+				pcall(function()
+					firesignal(d.MouseButton1Click)
+				end)
+				task.wait(0.4)
+			end
+			G.FTCutsceneSkips = (G.FTCutsceneSkips or 0) + 1
+			statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: cutscene skip pressed (button %s)'):format(d.Parent and 'still there' or 'gone')
+		end)
+	end)
 	function Boss.gate()
 		local prox = workspace:FindFirstChild('Proximity')
 		local gate = prox and prox:FindFirstChild('CreateParty')
@@ -7750,8 +9075,36 @@ do
 		end
 		return nil
 	end
+	-- (v214) a quest that asks for this island's boss ("The Asura Threat: Defeat Asura's Incarnate")
+	-- runs the boss too, with Auto boss off, while "Do quests" is on
+	local qwAt, qwVal = -1e9, false
+	function Boss.questWants()
+		if os.clock() - qwAt < 3 then
+			return qwVal
+		end
+		qwAt, qwVal = os.clock(), false
+		local d = data()
+		if not settings.doQuests or not d or type(d.Quests) ~= 'table' then
+			return false
+		end
+		local _, kind = Boss.gate()
+		if type(kind) ~= 'string' then
+			return false
+		end
+		for _, qd in pairs(d.Quests) do
+			for _, p in ipairs(type(qd) == 'table' and qd.Progress or {}) do
+				if p.questType == 'Kill' and tostring(p.target) == kind and (tonumber(p.currentProgress) or 0) < (tonumber(p.requiredAmount) or 1) then
+					qwVal = true
+				end
+			end
+		end
+		return qwVal
+	end
+	function Boss.on()
+		return settings.autoBoss or G.FTBossOnce == true or Boss.questWants() -- (v221: G.FTBossOnce = one kill asked for by hand)
+	end
 	function Boss.step()
-		if not settings.autoBoss then
+		if not Boss.on() then
 			Boss.first = true -- (so switching it on again tries straight away)
 			return false
 		end
@@ -7765,18 +9118,52 @@ do
 		local t = Boss.target(kind)
 		if t then
 			Boss.fails = 0
+			if not Boss.fought then
+				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: fight with %s started (%d HP)'):format(kind, t.h.MaxHealth)
+			end
+			Boss.fought = true
+			G.FTBossSeen = { name = t.m.Name, hp = t.h.Health, max = t.h.MaxHealth, at = os.time() }
 			setStatus(('boss: fighting %s (%d / %d HP)'):format(kind, t.h.Health, t.h.MaxHealth))
-			fightOnce(t)
+			G.FTBossFight = true
+			local okF, errF = pcall(fightOnce, t)
+			G.FTBossFight = false
+			if not okF then
+				error(errF, 0)
+			end
 			return true
 		end
 		local now = os.clock()
+		if Boss.fought then
+			-- (v207: the fight is over - won, or we died and are back outside. Read from the game's party
+			-- menu: a lobby window runs 10 minutes and the next opens as it closes, and the gate's clock
+			-- counts down to that. So the next start waits for the next window.)
+			Boss.fought = false
+			-- (v208: the first kill ended with the bot setting off on a 5,158-stud trip out of the arena
+			-- before the game had sent us back. Stay put until we have been moved, 20 s at most.)
+			do
+				local _, h0 = char()
+				local p0 = h0 and h0.Position
+				setStatus('boss: fight over — waiting to be sent back')
+				local tw = os.clock()
+				while alive and p0 and os.clock() - tw < 20 do
+					local _, h1 = char()
+					if not h1 or (h1.Position - p0).Magnitude > 1000 then
+						break
+					end
+					task.wait(0.5)
+				end
+				now = os.clock()
+			end
+			Boss.pauseUntil = now + (secs or 600) + 8
+			G.FTBossPauseT = os.time() + (secs or 600) + 8
+			statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: fight over, next start in %ds'):format((secs or 600) + 8)
+			G.FTBossOnce = nil
+		end
 		if now < Boss.pauseUntil then
 			return false
 		end
-		-- a start is tried right after the toggle goes on, and after that when the gate's countdown
-		-- is about to run out (walking over when it is under a minute)
-		local due = Boss.first or (secs ~= nil and secs <= 60)
-		if not due or now - Boss.lastTry < 25 then
+		-- (v207: the lobby is open the whole window, so a start is tried whenever none is pending)
+		if now - Boss.lastTry < 25 then
 			return false
 		end
 		local _, hrp = char()
@@ -7789,11 +9176,6 @@ do
 				Boss.lastTry = os.clock()
 				return true
 			end
-		end
-		if not Boss.first and secs ~= nil and secs > 3 and secs <= 60 then
-			setStatus(('boss: at the %s gate, countdown %ds'):format(kind, secs))
-			task.wait(0.5)
-			return true
 		end
 		Boss.first = false
 		Boss.lastTry = os.clock()
@@ -7822,7 +9204,7 @@ do
 		G.FTBossStart = ('%s ok=%s %s %s'):format(os.date('%H:%M:%S'), tostring(okA), tostring(a), tostring(b))
 		-- in the arena = the boss shows up next to us
 		local t0 = os.clock()
-		while alive and settings.autoBoss and os.clock() - t0 < 25 do
+		while alive and Boss.on() and os.clock() - t0 < 25 do
 			if Boss.target(kind) then
 				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: in the arena with %s'):format(kind)
 				return true
@@ -7839,6 +9221,457 @@ do
 		else
 			setStatus(('boss: %s did not start — next try when the gate countdown runs out'):format(kind))
 		end
+		return true
+	end
+end
+
+---------------------------------------------------------------------------
+-- Weapon DPS test (v209). Asked for with G.FTDpsTest = true or the button: goes to the nearest
+-- DPS dummy, equips every weapon in the bag in turn, swings for Dps.secs seconds each and adds
+-- up what the dummy lost. Puts the old weapon back. Uses nothing up.
+---------------------------------------------------------------------------
+local Dps = { secs = 20 }
+do
+	function Dps.step()
+		if not G.FTDpsTest then
+			return false
+		end
+		G.FTDpsTest = nil
+		local raw, rows = {}, {}
+		G.FTDpsRaw, G.FTDpsRows = raw, rows
+		local function note(s)
+			raw[#raw + 1] = s
+			pcall(writefile, 'PlayerTools/forgetools_dps.txt', table.concat(raw, '\n'))
+		end
+		local c, hrp, hum = char()
+		local d = data()
+		local living = workspace:FindFirstChild('Living')
+		if not (c and hrp and hum and d and living) then
+			note('not ready')
+			note('done')
+			return true
+		end
+		local dummy, dd
+		for _, m in ipairs(living:GetChildren()) do
+			if m:GetAttribute('DpsDummy') then
+				local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
+				if r then
+					local dist = (r.Position - hrp.Position).Magnitude
+					if not dd or dist < dd then
+						dummy, dd = m, dist
+					end
+				end
+			end
+		end
+		if not dummy or dd > 1500 then
+			note('no DPS dummy within reach')
+			note('done')
+			return true
+		end
+		local dr = dummy:FindFirstChild('HumanoidRootPart') or dummy.PrimaryPart
+		local dh = dummy:FindFirstChildOfClass('Humanoid')
+		local function flat()
+			return ((dr.Position - hrp.Position) * Vector3.new(1, 0, 1)).Magnitude
+		end
+		local function spot()
+			local dir = (hrp.Position - dr.Position) * Vector3.new(1, 0, 1)
+			dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(0, 0, 1)
+			return dr.Position + dir * 3.5
+		end
+		setStatus(('dps test: going to the dummy (%d studs)'):format(dd))
+		if flat() > 5 then
+			tweenTo(CFrame.new(spot() + Vector3.new(0, 2, 0)))
+		end
+		note(('at the dummy: %.1f studs'):format(flat()))
+		if flat() > 8 then
+			note('could not get to the dummy')
+			note('done')
+			return true
+		end
+		local CS = service('CharacterService')
+		local list = {}
+		for _, it in pairs(d.Inventory.Equipments) do
+			if type(it) == 'table' and it.GUID and type(it.Type) == 'string'
+				and not (string.find(it.Type, 'Leggings') or string.find(it.Type, 'Helmet') or string.find(it.Type, 'Chestplate')) then
+				list[#list + 1] = it
+			end
+		end
+		table.sort(list, function(a, b)
+			return a.Type .. tostring(a.Ore) < b.Type .. tostring(b.Ore)
+		end)
+		local orig = d.Equipped.Weapon and d.Equipped.Weapon.GUID
+		local function worn(guid)
+			return d.Equipped.Weapon ~= nil and d.Equipped.Weapon.GUID == guid
+		end
+		local function label()
+			local bb = dummy:FindFirstChild('BB', true)
+			local a = bb and bb:FindFirstChild('rockHP')
+			return a and a.Text or '?'
+		end
+		for i, it in ipairs(list) do
+			if not alive or hum.Health / hum.MaxHealth < 0.5 then
+				note('stopped early (health low or unloaded)')
+				break
+			end
+			local name = ('%s | %s | Q%.0f +%d'):format(it.Type, tostring(it.Ore), it.Quality or 0, it.Upgrade or 0)
+			setStatus(('dps test %d/%d: %s'):format(i, #list, name))
+			pcall(function()
+				return CS:EquipItem(it)
+			end)
+			local te = os.clock()
+			while os.clock() - te < 4 and not worn(it.GUID) do
+				task.wait(0.1)
+			end
+			task.wait(1.2)
+			if not worn(it.GUID) then
+				note(name .. ' | could not equip')
+			else
+				local hits, sum, last, drops, nums, big = 0, 0, dh.Health, {}, {}, 0
+				local conn = dh.HealthChanged:Connect(function(h)
+					if h < last then
+						hits += 1
+						sum += last - h
+						if #drops < 6 then
+							drops[#drops + 1] = ('%.0f'):format(last - h)
+						end
+					end
+					last = h
+				end)
+				local conn2 = workspace.DescendantAdded:Connect(function(x)
+					if x:IsA('TextLabel') then
+						task.defer(function()
+							pcall(function()
+								local v = tonumber(x.Text)
+								if v and (x.AbsolutePosition.Magnitude >= 0) then
+									hits += 1
+									sum += v
+									if v > big then
+										big = v
+									end
+									if #nums < 8 then
+										nums[#nums + 1] = x.Text
+									end
+								end
+							end)
+						end)
+					end
+				end)
+				local ts, labMax = os.clock(), 0
+				while alive and os.clock() - ts < Dps.secs do
+					local tool = equip('Weapon')
+					if tool then
+						swing(tool)
+					end
+					if flat() > 5 then
+						hum:MoveTo(spot())
+					end
+					hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(dr.Position.X, hrp.Position.Y, dr.Position.Z))
+					local n = tonumber((string.gsub(label(), '[^%d%.]', '')))
+					if n and n > labMax then
+						labMax = n
+					end
+					task.wait(0.05)
+				end
+				task.wait(0.8)
+				conn:Disconnect()
+				conn2:Disconnect()
+				local span = os.clock() - ts
+				rows[#rows + 1] = { name = name, hits = hits, sum = sum, dps = sum / span, big = big }
+				note(('%s | numbers %d | total %.0f | dps %.0f | biggest %.0f | first %s'):format(name, hits, sum, sum / span, big, table.concat(nums, ';')))
+			end
+		end
+		if orig then
+			for _, it in pairs(d.Inventory.Equipments) do
+				if type(it) == 'table' and it.GUID == orig then
+					pcall(function()
+						return CS:EquipItem(it)
+					end)
+				end
+			end
+			task.wait(1.5)
+			note('old weapon back on: ' .. tostring(worn(orig)))
+		end
+		table.sort(rows, function(a, b)
+			return a.dps > b.dps
+		end)
+		if rows[1] then
+			statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('dps test: best is %s (%.0f dps)'):format(rows[1].name, rows[1].dps)
+		end
+		note('done')
+		return true
+	end
+end
+
+---------------------------------------------------------------------------
+-- Quest pickups (v213). A "Collect X" quest whose X lies on the map as workspace.Proximity.X1,
+-- X2 ... with a prompt (Buried Remains: Skull1-3): go to each and press it.
+---------------------------------------------------------------------------
+local Pickup = { tried = {} }
+do
+	function Pickup.step()
+		if not settings.doQuests then
+			return false
+		end
+		local d = data()
+		local prox = workspace:FindFirstChild('Proximity')
+		local _, hrp = char()
+		if not (d and prox and hrp and type(d.Quests) == 'table') then
+			return false
+		end
+		for id, qd in pairs(d.Quests) do
+			for _, p in ipairs(type(qd) == 'table' and qd.Progress or {}) do
+				local target = tostring(p.target)
+				if p.questType == 'Collect' and #target >= 3 and (tonumber(p.currentProgress) or 0) < (tonumber(p.requiredAmount) or 1) then
+					local best, bd
+					for _, m in ipairs(prox:GetChildren()) do
+						if string.match(m.Name, '^' .. string.gsub(target, '%p', '%%%0') .. '%s?%d*$') and os.clock() - (Pickup.tried[m] or -1e9) > 180 then
+							local pr = m:FindFirstChildWhichIsA('ProximityPrompt', true)
+							local okp, pos = pcall(function()
+								return m:IsA('BasePart') and m.Position or m:GetPivot().Position
+							end)
+							if pr and okp then
+								local dist = (pos - hrp.Position).Magnitude
+								if dist <= math.max(tonumber(settings.questRange) or 1000, 1000) and (not bd or dist < bd) then
+									best, bd = { m = m, pr = pr, pos = pos }, dist
+								end
+							end
+						end
+					end
+					if best then
+						Pickup.tried[best.m] = os.clock()
+						setStatus(('quest: picking up %s (%d studs)'):format(best.m.Name, bd))
+						if tweenTo(CFrame.new(best.pos + Vector3.new(0, 3, 3))) then
+							local before = tonumber(p.currentProgress) or 0
+							for _ = 1, 3 do
+								pcall(function()
+									fireproximityprompt(best.pr)
+								end)
+								task.wait(0.6)
+								if (tonumber(p.currentProgress) or 0) > before or not best.m.Parent then
+									break
+								end
+							end
+							statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('quest pickup %s: %s %d -> %d'):format(best.m.Name, target, before, tonumber(p.currentProgress) or 0)
+						end
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+end
+
+---------------------------------------------------------------------------
+-- Raid start (v216). ONE raid per press of the button (or G.FTRaidStart = { tier = n }): goes to
+-- the raid gate, opens a Tower of Hell party, sets the tier and starts it. A start spends one
+-- Raid Ticket, so nothing here ever starts a raid on its own.
+---------------------------------------------------------------------------
+local Raid = {}
+do
+	function Raid.tickets()
+		local d = data()
+		for _, it in pairs(d and d.Inventory and type(d.Inventory.Misc) == 'table' and d.Inventory.Misc or {}) do
+			if type(it) == 'table' and it.Name == 'RaidTicket' then
+				return tonumber(it.Quantity) or 0
+			end
+		end
+		return 0
+	end
+	pcall(function()
+		local pc = controller('PartyController')
+		Raid.party = pc.CurrentParty
+		pc.PartyJoined:Connect(function(pt)
+			Raid.party = pt
+		end)
+		pc.PartyLeft:Connect(function()
+			Raid.party = nil
+		end)
+	end)
+	-- (v217) the Retry button on the raid result screen, while "Raid retries left" is above 0.
+	-- Each press starts another raid = one more Raid Ticket; the count goes down by one per press.
+	task.spawn(function()
+		local pressed = false
+		while alive do
+			task.wait(1)
+			local g = LocalPlayer.PlayerGui:FindFirstChild('RaidRewards')
+			local left = math.floor(tonumber(settings.raidRetries) or 0)
+			if g and g.Enabled and not pressed and left > 0 and Raid.tickets() >= 1 then
+				local b = g:FindFirstChild('Retry', true)
+				if b and b:IsA('GuiButton') then
+					task.wait(5) -- (let the rewards show first)
+					pressed = true
+					settings.raidRetries = left - 1
+					save()
+					statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('raid: pressing Retry (%d retries left after this, %d tickets)'):format(left - 1, Raid.tickets())
+					for _ = 1, 3 do
+						pcall(function()
+							firesignal(b.Activated)
+						end)
+						pcall(function()
+							firesignal(b.MouseButton1Click)
+						end)
+						task.wait(1)
+						if not (g.Parent and g.Enabled) then
+							break
+						end
+					end
+				end
+			elseif not (g and g.Enabled) then
+				pressed = false
+			end
+		end
+	end)
+	function Raid.step()
+		local req = G.FTRaidStart
+		if type(req) ~= 'table' then
+			return false
+		end
+		G.FTRaidStart = nil
+		local function say(sx)
+			setStatus(sx)
+			statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. sx
+			G.FTRaidLog = G.FTRaidLog or {}
+			table.insert(G.FTRaidLog, os.date('%H:%M:%S ') .. sx)
+		end
+		local prox = workspace:FindFirstChild('Proximity')
+		local gate = prox and prox:FindFirstChild('RaidCreateParty')
+		local pr = gate and gate:FindFirstChildWhichIsA('ProximityPrompt', true)
+		local kind = pr and pr:GetAttribute('PartyType')
+		if not gate or type(kind) ~= 'string' then
+			say('raid: no raid gate on this island')
+			return true
+		end
+		local before = Raid.tickets()
+		if before < 1 then
+			say('raid: no Raid Ticket')
+			return true
+		end
+		local tier = math.max(1, math.floor(tonumber(req.tier) or 1))
+		local pos = gate:IsA('BasePart') and gate.Position or gate:GetPivot().Position
+		local _, hrp = char()
+		if hrp and (hrp.Position - pos).Magnitude > 8 then
+			say(('raid: going to the %s gate'):format(kind))
+			if not tweenTo(CFrame.new(pos + Vector3.new(0, 2, 3))) then
+				say('raid: could not get to the gate')
+				return true
+			end
+		end
+		task.wait(1)
+		local PS = service('PartyService')
+		local okC, c1 = pcall(function()
+			return PS:CreateParty(kind):await()
+		end)
+		task.wait(1.5)
+		-- (v217: the party object, to read back which tier it is really on)
+		local party = Raid.party
+		local function partyTier()
+			local okp, v = pcall(function()
+				return party.Replica.Data.Tier
+			end)
+			return okp and tonumber(v) or nil
+		end
+		local okT, t1, t2
+		for _ = 1, 6 do
+			if (partyTier() or 1) == tier then
+				break
+			end
+			okT, t1, t2 = pcall(function()
+				return PS:SetTier(tier):await()
+			end)
+			task.wait(1)
+			party = Raid.party
+		end
+		local got = partyTier()
+		if tier ~= 1 and got ~= tier then
+			say(('raid: could not set tier %d (party is on %s, answer %s %s %s) — NOT started, no ticket spent'):format(tier, tostring(got), tostring(okT), tostring(t1), tostring(t2)))
+			pcall(function()
+				PS:Leave()
+			end)
+			return true
+		end
+		say(('raid: party %s, party tier %s (asked %d) — starting (tickets %d)'):format(tostring(okC and c1), tostring(got), tier, before))
+		local okA, a1, a2 = pcall(function()
+			return PS:Activate():await()
+		end)
+		task.wait(3)
+		say(('raid: start answered %s %s %s, tickets %d -> %d'):format(tostring(okA), tostring(a1), tostring(a2), before, Raid.tickets()))
+		return true
+	end
+end
+
+---------------------------------------------------------------------------
+-- Ore crafting at a craft station (v219). One-shot: G.FTCraft = { ore = 'Lgarite', n = 3 }.
+-- Crafting from afar is answered "ok" by the game but does nothing without the Craft Anywhere
+-- pass (measured), so this walks to the nearest craft station first. Spends the recipe's gold
+-- and ores, so nothing here ever starts by itself.
+---------------------------------------------------------------------------
+local Craft = {}
+do
+	local function say(sx)
+		setStatus(sx)
+		statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. sx
+		G.FTCraftLog = G.FTCraftLog or {}
+		table.insert(G.FTCraftLog, os.date('%H:%M:%S ') .. sx)
+	end
+	local function have(ore)
+		local d = data()
+		return d and d.Inventory and tonumber(d.Inventory[ore]) or 0
+	end
+	function Craft.step()
+		local req = G.FTCraft
+		if type(req) ~= 'table' or type(req.ore) ~= 'string' then
+			return false
+		end
+		G.FTCraft = nil
+		local n = math.max(1, math.floor(tonumber(req.n) or 1))
+		local _, hrp = char()
+		local prox = workspace:FindFirstChild('Proximity')
+		local best, bestD, bestPos
+		for _, m in ipairs(prox and prox:GetChildren() or {}) do
+			if hrp and string.find(m.Name, 'Craft Station', 1, true) then
+				local pos = m:IsA('BasePart') and m.Position or m:GetPivot().Position
+				local dd = (pos - hrp.Position).Magnitude
+				if not bestD or dd < bestD then
+					best, bestD, bestPos = m, dd, pos
+				end
+			end
+		end
+		if not best then
+			say('craft: no craft station on this island')
+			return true
+		end
+		if bestD > 9 then
+			say(('craft: going to %s (%d studs)'):format(best.Name, bestD))
+			if not tweenTo(CFrame.new(bestPos + Vector3.new(0, 2, 5))) then
+				say('craft: could not get to the station')
+				return true
+			end
+		end
+		task.wait(0.8)
+		local d = data()
+		local OS = service('OreCraftService')
+		local before, gold0 = have(req.ore), d and tonumber(d.Gold) or 0
+		local okS, s1 = pcall(function()
+			return OS:StartCrafting(best.Name):await()
+		end)
+		task.wait(0.5)
+		local okR, r1, r2 = pcall(function()
+			return OS:CraftRequest(req.ore, n):await()
+		end)
+		say(('craft: %d x %s at %s — open %s %s, request %s %s %s'):format(n, req.ore, best.Name, tostring(okS), tostring(s1), tostring(okR), tostring(r1), tostring(r2)))
+		local t0 = os.clock()
+		while alive and os.clock() - t0 < (tonumber(req.wait) or 300) and have(req.ore) < before + n do
+			task.wait(3)
+			pcall(function()
+				OS:CheckCraftCompletions()
+			end)
+			setStatus(('craft: waiting for %s (%d of %d, %.0fs)'):format(req.ore, have(req.ore) - before, n, os.clock() - t0))
+			if os.clock() - t0 > 20 and have(req.ore) == before and (tonumber(data().Gold) or 0) >= gold0 and not req.long then
+				break -- (nothing was taken and nothing came: the request was refused)
+			end
+		end
+		say(('craft: %s %d -> %d, gold %.0f -> %.0f, %.0fs'):format(req.ore, before, have(req.ore), gold0, tonumber(data().Gold) or 0, os.clock() - t0))
 		return true
 	end
 end
@@ -8350,6 +10183,7 @@ end
 bindSlider(ForgeBox, 'FTForgeOres', 'forgeOres', 'Ores per forge (max)', 3, 60, 'The most ores one item may use. Left at 3, the smart picks treat it as no limit.')
 bindSlider(ForgeBox, 'FTForgeMinOres', 'forgeMinOres', 'Ores per forge (min)', 3, 60, 'The fewest ores one item may use. Few ores only ever make the small pieces (helmets, daggers): raise this for chestplates, leggings and big weapons. Trait mode with rare ores you only own 2 of otherwise settles on 6-ore items.')
 bindSlider(FarmBox, 'FTForgeKeep', 'forgeKeep', 'Keep of each ore (auto sell)', 0, 20, 'With auto forge on, auto sell leaves this many of each ore for forging.')
+bindToggle(FarmBox, 'FTKeepTraitOres', 'keepTraitOres', 'Keep ores that give traits', 'Ores that give an item a trait are never sold (auto sell and Sell ores now skip them). They can still be used for forging.')
 do
 	local oreList = {}
 	for name in pairs(ORE_NAMES) do
@@ -8403,6 +10237,7 @@ pcall(function()
 	end)
 end)
 local mobDD = bindDropdown(MobBox, 'FTMobFilter', 'mobFilter', 'Target', mobNames())
+bindSlider(MobBox, 'FTKiteHp', 'kiteHp', 'Back off below % health', 0, 90, 'Below this the fight stops and it keeps its distance from every mob until health is back at the heal-to value (at least 25% above this). Works in raids too. 0 = off.')
 bindSlider(MobBox, 'FTRetreatHp', 'retreatHp', 'Retreat to spawn below % health', 0, 90, 'Below this it stops to heal (health comes back about 1% a second). 0 = never stop to heal, keep working.')
 bindSlider(MobBox, 'FTHealTo', 'healTo', 'Back to work at % health', 5, 100, 'How far it heals before it carries on. Lower = less standing around, more risk.')
 -- The slider used to stop at 2000, which silently hid every bigger mob (island 3: Elite Orc,
@@ -8423,10 +10258,18 @@ MobBox:AddButton('Forget deadly mobs', function()
 	setStatus('deadly list cleared' .. (was ~= '' and (' (was: ' .. was .. ')') or ''))
 end)
 bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything' }, 'Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 25% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
-bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Block / parry' }, 'Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Block / parry: stands and blocks. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)')
+bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Block / parry', 'Attack only' }, 'Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Block / parry: stands and blocks. Attack only: never dodges or blocks, just stands in reach and swings. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)')
 bindSlider(MobBox, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
 bindToggle(MobBox, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
 bindToggle(MobBox, 'FTAutoBoss', 'autoBoss', 'Auto boss (this island)', 'UNTESTED. Goes to this island\'s boss gate (Island 4: Asura\'s Incarnate), opens a party, starts it when the lobby opens and fights the boss. Boss lobbies are free (no ticket). Ignores the max mob health slider. Tries once right away, then each time the gate countdown runs out; gives up for 30 minutes after 3 starts in a row that do not go through.')
+bindSlider(MobBox, 'FTRaidTier', 'raidTier', 'Raid tier', 1, 15, 'The Tower of Hell tier the button below starts.')
+bindSlider(MobBox, 'FTRaidRetries', 'raidRetries', 'Raid retries left (1 ticket each)', 0, 10, 'When a raid ends, the Retry button is pressed this many more times. Each press starts another raid and spends one Raid Ticket; the number counts down by itself. 0 = never press it.')
+MobBox:AddButton('Start ONE raid (spends 1 Raid Ticket)', function()
+	G.FTRaidStart = { tier = tonumber(settings.raidTier) or 1 }
+end)
+MobBox:AddButton('Weapon DPS test (dummies)', function()
+	G.FTDpsTest = true
+end)
 bindToggle(MobBox, 'FTAutoCards', 'autoCards', 'Auto pick abyss cards', 'Picks a card for you after each floor, even when you play the Abyss yourself.')
 bindDropdown(MobBox, 'FTCardFocus', 'cardFocus', 'Card priority', { 'Best overall', 'Damage', 'Survival', 'Loot' }, 'Best overall: rarest card (Abyssal > Fusion > Epic > Rare > Common). Damage / Survival / Loot: that kind of card first, then rarity.')
 bindToggle(MobBox, 'FTAutoBlock', 'autoBlock', 'Auto block (F)', 'Blocks right before a mob\'s attack lands, then goes back to swinging.')
@@ -8569,6 +10412,21 @@ do
 					setStatus('race reroll: race service not found')
 					break
 				end
+				-- (v232, the user: "the race reroll skipped demon". The game keeps its own list of race
+				-- changes (RaceLog: from, new, time). When the roll's answer names no race, the new entry
+				-- in that list says what was rolled, before the next roll can go out. Every roll is also
+				-- written to PlayerTools/forgetools_racerolls.txt.)
+				local function logNewest()
+					local d0 = data()
+					local best
+					for _, e in pairs(d0 and type(d0.RaceLog) == 'table' and d0.RaceLog or {}) do
+						if type(e) == 'table' and type(e.T) == 'number' and (not best or e.T > best.T) then
+							best = e
+						end
+					end
+					return best
+				end
+				local log0 = logNewest()
 				local ok, got = pcall(function()
 					local _, r = svc:Reroll(banner):await()
 					return r
@@ -8576,6 +10434,25 @@ do
 				if ok and got then
 					used += 1
 					fails = 0
+					local viaLog
+					if not raceFrom(got) then
+						local tl = os.clock()
+						while os.clock() - tl < 3 do
+							local e = logNewest()
+							if e and e ~= log0 and (not log0 or e.T >= log0.T) and e.F == name and type(e.N) == 'string' and Races and Races[e.N] then
+								viaLog = e.N
+								break
+							end
+							task.wait(0.05)
+						end
+						if viaLog then
+							got = viaLog
+						end
+					end
+					pcall(function()
+						local ans = type(got) == 'table' and HttpService:JSONEncode(got) or tostring(got)
+						local wf = isfile('PlayerTools/forgetools_racerolls.txt') and appendfile or writefile; wf('PlayerTools/forgetools_racerolls.txt', ('%s roll %d from %s: answer %s%s\n'):format(os.date('%m-%d %H:%M:%S'), used, tostring(name), string.sub(ans, 1, 200), viaLog and ' (from the game log)' or ''))
+					end)
 					-- It used to wait (2s at most) for the spin count to drop and then read the race: the
 					-- race arrives in a separate update, so the next round could still see the OLD race and
 					-- roll straight over the one it was meant to stop on. Now: the server's own answer
@@ -8594,7 +10471,7 @@ do
 					if not told then
 						-- no race in the answer: the race we read must hold still before it is trusted
 						local same = os.clock()
-						while os.clock() - same < 1 do
+						while os.clock() - same < 2.5 do -- (v232: was 1 s)
 							task.wait(0.1)
 							local n3 = raceInfo()
 							if n3 ~= n2 then
@@ -8604,6 +10481,9 @@ do
 						n2, r2, s2 = raceInfo()
 					end
 					setStatus(('race reroll #%d: %s (%s) — %d spins left'):format(used, tostring(n2), tostring(r2), s2))
+					pcall(function()
+						local wf = isfile('PlayerTools/forgetools_racerolls.txt') and appendfile or writefile; wf('PlayerTools/forgetools_racerolls.txt', ('%s   -> data says %s (%s), %d spins left\n'):format(os.date('%m-%d %H:%M:%S'), tostring(n2), tostring(r2), s2))
+					end)
 					if s2 == spins or (told and n2 ~= told) then
 						setStatus(('race reroll: could not confirm roll #%d (answer %s, data %s) — stopped so nothing gets rolled over. Check your race, then press again.'):format(used, tostring(told), tostring(n2)))
 						break
@@ -9466,6 +11346,46 @@ task.spawn(function()
 	end
 end)
 
+-- (v254, asked for: "when retrying just click retry theres a checkpoint system".) After a defeat in
+-- an Abyss run the game shows its results screen with a Retry button, which restarts from the last
+-- checkpoint. Pressed here, on its own clock (the main loop stops at "dead"). ONLY inside an Abyss
+-- run: the same screen is used for raids, where a retry may cost a Raid Ticket - never touched.
+task.spawn(function()
+	while alive and G.SB2ForgeToolsToken == token do
+		task.wait(2)
+		pcall(function()
+			if not settings.autoAbyss or workspace:GetAttribute('AbyssRun') ~= true then
+				return
+			end
+			local rr = LocalPlayer.PlayerGui:FindFirstChild('RaidRewards')
+			local btn = rr and rr.Enabled and rr:FindFirstChild('Retry', true)
+			if not btn or not btn:IsA('GuiButton') or os.clock() - (G.FTAbyssRetryAt or 0) < 6 then
+				return
+			end
+			local q = btn
+			while q and q ~= rr do
+				if q:IsA('GuiObject') and not q.Visible then
+					return
+				end
+				q = q.Parent
+			end
+			for _, t in ipairs(btn:GetDescendants()) do
+				if t:IsA('TextLabel') and string.find(t.Text, 'Restarting', 1, true) then
+					return -- (already pressed)
+				end
+			end
+			G.FTAbyssRetryAt = os.clock()
+			setStatus('abyss: defeated - pressing Retry (from the checkpoint)')
+			for _, c in ipairs(getconnections(btn.Activated)) do
+				pcall(function()
+					c:Fire()
+				end)
+			end
+			G.FTAbyssRetries = (G.FTAbyssRetries or 0) + 1
+		end)
+	end
+end)
+
 local function mainLoop(myGen)
 	while alive and G.SB2ForgeToolsToken == token and loopGen == myGen do
 		local ok, err = pcall(function()
@@ -9487,10 +11407,61 @@ local function mainLoop(myGen)
 				QS.wantMobs = true
 				if #mobList() > 0 then
 					fightOnce()
+				elseif (function()
+					-- (v251) no mob within 800 studs but the floor's mobs are alive further off: we are off the
+					-- floor. Back to the middle of the level they stand on (the level, not a mob's position).
+					G.FTAbyssAll = true
+					local okL, far = pcall(mobList)
+					G.FTAbyssAll = nil
+					local e1 = okL and far[1]
+					local rl = workspace:FindFirstChild('RaidLevels')
+					if not e1 or not rl then
+						return false
+					end
+					local best, bd
+					for _, l in ipairs(rl:GetChildren()) do
+						local okP, pv = pcall(function()
+							return l:GetPivot().Position
+						end)
+						local dd = okP and (pv - e1.r.Position).Magnitude
+						if dd and dd < 600 and (not bd or dd < bd) then
+							best, bd = pv, dd
+						end
+					end
+					if not best then
+						return false
+					end
+					setStatus('abyss: off the floor - going back to it')
+					G.FTAbyssBack = true
+					pcall(tweenTo, CFrame.new(best + Vector3.new(0, 8, 0)))
+					G.FTAbyssBack = nil
+					return true
+				end)() then
+					task.wait(0.2)
 				else
 					setStatus('abyss: waiting for the next floor')
 					task.wait(0.5)
 				end
+				return
+			end
+			if Raid.step() then
+				return
+			end
+			if Craft.step() then
+				return
+			end
+			if Quest.pickPlan and Quest.pickPlan() then
+				return
+			end
+			if type(G.FTForgeRecipe) == 'table' then
+				local okF = forgeOnce()
+				G.FTForgeResult = { ok = okF, status = _statusText, at = os.time() }
+				return
+			end
+			if Dps.step() then
+				return
+			end
+			if Pickup.step() then
 				return
 			end
 			if Abyss.step() then
@@ -9513,7 +11484,7 @@ local function mainLoop(myGen)
 					fightOnce(sp)
 					local _, _, h2 = char()
 					if not h2 or h2.Health <= 0 then
-						huntSkip[sp.key] = os.clock() + 900
+						huntSkip[sp.key] = 0 -- (v246: was a 15 minute skip after it killed us)
 						statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('%s killed us — leaving that kind alone for 15 minutes'):format(sp.key)
 					elseif sp.m.Parent and sp.h.Health > 0 and h2.Health / math.max(1, h2.MaxHealth) < 0.4 then
 						-- backed out hurt: get clear of it, and it waits until we are back over 60%
@@ -9542,9 +11513,33 @@ local function mainLoop(myGen)
 				sellOres()
 			elseif Quest.gearSellNeeded() then
 				Quest.sellGear()
+			elseif G.FTCamp and type(G.FTCampStay) == 'table' and G.FTCampStay[tostring(G.FTCampFor)] and not (farm == 'mine' and craftWant() and craftRockUp()) then
+				-- (v235, asked for: wait where the quest's mob lives instead of mining around it, in case
+				-- the game only respawns a zone's mobs while someone stands in that zone)
+				-- (v239: this used to come after "fight anything", so with Auto mobs on it walked 1,000
+				-- studs off to the apes. Now only mobs within 220 studs of the waiting spot are fought.)
+				local _, hc = char()
+				local nearE
+				if farm == 'mobs' or settings.autoMobs then
+					for _, e in ipairs(mobList()) do
+						if e.r and (e.r.Position - G.FTCamp).Magnitude <= 220 then
+							nearE = e
+							break
+						end
+					end
+				end
+				if nearE then
+					fightOnce(nearE)
+				elseif hc and (hc.Position - G.FTCamp).Magnitude > 25 then
+					setStatus(('going to wait where %s lives'):format(tostring(G.FTCampFor)))
+					tweenTo(CFrame.new(G.FTCamp + Vector3.new(0, 3, 0)))
+				else
+					setStatus(('waiting here for %s to respawn'):format(tostring(G.FTCampFor)))
+					task.wait(1)
+				end
 			elseif farm == 'mobs' and #mobList() > 0 then
 				fightOnce()
-			elseif farm == 'mine' or (farm == 'mobs' and (settings.autoMine or QS.wantMine)) then
+			elseif farm == 'mine' or (farm == 'mobs' and (settings.autoMine or QS.wantMine or craftWant())) then
 				if not mineOnce() then
 					task.wait(1)
 				end
