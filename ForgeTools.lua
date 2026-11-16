@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v264'
+local BUILD = 'forge-tools-v268'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -5585,6 +5585,12 @@ Block.dodge = dodgeFrom
 local function kiteLow()
 	local _, _, hum = char()
 	local k = tonumber(settings.kiteHp) or 0
+	-- (v268, seen live in a raid: it backed off at 49%, was chipped from range the whole time, never
+	-- got back to 75% and stood off for minutes while the raid waited. A back-off that did not get
+	-- there in 20 s is over; for the next 25 s only half the threshold sends it off again.)
+	if os.clock() < (G.FTKiteHold or 0) then
+		k = k / 2
+	end
 	return k > 0 and hum ~= nil and hum.MaxHealth > 0 and hum.Health > 0 and hum.Health / hum.MaxHealth * 100 < k
 end
 local function kiteHeal()
@@ -5592,13 +5598,16 @@ local function kiteHeal()
 	local _, _, hum0 = char()
 	local from = hum0 and hum0.MaxHealth > 0 and hum0.Health / hum0.MaxHealth * 100 or 0
 	local goal = math.clamp(tonumber(settings.healTo) or 60, math.min((tonumber(settings.kiteHp) or 40) + 25, 95), 100)
-	while alive and os.clock() - t0 < 45 do
+	local reached = false
+	while alive and os.clock() - t0 < 20 do
 		local _, hrp, hum = char()
 		if not hrp or not hum or hum.Health <= 0 then
+			reached = true
 			break
 		end
 		local pct = hum.Health / hum.MaxHealth * 100
 		if pct >= goal then
+			reached = true
 			break
 		end
 		local sum, wsum, n, nearD = Vector3.zero, 0, 0, nil
@@ -5640,6 +5649,10 @@ local function kiteHeal()
 			end
 		end
 		task.wait(0.05)
+	end
+	if not reached then
+		G.FTKiteHold = os.clock() + 25
+		G.FTKiteGaveUp = (G.FTKiteGaveUp or 0) + 1
 	end
 	local _, _, hum1 = char()
 	G.FTKite = G.FTKite or { n = 0, hops = 0, died = 0 }
@@ -8350,6 +8363,84 @@ do
 							end
 						elseif t == 'Extra' then
 							local desc = q.Objectives and q.Objectives[pi] and q.Objectives[pi].Description
+							-- (v265, asked for: "Breaking the Spirit Seals - 3". Each seal is a model in workspace named
+							-- like the step's target (SpiritSeal1..3), with a rock-style health bar and no prompt: it is
+							-- hit until it breaks. Go stand beside it and swing - pickaxe first, weapon if the bar does
+							-- not move - and write down what the bar did.)
+							local sealM = type(target) == 'string' and string.match(target, '^SpiritSeal%d+$') and workspace:FindFirstChild(target)
+							local sealP = sealM and (sealM:FindFirstChild('Spirit Seal') or sealM:FindFirstChildWhichIsA('BasePart', true))
+							if sealP then
+								local function barText()
+									local l = sealP:FindFirstChild('rockHP', true)
+									return l and l:IsA('TextLabel') and l.Text or '?'
+								end
+								local function stepDone()
+									local p2 = qd.Progress and qd.Progress[pi]
+									return (p2 and (tonumber(p2.currentProgress) or 0) >= (tonumber(p2.requiredAmount) or 1)) or not sealP.Parent
+								end
+								G.FTSealLog = G.FTSealLog or {}
+								local function note(msg)
+									local line = os.date('%H:%M:%S ') .. target .. ': ' .. msg
+									statusLog[#statusLog + 1] = line
+									if #G.FTSealLog < 60 then
+										G.FTSealLog[#G.FTSealLog + 1] = line
+									end
+								end
+								local _, hS = char()
+								if not hS then
+									return true
+								end
+								local base = Vector3.new(sealP.Position.X, sealP.Position.Y - sealP.Size.Y / 2 + 3, sealP.Position.Z)
+							-- (v266, seen live: the pickaxe took Seal I from 60,000 to 29,749 in 34 s, then a Spirit Golem
+							-- guarding it shot us off the spot every few seconds and nothing more landed. Whatever is
+							-- within 80 studs of the seal is killed first.)
+							local function guard()
+								local nG, lG = mobsNear(base, 80)
+								return nG > 0 and lG[1] or nil
+							end
+							local gd = (hS.Position - base).Magnitude < 150 and guard()
+							if gd then
+								setStatus(('clearing %s away from %s'):format(gd.m.Name, target))
+								fightOnce(gd)
+								return true
+							end
+								if (hS.Position - base).Magnitude > 9 then
+									setStatus('going to ' .. target)
+									local dir = (hS.Position - base) * Vector3.new(1, 0, 1)
+									dir = dir.Magnitude > 1 and dir.Unit or Vector3.new(0, 0, 1)
+									if not tweenTo(CFrame.new(base + dir * 5)) then
+										note('could not get there')
+										task.wait(3)
+										return true
+									end
+								end
+								for _, toolName in ipairs({ 'Pickaxe', 'Weapon' }) do
+									local tool = equip(toolName)
+									local b0, t0, moved = barText(), os.clock(), false
+									while alive and tool and not stepDone() and os.clock() - t0 < (moved and 90 or 10) do
+										local _, hh = char()
+										if not hh then
+											break
+										end
+										if (hh.Position - base).Magnitude > 9 or guard() then
+											break
+										end
+										hh.CFrame = CFrame.lookAt(hh.Position, Vector3.new(sealP.Position.X, hh.Position.Y, sealP.Position.Z))
+										setStatus(('breaking %s with the %s (%s)'):format(target, toolName, barText()))
+										swing(tool)
+										task.wait(0.35)
+										if barText() ~= b0 then
+											moved = true
+										end
+									end
+									note(('%s: bar %s -> %s, step done %s'):format(toolName, b0, barText(), tostring(stepDone())))
+									if stepDone() or moved then
+										break
+									end
+								end
+								task.wait(0.5)
+								return true
+							end
 							-- (v229, measured on "Cleansing the Holy Tree - 1": its last step "Return to the Shogun's
 							-- Spirit" is marked TurnInOnly. The bot walked to him for it while the kills were still
 							-- short, got nothing, and was then backing off when the kills were finally done.
@@ -11400,6 +11491,19 @@ local function mainLoop(myGen)
 			if FC and FC.ForgeActive and not settings.autoForge and not questForgeType() then
 				setStatus('forge open')
 				task.wait(0.5)
+				return
+			end
+			if game.PlaceId == 84980181568016 and workspace:GetAttribute('RaidRunStartedAt') and workspace:GetAttribute('AbyssRun') ~= true then
+				-- (v267, seen live: a raid the user asked for was started with "Auto mobs" off, and inside
+				-- it stood there "no rocks to mine" with five zombies around. A raid is only ever entered
+				-- on purpose, and there is nothing else to do in one: fight.)
+				QS.wantMobs = true
+				if #mobList() > 0 then
+					fightOnce()
+				else
+					setStatus('raid: waiting for the next mobs')
+					task.wait(0.3)
+				end
 				return
 			end
 			if settings.autoAbyss and Abyss.inRun() then
