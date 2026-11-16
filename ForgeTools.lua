@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v271'
+local BUILD = 'forge-tools-v274'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -291,8 +291,22 @@ local function dropTarget()
 	-- any mob at all instead of moving on to the Pale Onis)
 	local living = workspace:FindFirstChild('Living')
 	local first
+	-- (v272, asked for: farm Weapon Molds for the Moon Crescent Spear. A mold is not an ore: it is
+	-- an entry { Name, Quantity } in Inventory.Misc, so it was always counted as 0 held.)
+	local function held(name)
+		local nOre = tonumber(inv[name])
+		if nOre then
+			return nOre
+		end
+		for _, it in pairs(type(inv.Misc) == 'table' and inv.Misc or {}) do
+			if type(it) == 'table' and it.Name == name then
+				return tonumber(it.Quantity) or 0
+			end
+		end
+		return 0
+	end
 	for _, e in ipairs(need) do
-		if type(e) == 'table' and (tonumber(inv[e.ore]) or 0) < (tonumber(e.n) or 0) then
+		if type(e) == 'table' and held(e.ore) < (tonumber(e.n) or 0) then
 			first = first or e.mob
 			for _, m in ipairs(living and living:GetChildren() or {}) do
 				if string.sub(m.Name, 1, #e.mob) == e.mob and m:GetAttribute('IsNpc') then
@@ -2377,7 +2391,12 @@ local function rockList()
 		end
 	end
 	for _, zone in ipairs(rocks:GetChildren()) do
-		if (settings.mineZone == 'Any' or settings.mineZone == zone.Name) and os.clock() >= (zoneBlocked[zone.Name] or 0) then
+		-- (v273, asked for: "its going to an area thats not been unlocked ... do the quests avoiding
+		-- the blocked off area". On Island 2 it was after the Basalt Rocks in the Goblin Cave, which is
+		-- shut until its quest is done, and bounced off it for minutes. That zone is left out unless
+		-- G.FTZoneOpen[zone] is set; the user's own zone pick still wins.)
+		local shut = zone.Name == 'Island2GoblinCave' and not (type(G.FTZoneOpen) == 'table' and G.FTZoneOpen[zone.Name]) and settings.mineZone ~= zone.Name
+		if not shut and (settings.mineZone == 'Any' or settings.mineZone == zone.Name) and os.clock() >= (zoneBlocked[zone.Name] or 0) then
 			for _, sp in ipairs(zone:GetChildren()) do
 				local m = sp:FindFirstChildWhichIsA('Model')
 				local hb = m and m:FindFirstChild('Hitbox')
@@ -5371,6 +5390,13 @@ do
 				end
 			end
 			pcall(watchHealth)
+			if #blockConns > 400 then
+				for i = #blockConns, 1, -1 do
+					if not blockConns[i].Connected then
+						table.remove(blockConns, i)
+					end
+				end
+			end
 			task.wait(2)
 		end
 	end)
@@ -5712,15 +5738,22 @@ end
 -- 75-100 studs/s, and an area attack first shows a "GroundIndicator" / "rangeIndicator" marker on
 -- the floor for about a second. So: anything in Debris that starts away from us and is flying at
 -- us gets side-stepped, and we never stay standing inside a marker.
-local Hazard = { seen = {}, n = { proj = 0, ground = 0 }, last = 0 }
+local Hazard = { seen = {}, n = { proj = 0, ground = 0 }, last = 0, count = 0,
+	skipName = { Parry = true, Block = true, BlockHit = true, Shieldd = true, M1Slash = true, M2Slash = true, Effect = true, Head = true, HumanoidRootPart = true, Rig = true, lightningDebris = true, Dust1 = true } }
 G.FTHazard = Hazard.n
 pcall(function()
 	if G.FTHazardConn then
 		G.FTHazardConn:Disconnect()
 	end
 	G.FTHazardConn = workspace:WaitForChild('Debris', 10).ChildAdded:Connect(function(x)
-		if x:IsA('BasePart') or x:IsA('Model') then
+		-- (v274, reported: "ping keeps getting higher" with Auto mobs on in the Abyss. Every effect
+		-- the game drops into Debris was tracked here for 6 s and looked at every frame - in an Abyss
+		-- crowd that is hundreds of parts, and it grows with the floor. Now: our own guard / slash
+		-- effects are not tracked at all, nothing is kept past 3 s (a shot flies 0.3 s; a floor marker
+		-- shows for about 1 s), and never more than 250 at once.)
+		if (x:IsA('BasePart') or x:IsA('Model')) and not Hazard.skipName[x.Name] and (Hazard.count or 0) < 250 then
 			Hazard.seen[x] = { t = os.clock() }
+			Hazard.count = (Hazard.count or 0) + 1
 		end
 		if x.Name == 'ChargeIndicator' and x:IsA('BasePart') then
 			-- (v261, asked for: the beam. Traced: a flat strip "ChargeIndicator", 7 studs wide and 30-70
@@ -5887,8 +5920,9 @@ function Hazard.step()
 	Hazard.strafe(hrp, now)
 	me = hrp.Position
 	for x, e in pairs(Hazard.seen) do
-		if not x.Parent or now - e.t > 6 then
+		if not x.Parent or now - e.t > 3 then
 			Hazard.seen[x] = nil
+			Hazard.count = math.max(0, (Hazard.count or 1) - 1)
 		elseif x.Name == 'GroundIndicator' or x.Name == 'rangeIndicator' then
 			if now - Hazard.last > 0.3 then
 				local ok, cf, size = pcall(function()
@@ -5995,7 +6029,17 @@ task.spawn(function()
 		end
 		if not forging and (next(Hazard.seen) or next(attackWarn)) and (settings.autoMine or settings.autoMobs or settings.autoAbyss
 			or settings.autoCompleteQuests or QS.wantMobs or QS.wantMine) then
+			local tH = os.clock()
 			pcall(Hazard.step)
+			local PF = G.FTPerf or { ms = 0, at = os.clock(), msPerSec = 0, peak = 0, seenPeak = 0 }
+			G.FTPerf = PF
+			PF.ms += (os.clock() - tH) * 1000
+			PF.seenPeak = math.max(PF.seenPeak, Hazard.count or 0)
+			if os.clock() - PF.at >= 1 then
+				PF.msPerSec = PF.ms / (os.clock() - PF.at)
+				PF.peak = math.max(PF.peak, PF.msPerSec)
+				PF.ms, PF.at = 0, os.clock()
+			end
 		end
 	end
 end)
@@ -8082,6 +8126,13 @@ do
 					if not up and typeof(at) == 'Vector3' then
 						G.FTCamp = at
 						G.FTCampFor = e.mob
+					end
+					if up then
+						-- (v272: a wanted drop's mob is alive - fight it, also with "Auto mobs" off)
+						QS.wantMobs = true
+						QS.mobTarget = e.mob
+						G.FTDropFight = (G.FTDropFight or 0) + 1
+						return false
 					end
 					break
 				end
