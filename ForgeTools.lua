@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v268'
+local BUILD = 'forge-tools-v271'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -5060,7 +5060,11 @@ do
 		local farK
 		local dS = (r.Position - hrp.Position).Magnitude
 		if dS > 16 then
-			if dS > 130 then
+			-- (v269, seen live in a raid: with 14 mobs around, every shine from 16-40 studs away was being
+			-- answered too - a guard raised for attacks that cannot reach us, and every one of them also
+			-- held our own sword back: 3 swings in 15 s. Only true long-range attacks (40+ studs, the
+			-- golem beam) are answered; 16-40 is ignored again, as it was before v260.)
+			if dS > 130 or dS <= 40 then
 				return
 			end
 			farK = baseName(m.Name) .. (dS > 40 and ' @long' or ' @far')
@@ -5379,7 +5383,7 @@ do
 			-- (v205: since the block cancels a swing, a swing only has to be held back when it could not
 			-- reach its own hitbox - about 0.35 s after the press - before the block has to go up)
 			local H1 = Block.hits[1]
-			if (H1 ~= nil and H1 - now < 0.82 and H1 - now > -0.1) or (d ~= nil and d - now < 0.47 and d - now > -0.1) then
+			if (H1 ~= nil and H1 - now < (tonumber(G.FTSwingHold) or 0.82) and H1 - now > -0.1) or (d ~= nil and d - now < 0.47 and d - now > -0.1) then
 				return true
 			end
 			-- (v211: a follow-up shine is expected at P. A swing sent now must either be over before the
@@ -5674,7 +5678,10 @@ task.spawn(function()
 		task.wait(0.04)
 		local c, hrp, hum = char()
 		local st = c and c:FindFirstChild('Status')
-		if st and hrp and hum and hum.Health > 0 and st:FindFirstChild('Stun') and combatStyle() ~= 'Attack only'
+		-- (v271: OFF unless G.FTStunEscape is set. Seen live in a raid: a stun every 3-6 s, each one
+		-- a 30 stud hop out of the crowd - it was never in reach to parry or swing: 0-7 swings per 30 s.
+		-- "whys it dodging and not parrying .... its also not swinging")
+		if G.FTStunEscape == true and st and hrp and hum and hum.Health > 0 and st:FindFirstChild('Stun') and combatStyle() ~= 'Attack only'
 			and os.clock() - lastHop >= 0.3 then
 			local _, near = mobsNear(hrp.Position, 20)
 			if near and #near > 0 then
