@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v313'
+local BUILD = 'forge-tools-v317'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -1770,6 +1770,22 @@ local function tweenTo(cf, opts)
 end
 tweenToFwd = tweenTo
 
+-- (v316, the user in the Abyss: "gotta be careful of these go below the ramp". Measured: a Chuthlu
+-- 8 studs below us under a plank ramp, 4 studs across; the spot on our side was inside the ramp, the
+-- game pushed us up onto it and every swing hit the planks - its health did not move in 11 s. A spot
+-- now needs a clear line to the mob and a floor under it at the mob's height; if ours has neither,
+-- the nearest of 8 spots around the mob that does is used.)
+local standRp = RaycastParams.new()
+standRp.FilterType = Enum.RaycastFilterType.Exclude
+standRp.RespectCanCollide = true
+local function standClear(p, pos)
+	standRp.FilterDescendantsInstances = { LocalPlayer.Character, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+	if workspace:Raycast(p, pos - p, standRp) then
+		return false -- (a wall / ramp between the mob and the spot)
+	end
+	local fl = workspace:Raycast(pos + Vector3.new(0, 1, 0), Vector3.new(0, -9, 0), standRp)
+	return fl ~= nil
+end
 local function standNear(part, gap)
 	local _, hrp = char()
 	local p = part.Position
@@ -1777,6 +1793,26 @@ local function standNear(part, gap)
 	dir = dir.Magnitude > 0.1 and dir.Unit or Vector3.new(1, 0, 0)
 	local r = math.max(part.Size.X, part.Size.Z) / 2 + (gap or 2)
 	local pos = p + dir * r
+	local okC, clear = pcall(standClear, p, pos)
+	if okC and not clear then
+		local best, bd
+		local base = math.atan2(dir.Z, dir.X)
+		for i = 1, 7 do
+			local a = base + (math.ceil(i / 2) * (i % 2 == 0 and -1 or 1)) * math.pi / 4
+			local c = p + Vector3.new(math.cos(a), 0, math.sin(a)) * r
+			local okS, cl = pcall(standClear, p, c)
+			if okS and cl then
+				local d = hrp and (c - hrp.Position).Magnitude or 0
+				if not bd or d < bd then
+					best, bd = c, d
+				end
+			end
+		end
+		if best then
+			pos = best
+			G.FTStandMoved = (G.FTStandMoved or 0) + 1
+		end
+	end
 	return CFrame.lookAt(pos, Vector3.new(p.X, pos.Y, p.Z))
 end
 
@@ -6877,6 +6913,26 @@ local function fightOnce(forced)
 			end
 		end
 		local inRange = hrp and (hrp.Position - target.r.Position).Magnitude <= reach - 1 + math.max(target.r.Size.X, target.r.Size.Z) / 2
+		-- (v317, seen live in the Abyss: a Chuthlu under a plank ramp, 8 studs straight below us, counted
+		-- as "in range" for reach 11 - 80 swings into the planks, all missed, its health never moved.
+		-- In range now also needs the mob at about our height and nothing solid between us.)
+		if inRange and hrp then
+			local dy = math.abs(hrp.Position.Y - target.r.Position.Y)
+			local blocked = false
+			if dy > 2.5 then
+				pcall(function()
+					local rpR = RaycastParams.new()
+					rpR.FilterType = Enum.RaycastFilterType.Exclude
+					rpR.RespectCanCollide = true
+					rpR.FilterDescendantsInstances = { LocalPlayer.Character, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+					blocked = workspace:Raycast(hrp.Position, target.r.Position - hrp.Position, rpR) ~= nil
+				end)
+			end
+			if blocked or dy > 6 + target.r.Size.Y / 2 then
+				inRange = false
+				G.FTOutOfReachY = (G.FTOutOfReachY or 0) + 1
+			end
+		end
 		local striking = hitRun and strikeAt and now >= strikeAt - STRIKE_LEAD and now <= strikeEnd
 		if striking and hrp and (forcedStrike or ((strikeSafe(reach, 0) or (now <= strikeEnd - 0.05 and strikeSafe(reach, 0, 0.08))) and not (rem and rem > 0 and rem < 0.25))) then
 			-- Our hitbox is (about to be) out and no hit is landing on us: be on the mob for it.
@@ -9640,6 +9696,14 @@ do
 	--   Best overall: rarest, then damage. Damage / Survival: that kind first. Loot: reward cards.
 	--   Cursed cards (Greed, Glass Cannon...) are skipped unless "Allow cursed cards" is on.
 	local RANK = { Abyssal = 60, Fusion = 50, Epic = 40, Rare = 30, Common = 10, Cursed = 35 }
+	local CURSE_RANK = {
+		TunnelVision = 60, -- +15% crit chance, -15% move speed (barely matters standing in a fight)
+		GlassCannon = 50, -- +50% damage, -25% max health
+		DeepPact = 40, -- +80% damage, enemies 30% stronger
+		Berserker = 30, -- +40% damage, -50% healing (halves the regen the armour is built on)
+		Bloodlust = 20, -- +30% attack speed, take 15% more damage
+		FragileFortune = 10, -- +60% crit damage, take 20% more damage
+	}
 	local function cardScore(card)
 		if type(card) ~= 'table' then
 			return -1
@@ -9660,7 +9724,10 @@ do
 		end
 		if not greed and (card.Cost ~= nil or card.Enemy ~= nil or card.Rarity == 'Cursed'
 			or text:find('more damage') or text:find('stronger') or text:find('%-%d')) then
-			return -1000
+			-- (v315, the user: "if theres 3 curses pick the least bad option, the one that doesnt reduce
+			-- damage preferably". None of the game's downside cards lowers our damage; ranked by what the
+			-- cost does to a bot that stands and fights on a regen build. Still below every good card.)
+			return -1000 + (CURSE_RANK[card.Id] or 0)
 		end
 		local score = RANK[tostring(card.Rarity)] or 5
 		if greed then
@@ -9708,42 +9775,74 @@ do
 				G.FTAbyssDeck = deck
 			end
 		end)
-		G.FTAbyssCardConn = AS.CardOffer:Connect(function(offer)
-			if not (settings.autoCards or settings.autoAbyss) or type(offer) ~= 'table' or type(offer.Cards) ~= 'table' then
-				return
-			end
+		-- (v314, a friend's report: "If there's 3 curses the script skips it too much, then proceed to go to
+		-- the other floor without properly waiting for it, causing the lag". Before: every offer event ran
+		-- its own handler at once (a reroll can send a fresh offer, so handlers stacked and rerolled /
+		-- skipped over each other), every bad slot was rerolled even when a good card was already there,
+		-- and the bot ran on to the next floor while the menu was still open. Now: one offer at a time,
+		-- reroll only while there is nothing worth taking, wait for each answer, and the fight loop holds
+		-- (G.FTAbyssCardBusy) until the pick or skip has gone through.)
+		local busy, latest = false, nil
+		local function handle(offer)
 			local offeredAt = os.clock()
+			G.FTAbyssCardBusy = offeredAt
 			task.wait(1)
-			-- Reroll every card that has a downside (3 rerolls per slot), then take the best one.
+			if latest and latest ~= offer and type(latest.Cards) == 'table' then
+				offer = latest -- (a newer offer came in while we waited: use that one)
+			end
 			local cards = table.clone(offer.Cards)
-			for slot = 1, #cards do
-				for _ = 1, 3 do
-					if os.clock() - offeredAt > 9 then
-						break
-					end
-					if cardScore(A and A.GetCard and A.GetCard(cards[slot])) > -800 then -- (downside or already maxed: reroll)
-						break
-					end
-					local ok, a, b, c = pcall(function()
-						return AS:RerollCards(slot):await()
-					end)
-					local newId = ok and a and b and c or nil
-					if newId == nil then
-						break -- out of rerolls
-					end
-					cards[slot] = newId
-					task.wait(0.3)
-				end
+			local function scoreOf(id)
+				return cardScore(A and A.GetCard and A.GetCard(id))
 			end
 			local best, bestScore = pickFrom({ Cards = cards })
+			-- Reroll only while nothing is worth taking: the worst slot first, one call at a time.
+			local rerolls = 0
+			while best ~= nil and bestScore <= -800 and rerolls < 9 and os.clock() - offeredAt < 8 do
+				local worst, ws
+				for slot = 1, #cards do
+					local sc = scoreOf(cards[slot])
+					if (G.FTCardRerollsLeft and G.FTCardRerollsLeft[slot] == 0) then
+						sc = 1e9 -- (this slot is out of rerolls)
+					end
+					if not ws or sc < ws then
+						worst, ws = slot, sc
+					end
+				end
+				if not worst or ws >= 1e9 then
+					break
+				end
+				local ok, r1, r2, r3 = pcall(function()
+					return AS:RerollCards(worst):await()
+				end)
+				local newId = ok and r1 and r2 and r3 or nil
+				rerolls += 1
+				if newId == nil then
+					G.FTCardRerollsLeft = G.FTCardRerollsLeft or {}
+					G.FTCardRerollsLeft[worst] = 0
+				else
+					cards[worst] = newId
+				end
+				best, bestScore = pickFrom({ Cards = cards })
+				task.wait(0.4)
+			end
+			G.FTCardRerollsLeft = nil
 			if best == nil then
 				return
 			end
-			if bestScore <= -1000 then
-				pcall(function()
+			if bestScore <= -1000 and not (A and A.GetCard and A.GetCard(best) and CURSE_RANK[A.GetCard(best).Id]) then
+				setStatus('abyss: only cards with downsides - skipping')
+				local okS = pcall(function()
 					AS:SkipCards():await()
 				end)
-				setStatus('abyss: only cards with downsides — skipped')
+				G.FTAbyssSkips = (G.FTAbyssSkips or 0) + 1
+				-- (wait for the menu to really close before moving on: a skip answer can take a while
+				-- on a slow connection)
+				local ping = 0.2
+				pcall(function()
+					ping = LocalPlayer:GetNetworkPing()
+				end)
+				task.wait(math.clamp(1 + ping * 3, 1, 4))
+				setStatus(okS and 'abyss: only cards with downsides - skipped' or 'abyss: skip failed')
 				return
 			end
 			local card = A and A.GetCard and A.GetCard(best)
@@ -9752,12 +9851,30 @@ do
 				pcall(function()
 					AS:PickCard(best)
 				end)
-				task.wait(1.2)
+				local t1 = os.clock()
+				while os.clock() - t1 < 1.5 and not (lastPicked and lastPicked >= offeredAt) do
+					task.wait(0.1)
+				end
 				if lastPicked and lastPicked >= offeredAt then
 					break
 				end
 			end
 			setStatus('abyss: took ' .. tostring(card and card.Name or best))
+		end
+		G.FTAbyssCardConn = AS.CardOffer:Connect(function(offer)
+			if not (settings.autoCards or settings.autoAbyss) or type(offer) ~= 'table' or type(offer.Cards) ~= 'table' then
+				return
+			end
+			latest = offer
+			if busy then
+				return -- (one handler at a time; it picks up the newest offer)
+			end
+			busy = true
+			task.spawn(function()
+				pcall(handle, offer)
+				busy = false
+				G.FTAbyssCardBusy = nil
+			end)
 		end)
 	end)
 
@@ -12404,6 +12521,12 @@ local function mainLoop(myGen)
 			end
 			if settings.autoAbyss and Abyss.inRun() then
 				-- In the Abyss: just fight (no quests / forging in there).
+				-- (v314: hold still while a card is being picked or skipped - at most 15 s)
+				if G.FTAbyssCardBusy and os.clock() - G.FTAbyssCardBusy < 15 then
+					setStatus('abyss: choosing a card')
+					task.wait(0.2)
+					return
+				end
 				QS.wantMobs = true
 				if #mobList() > 0 then
 					fightOnce()
