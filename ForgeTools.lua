@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v317'
+local BUILD = 'forge-tools-v320'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -5824,7 +5824,7 @@ end
 local dodgeParams = RaycastParams.new()
 dodgeParams.FilterType = Enum.RaycastFilterType.Exclude
 local function dodgeOnce(fromPos, distOverride)
-	if G.FTNoDodge then
+	if (G.FTNoDodge or settings.dodgeWhat == 'Low health only') and not G.FTKiting then
 		return false -- (v299, asked for while testing parries: no stepping out at all)
 	end
 	local c, hrp = char()
@@ -5900,7 +5900,7 @@ local function dodgeFrom(fromPos, distOverride)
 		local k = tostring(okL and ln or '?')
 		by[k] = (by[k] or 0) + 1
 	end
-	if combatStyle() == 'Attack only' or G.FTNoDodge then
+	if combatStyle() == 'Attack only' or ((G.FTNoDodge or settings.dodgeWhat == 'Low health only') and not G.FTKiting) then
 		return false -- (v236, asked for: no dodging, no blocking, just stand in reach and swing)
 	end
 	if dodgeOnce(fromPos, distOverride) then
@@ -5933,6 +5933,60 @@ local function kiteHeal()
 	local from = hum0 and hum0.MaxHealth > 0 and hum0.Health / hum0.MaxHealth * 100 or 0
 	local goal = math.clamp(tonumber(settings.healTo) or 60, math.min((tonumber(settings.kiteHp) or 40) + 25, 95), 100)
 	local reached = false
+	G.FTKiting = true -- (v320: the only stepping allowed under Dodge = Low health only)
+	-- (v319, asked for: "low level dodge can get cornered". Stepping straight away from the mobs ends
+	-- against a wall or an edge. Now the ordinary step looks at 32 spots 22 and 36 studs out, all round,
+	-- and takes the one farthest from every mob with the fewest walls next to it - jumping past the
+	-- mobs if the open side is behind them.)
+	local rpK = RaycastParams.new()
+	rpK.FilterType = Enum.RaycastFilterType.Exclude
+	rpK.RespectCanCollide = true
+	local function openStep(hrp, mobsP)
+		if G.FTNoDodge or combatStyle() == 'Attack only' then
+			return false
+		end
+		rpK.FilterDescendantsInstances = { LocalPlayer.Character, workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+		local function score(pos)
+			local sc = 80
+			for _, mp in ipairs(mobsP) do
+				sc = math.min(sc, (mp - pos).Magnitude)
+			end
+			for k = 0, 3 do
+				local a = k * math.pi / 2
+				if workspace:Raycast(pos, Vector3.new(math.cos(a), 0, math.sin(a)) * 10, rpK) then
+					sc -= 6
+				end
+			end
+			return sc
+		end
+		local here = score(hrp.Position)
+		local best, bs
+		for _, dist in ipairs({ 22, 36 }) do
+			for k = 0, 15 do
+				local a = k * math.pi / 8
+				local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+				if not workspace:Raycast(hrp.Position, dir * dist, rpK) then
+					local tgt = hrp.Position + dir * dist
+					local fl = workspace:Raycast(tgt + Vector3.new(0, 8, 0), Vector3.new(0, -30, 0), rpK)
+					if fl and math.abs(fl.Position.Y + 3 - hrp.Position.Y) < 14 and not Lava.at(fl.Position + Vector3.new(0, 3, 0)) then
+						local pos = fl.Position + Vector3.new(0, 3, 0)
+						local sc = score(pos)
+						if not bs or sc > bs then
+							best, bs = pos, sc
+						end
+					end
+				end
+			end
+		end
+		if best and bs > here + 3 then
+			local fwd = (best - hrp.Position) * Vector3.new(1, 0, 1)
+			hrp.CFrame = CFrame.lookAt(best, best + fwd)
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			G.FTKiteOpen = (G.FTKiteOpen or 0) + 1
+			return true
+		end
+		return false
+	end
 	while alive and os.clock() - t0 < 20 do
 		local _, hrp, hum = char()
 		if not hrp or not hum or hum.Health <= 0 then
@@ -5945,6 +5999,7 @@ local function kiteHeal()
 			break
 		end
 		local sum, wsum, n, nearD = Vector3.zero, 0, 0, nil
+		local mobsP = {}
 		local living = workspace:FindFirstChild('Living')
 		for _, m in ipairs(living and living:GetChildren() or {}) do
 			if m:GetAttribute('IsNpc') then
@@ -5952,6 +6007,9 @@ local function kiteHeal()
 				local r = m:FindFirstChild('HumanoidRootPart') or m.PrimaryPart
 				if h and r and h.Health > 0 and h.MaxHealth < 1e8 then
 					local d = (r.Position - hrp.Position).Magnitude
+					if d < 80 then
+						mobsP[#mobsP + 1] = r.Position
+					end
 					if d < 50 then
 						local wt = 1 / math.max(d, 4)
 						sum += r.Position * wt
@@ -5972,18 +6030,19 @@ local function kiteHeal()
 		local wK = attackThreat(26) or Attack.rangedThreat(30)
 		if wK and os.clock() - lastHop >= 0.2 then
 			lastHop = os.clock()
-			if dodgeFrom(wK, 30) then
+			if dodgeFrom(wK, 30) or openStep(hrp, mobsP) then
 				hops += 1
 				G.FTKiteFast = (G.FTKiteFast or 0) + 1
 			end
 		elseif nearD and nearD < 42 and os.clock() - lastHop >= 0.4 then
 			lastHop = os.clock()
-			if dodgeFrom(sum / wsum, 30) then
+			if openStep(hrp, mobsP) or dodgeFrom(sum / wsum, 30) then
 				hops += 1
 			end
 		end
 		task.wait(0.05)
 	end
+	G.FTKiting = nil
 	if not reached then
 		G.FTKiteHold = os.clock() + 25
 		G.FTKiteGaveUp = (G.FTKiteGaveUp or 0) + 1
@@ -6140,6 +6199,9 @@ end)
 -- from mobs, which can be straight along the line - measured: a 12 stud "dodge" that still let the
 -- shot pass 2.4 studs from us.)
 function Hazard.sidestep(hrp, perp)
+	if (G.FTNoDodge or settings.dodgeWhat == 'Low health only') and not G.FTKiting then
+		return false -- (v320: Dodge = Low health only - no side-steps from shots either)
+	end
 	local c = char()
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Exclude
@@ -6162,7 +6224,7 @@ end
 -- across its line the whole time it is in the air. So while any shooter near us is in its release
 -- window we keep moving - 6 studs every 0.08s - in the direction that crosses ALL their lines best.
 function Hazard.strafe(hrp, now)
-	if now - (Hazard.strafeAt or 0) < 0.08 or now < (G.FTStrikeUntil or 0) then
+	if ((G.FTNoDodge or settings.dodgeWhat == 'Low health only') and not G.FTKiting) or now - (Hazard.strafeAt or 0) < 0.08 or now < (G.FTStrikeUntil or 0) then
 		return
 	end
 	local me = hrp.Position
@@ -6759,6 +6821,22 @@ local function fightOnce(forced)
 		local cd = combat and type(combat.HitCooldown) == 'table' and tonumber(combat.HitCooldown[idx]) or 0.4
 		local ht = combat and type(combat.HitboxTiming) == 'table' and tonumber(combat.HitboxTiming[idx]) or 0.27
 		local hd = combat and type(combat.HitboxDuration) == 'table' and tonumber(combat.HitboxDuration[idx]) or 0.1
+		-- (v318, the user: "this spear can swing really fast due to having picked attack speed cards, its
+		-- only swinging mildly slowly". Measured: Status PercentageAttackHasteBoost 0.025 + the Abyss card's
+		-- PercentageAttackHasteBoost_Abyss 1.15, and the swing animation played at speed 2.175 = 1 + both.
+		-- The data's cooldown / hitbox times are for speed 1: all of them scale by 1 / speed.)
+		local spd = 1
+		pcall(function()
+			local stH = h.Parent and h.Parent:FindFirstChild('Status')
+			for _, x in ipairs(stH and stH:GetChildren() or {}) do
+				if x:IsA('ValueBase') and string.sub(x.Name, 1, 26) == 'PercentageAttackHasteBoost' and tonumber(x.Value) then
+					spd += x.Value
+				end
+			end
+		end)
+		spd = math.clamp(spd, 0.5, 4)
+		G.FTAtkSpeed = spd
+		cd, ht, hd = cd / spd, ht / spd, hd / spd
 		-- (traced at ~300ms round trip: arriving 0.05s before the hitbox on a mob standing still missed
 		-- 3 of 3, standing there from the start hit 8 of 8 - our hop reaches the server late. Leaving can
 		-- be early for the same reason.)
@@ -6817,7 +6895,7 @@ local function fightOnce(forced)
 		Block.swingAt = now
 		lastSwingAt, sentAt = now, now
 		-- (a great axe's swing plays for 1.6s but its cooldown says 1.5: a press in between is dropped)
-		local dur = combat and type(combat.AttackDuration) == 'table' and tonumber(combat.AttackDuration[idx]) or 0
+		local dur = (combat and type(combat.AttackDuration) == 'table' and tonumber(combat.AttackDuration[idx]) or 0) / spd
 		nextSwingAt = now + math.max(cd, dur) + 0.05
 		G.FTSwingDbg = { idx = idx, hits = hits, cd = cd, dur = dur, ht = ht, gap = now - (G.FTSwingDbgAt or now), n = ((G.FTSwingDbg and G.FTSwingDbg.n) or 0) + 1 }
 		G.FTSwingDbgAt = now
@@ -6931,6 +7009,42 @@ local function fightOnce(forced)
 			if blocked or dy > 6 + target.r.Size.Y / 2 then
 				inRange = false
 				G.FTOutOfReachY = (G.FTOutOfReachY or 0) + 1
+			end
+		end
+		-- (v319, seen live in the Abyss: an Abyssal Watcher at the edge of a plank, 9 studs off but at another
+		-- height - "out of reach" by the check above, and every move to it ended on the same plank spot.
+		-- Two hours of parrying it, not one hit, then the floor timer burned us down. Now: a mob within 30
+		-- studs whose health has not moved for 10 s while out of reach gets us placed right beside it at its
+		-- own height; one that still takes nothing for 45 s is left alone for 30 s.)
+		if hrp and target.h and target.r.Parent then
+			G.FTStallBy = G.FTStallBy or setmetatable({}, { __mode = 'k' })
+			local sp = G.FTStallBy[target.m]
+			if not sp or target.h.Health < sp.hp - 1 or now - sp.seen > 5 then
+				sp = { hp = target.h.Health, at = now, hover = sp and now - sp.seen <= 5 and sp.hover or nil }
+				G.FTStallBy[target.m] = sp
+			end
+			sp.seen = now
+			local stall = now - sp.at
+			if not inRange and (stall > 10 or sp.hover) and (hrp.Position - target.r.Position).Magnitude < 30 then
+				local pS = target.r.Position
+				local flatS = (hrp.Position - pS) * Vector3.new(1, 0, 1)
+				flatS = flatS.Magnitude > 0.1 and flatS.Unit or Vector3.new(1, 0, 0)
+				local posS = pS + flatS * (math.max(target.r.Size.X, target.r.Size.Z) / 2 + 2.5)
+				hrp.CFrame = CFrame.lookAt(posS, Vector3.new(pS.X, posS.Y, pS.Z))
+				hrp.AssemblyLinearVelocity = Vector3.zero
+				inRange = true
+				if not sp.hover then
+					sp.hover = true
+					G.FTStallHover = (G.FTStallHover or 0) + 1
+					statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('no damage to %s in 10 s and out of reach - moved beside it at its height'):format(target.m.Name)
+				end
+			end
+			if stall > 45 then
+				mobNoRoute[target.m] = now + 30
+				G.FTStallSkip = (G.FTStallSkip or 0) + 1
+				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('no damage to %s in 45 s - leaving it for 30 s'):format(target.m.Name)
+				G.FTStallBy[target.m] = nil
+				break
 			end
 		end
 		local striking = hitRun and strikeAt and now >= strikeAt - STRIKE_LEAD and now <= strikeEnd
@@ -11359,7 +11473,7 @@ MobBox:AddButton('Forget deadly mobs', function()
 	Deadly.clear()
 	setStatus('deadly list cleared' .. (was ~= '' and (' (was: ' .. was .. ')') or ''))
 end)
-bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything' }, 'Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 25% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
+bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything', 'Low health only' }, 'Low health only: no stepping out of attacks, markers or shots - parries only - except the back-off below "Back off below % health". Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 25% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
 bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Behind + dodge', 'Block / parry', 'Attack only', 'Face tank' }, "Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Behind + dodge: the same, but always comes back in at the mob's back. Block / parry: stands behind the mob and blocks. Attack only: stands behind the mob and swings, never dodges or blocks. Face tank: walks straight up to the mob's face and swings, never moves round it, dodges or blocks (stuns will land). The island boss is always parried in Attack only / Face tank. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)")
 bindSlider(MobBox, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
 bindToggle(MobBox, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
@@ -12510,6 +12624,14 @@ local function mainLoop(myGen)
 				-- (v267, seen live: a raid the user asked for was started with "Auto mobs" off, and inside
 				-- it stood there "no rocks to mine" with five zombies around. A raid is only ever entered
 				-- on purpose, and there is nothing else to do in one: fight.)
+				-- (v320, the user: "i dont even have auto kill enemies on why ... is it teleporting to them".
+				-- Auto kill mobs off = it does not go to them in a raid either; auto parry still runs.)
+				if not settings.autoMobs then
+					QS.wantMobs = false
+					setStatus('raid: Auto kill mobs is off — not moving')
+					task.wait(0.3)
+					return
+				end
 				QS.wantMobs = true
 				if #mobList() > 0 then
 					fightOnce()
