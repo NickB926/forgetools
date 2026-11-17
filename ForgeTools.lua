@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v274'
+local BUILD = 'forge-tools-v298'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -155,6 +155,9 @@ local defaults = {
 	keepTraitOres = false,
 	raidTier = 1,
 	raidRetries = 0,
+	raidTicketMax = 5,
+	raidFarming = false,
+	raidSideMine = false,
 	autoCards = false,
 	cardFocus = 'Best overall',
 	allowCursed = false,
@@ -169,17 +172,23 @@ if settings.combatStyle == 'Float above' then
 end
 -- (v238, asked for: "parry on asura, no parry on normal mobs") the island boss is always fought
 -- with Block / parry when the style is Attack only; everything else uses the style as set.
+-- (v296, asked for: fight modes for mining fights. Two new ones ride on the old ones:
+-- 'Behind + dodge' is Hit & run that hops in behind the mob's back instead of on our side of it;
+-- 'Face tank' is Attack only that walks straight up to the mob's face - no hopping round behind it,
+-- no dodge, no block. Everything else in the code reads them as the style they are built on.)
+local STYLE_BASE = { ['Behind + dodge'] = 'Hit & run', ['Face tank'] = 'Attack only' }
 local function combatStyle()
-	if G.FTBossFight and settings.combatStyle == 'Attack only' then
+	local cs = STYLE_BASE[settings.combatStyle] or settings.combatStyle
+	if G.FTBossFight and cs == 'Attack only' then
 		return 'Block / parry'
 	end
 	-- (v252, asked for: "crowd mode". Measured in the Abyss with 8-10 mobs around: 2.5 attack shines
 	-- a second, 167 of 394 block presses refused, 61 hits in 75 s. A block cannot cover hits that
 	-- close together, so with 5 or more mobs in reach a Block / parry fight is fought as Hit & run.)
-	if G.FTCrowdMode and not G.FTBossFight and settings.combatStyle == 'Block / parry' then
+	if G.FTCrowdMode and not G.FTBossFight and cs == 'Block / parry' then
 		return 'Hit & run'
 	end
-	return settings.combatStyle
+	return cs
 end
 local function save()
 	pcall(writefile, SETTINGS_PATH, HttpService:JSONEncode(settings))
@@ -2394,8 +2403,9 @@ local function rockList()
 		-- (v273, asked for: "its going to an area thats not been unlocked ... do the quests avoiding
 		-- the blocked off area". On Island 2 it was after the Basalt Rocks in the Goblin Cave, which is
 		-- shut until its quest is done, and bounced off it for minutes. That zone is left out unless
-		-- G.FTZoneOpen[zone] is set; the user's own zone pick still wins.)
-		local shut = zone.Name == 'Island2GoblinCave' and not (type(G.FTZoneOpen) == 'table' and G.FTZoneOpen[zone.Name]) and settings.mineZone ~= zone.Name
+		-- G.FTZoneOpen[zone] is set; the user's own zone pick still wins.
+		-- v289: same for any zone named '...Closed' - it stood at Island2CaveLavaClosed's Basalt Vein for minutes.)
+		local shut = (zone.Name == 'Island2GoblinCave' or string.find(zone.Name, 'Closed', 1, true) ~= nil) and not (type(G.FTZoneOpen) == 'table' and G.FTZoneOpen[zone.Name]) and settings.mineZone ~= zone.Name
 		if not shut and (settings.mineZone == 'Any' or settings.mineZone == zone.Name) and os.clock() >= (zoneBlocked[zone.Name] or 0) then
 			for _, sp in ipairs(zone:GetChildren()) do
 				local m = sp:FindFirstChildWhichIsA('Model')
@@ -2436,6 +2446,34 @@ local function rockList()
 	-- the next best kind is the one with the most health below the picked ones (huge > large >
 	-- medium > small), and kinds bigger than the picked ones come last.
 	local sel = type(settings.mineRocks) == 'table' and next(settings.mineRocks) and settings.mineRocks or nil
+	-- (v293, asked: Spirit Rocks only. With "mine only the picked rocks" on, no other kind is mined
+	-- when none of the picked ones is standing - it waits for them instead. Quest rocks still win.)
+	if sel and settings.mineOnlyPicked and not G.FTQuestRock and not G.FTQuestRocks then
+		-- (v294, asked: "shit stopped mining" - every Spirit Rock was mined out and it stood still.
+		-- Zones where a picked rock has stood are remembered; while none is up, it mines the other
+		-- rocks in those zones only, so it stays where the picked ones spawn. No zone known yet: waits.)
+		G.FTPickedZones = G.FTPickedZones or {}
+		local anyPicked = false
+		for _, e in ipairs(list) do
+			if sel[e.m.Name] then
+				anyPicked = true
+				G.FTPickedZones[e.zone] = true
+			end
+		end
+		for _, zone in ipairs(rocks:GetChildren()) do
+			for _, sp in ipairs(zone:GetChildren()) do
+				local m = sp:FindFirstChildWhichIsA('Model')
+				if m and sel[m.Name] then
+					G.FTPickedZones[zone.Name] = true
+				end
+			end
+		end
+		for i = #list, 1, -1 do
+			if not sel[list[i].m.Name] and (anyPicked or not G.FTPickedZones[list[i].zone]) then
+				table.remove(list, i)
+			end
+		end
+	end
 	if sel and not G.FTQuestRock and not G.FTQuestRocks then
 		local ref = 0
 		for _, e in ipairs(list) do
@@ -2581,6 +2619,16 @@ local function mineOnce()
 		local th = threatNow()
 		if not th then
 			return false
+		end
+		-- (v291, asked: "mine spirit rocks ignore mobs". With ignoreMobs on, a mob near the rock is not
+		-- fought: mining goes on. Kinds that have killed us and low health still pull us away, and
+		-- attack markers / projectiles are still stepped out of by the hazard loop.)
+		if settings.ignoreMobs then
+			local _, _, hm = char()
+			local pctI = hm and hm.MaxHealth > 0 and hm.Health / hm.MaxHealth * 100 or 100
+			if not Deadly.avoid(th.m) and pctI >= math.max(40, tonumber(settings.retreatHp) or 0) then
+				return false
+			end
 		end
 		why('threat ' .. tostring(th.m and th.m.Name) .. (' %.0f studs from us'):format(th.d or -1))
 		-- (measured: 10 of 14 rocks were left this way, each for one spider, and the next rock was 100-200
@@ -2774,9 +2822,31 @@ local function mineOnce()
 			if off.Magnitude > half + 16 then
 				why('knocked far away')
 				break -- knocked far away
-			elseif off.Magnitude > half + 2.5 and hum then
+			elseif hum and os.clock() - lastChange > 1.2 and (function()
+				-- (v278: a long rock - a Basalt Vein is 25 by 10 - measured from its middle with its long
+				-- half looked "at the edge" 12.5 studs out on the short side, 7 studs from the stone. After
+				-- 1.2 s of swings that do nothing: walk to the nearest point of the rock's actual box.)
+				local lpos = target.hb.CFrame:PointToObjectSpace(hrp.Position)
+				local sz = target.hb.Size
+				local cx, cz = math.clamp(lpos.X, -sz.X / 2, sz.X / 2), math.clamp(lpos.Z, -sz.Z / 2, sz.Z / 2)
+				local gap = Vector3.new(lpos.X - cx, 0, lpos.Z - cz).Magnitude
+				if gap > 1.6 then
+					local near = target.hb.CFrame:PointToWorldSpace(Vector3.new(cx, lpos.Y, cz))
+					local out = (hrp.Position - near) * Vector3.new(1, 0, 1)
+					local stand = near + (out.Magnitude > 0.1 and out.Unit or Vector3.zero) * 0.8
+					hum:MoveTo(Vector3.new(stand.X, hrp.Position.Y - 3, stand.Z))
+					G.FTRockStepIn = (G.FTRockStepIn or 0) + 1
+					return true
+				end
+				return false
+			end)() then
+				-- (stepping to the box)
+			elseif (off.Magnitude > half + 1.8 or (os.clock() - lastChange > 1.2 and off.Magnitude > half + 0.9)) and hum then
 				-- step in: to the rock's edge, not its middle (walking at the middle climbed onto it)
-				local edge = target.hb.Position + off.Unit * (half + 1.5)
+				-- (v277, reported: "it still misses hitting rocks sometimes". Every "no damage 4s" in the log
+				-- was 2.2-2.4 studs off the edge - just inside the old 2.5 "close enough". Now 1.8, and
+				-- closer still once 1.2 s of swings have done nothing.)
+				local edge = target.hb.Position + off.Unit * (half + (os.clock() - lastChange > 1.2 and 0.6 or 1.2))
 				hum:MoveTo(Vector3.new(edge.X, hrp.Position.Y - 3, edge.Z))
 			end
 		end
@@ -2784,7 +2854,12 @@ local function mineOnce()
 			break
 		end
 		swing(tool)
-		task.wait(0.35)
+		-- (v295, reported: "the mining portion of auto mine is really ass ... not efficient so he left
+		-- autoclicker running". A click every 0.35 s against the pickaxe's own cooldown: any click
+		-- landing inside the cooldown is dropped and the swing waits for the next one, so a cooldown a
+		-- little over 0.35 s gave a swing only every ~0.7 s. Clicked like an autoclicker now; the game
+		-- still swings only as fast as its cooldown allows.)
+		task.wait(0.08)
 	end
 	return true
 end
@@ -3830,7 +3905,13 @@ local function forgeOnce()
 		for _, n in pairs(ores) do
 			total += n
 		end
-		if moldName and total >= moldMin and not rec then
+		if rec and type(rec.mold) == 'string' and (tonumber(rec.molds) or 0) > 0 then
+			-- (v293: a hand-picked recipe can carry its own mold target and count, e.g. the Moon
+			-- Crescent Spear with every Weapon Mold owned; the user okays the chance)
+			local n = math.min(math.floor(tonumber(rec.molds)), Mold.owned(itemType))
+			F.MoldItem, F.MoldCount = rec.mold, n
+			G.FTLastMold = ('%s with %d molds (by hand)'):format(rec.mold, n)
+		elseif moldName and total >= moldMin and not rec then
 			F.MoldItem, F.MoldCount = moldName, moldCount
 			G.FTLastMold = ('%s with %d molds'):format(moldName, moldCount)
 		else
@@ -5596,6 +5677,14 @@ end
 -- back 8 studs does nothing against that: callers ask for enough to end up ~30 studs from the mob.
 -- In a tight cave the long step may not fit, so shorter ones are tried after it.
 local function dodgeFrom(fromPos, distOverride)
+	-- (v276: which rule asked for each dodge, by line, so a "jitter" report can be traced)
+	do
+		local okL, ln = true, debug.info(2, 'l')
+		local by = type(G.FTDodgeBy) == 'table' and G.FTDodgeBy or {}
+		G.FTDodgeBy = by
+		local k = tostring(okL and ln or '?')
+		by[k] = (by[k] or 0) + 1
+	end
 	if combatStyle() == 'Attack only' then
 		return false -- (v236, asked for: no dodging, no blocking, just stand in reach and swing)
 	end
@@ -6062,7 +6151,14 @@ task.spawn(function()
 				if string.find(m.Name, 'Bomber', 1, true) and m:GetAttribute('IsNpc') then
 					local r = mobRoot(m)
 					local h = m:FindFirstChildOfClass('Humanoid')
-					if r and h and h.Health > 0 and (r.Position - hrp.Position).Magnitude < 22 then
+					-- (v277, reported: "some enemy is causing it to jitter back and forth". Measured: 53 of
+					-- these steps in 6 s on one Bomber - this rule stepped 24 studs off it and the fight glided
+					-- straight back in, three times a second. The rule dates from a 116-health character; a
+					-- blast is about 90. The Bomber the bot is fighting is now left to the fight, unless the
+					-- character is still weak enough for one blast to matter.)
+					local fightingIt = _statusText == 'fighting ' .. m.Name or string.sub(_statusText, 1, #m.Name + 10) == 'fighting ' .. m.Name .. ' '
+					if r and h and h.Health > 0 and (r.Position - hrp.Position).Magnitude < 22
+						and hum.MaxHealth < 600 then -- (v279: also while mining - 21 steps in 150 s threw it off its rock; a Bomber is simply fought)
 						dodgeFrom(r.Position, 24)
 						break
 					end
@@ -6373,6 +6469,25 @@ local function fightOnce(forced)
 		-- The hitbox only reaches ~reach studs in front of us: stand well inside it, facing the mob.
 		-- (traced: 4-5 studs off missed 14 swings of 16, 2-3 off hit 9 of 10)
 		local cf = standFor(math.clamp(reach - 3.5, 1.5, 2.3))
+		if settings.combatStyle == 'Behind + dodge' then
+			-- (v296) in at the mob's back: its swing goes out the front, away from us
+			local tpB = target.r.Position
+			local lookB = target.r.CFrame.LookVector * Vector3.new(1, 0, 1)
+			if lookB.Magnitude > 0.1 then
+				local spotB = tpB - lookB.Unit * (math.max(target.r.Size.X, target.r.Size.Z) / 2 + math.clamp(reach - 3.5, 1.5, 2.3))
+				local rpB = RaycastParams.new()
+				rpB.FilterType = Enum.RaycastFilterType.Exclude
+				rpB.RespectCanCollide = true
+				rpB.FilterDescendantsInstances = { (char()), workspace:FindFirstChild('Living'), workspace:FindFirstChild('Debris') }
+				local floorB = workspace:Raycast(spotB + Vector3.new(0, 6, 0), Vector3.new(0, -20, 0), rpB)
+				if floorB and math.abs(floorB.Position.Y + 3 - h.Position.Y) <= 10 and not Lava.at(floorB.Position + Vector3.new(0, 3, 0))
+					and not workspace:Raycast(tpB, spotB - tpB, rpB) then
+					spotB = Vector3.new(spotB.X, floorB.Position.Y + 3, spotB.Z)
+					cf = CFrame.lookAt(spotB, Vector3.new(tpB.X, spotB.Y, tpB.Z))
+					G.FTBehindN = (G.FTBehindN or 0) + 1
+				end
+			end
+		end
 		if Lava.at(groundAt(cf.Position)) then
 			-- that side of the mob is lava: any dry side will do
 			local tp = target.r.Position
@@ -6729,7 +6844,8 @@ local function fightOnce(forced)
 			tool = equip('Weapon')
 		else
 			if hrp then
-				if not hitRun and os.clock() >= regroupAt then
+				local faceTank = settings.combatStyle == 'Face tank' and atkOnly
+				if not hitRun and not faceTank and os.clock() >= regroupAt then
 					regroupAt = os.clock() + 1.5
 					if mobsNear(hrp.Position, 14) >= 3 then
 						local cf = standFor(math.clamp(reach - 3.5, 1.5, 4))
@@ -6743,7 +6859,7 @@ local function fightOnce(forced)
 				-- Mobs turn to face us, so this is checked all the time: whenever we are not within the rear
 				-- third of the mob, hop to the spot behind its back - unless that spot is a wall, a drop or
 				-- lava, and never in the instant our own hitbox is coming out.
-				if not hitRun and os.clock() >= (G.FTBehindAt or 0) and not (pend and math.abs(os.clock() - pend.at) < 0.15) then
+				if not hitRun and not faceTank and os.clock() >= (G.FTBehindAt or 0) and not (pend and math.abs(os.clock() - pend.at) < 0.15) then
 					G.FTBehindAt = os.clock() + 0.1
 					local tpB = target.r.Position
 					local lookB = target.r.CFrame.LookVector * Vector3.new(1, 0, 1)
@@ -6811,6 +6927,9 @@ MineHooks.clear = function(pos)
 	local _, hrp = char()
 	if not hrp or (hrp.Position - pos).Magnitude > 80 then
 		return false -- far away: walk there first, deal with mobs when we actually meet them
+	end
+	if settings.ignoreMobs and not settings.autoMobs then
+		return false -- (v291: "ignore mobs" - the rock is mined with them around)
 	end
 	local n, list = mobsNear(pos, 22)
 	if n == 0 or not mobFightable(list[1]) then
@@ -7051,6 +7170,17 @@ do
 		if (d.Quests or {})[id] then
 			return false
 		end
+		-- (v288, the user: "those 2 dont have quests continue with the other quests instead". Fisher's
+		-- and Henry's follow-up quests are in the game's data but the game does not hand them out;
+		-- the bot stood at each for 25 s per visit trying. Left alone; G.FTSkipQuests[id] = false
+		-- brings one back.)
+		do
+			local skip = type(G.FTSkipQuests) == 'table' and G.FTSkipQuests or {}
+			local dflt = id == 'FisherQuest2' or id == 'FisherQuest3' or id == 'HenryQuest2' or id == 'HenryQuest3'
+			if skip[id] == true or (dflt and skip[id] ~= false) then
+				return false
+			end
+		end
 		-- (v213, asked for: daily quests handed out by NPCs, e.g. Daily_Farmer, are not taken.
 		-- settings.acceptDaily = true by hand brings them back.)
 		if settings.acceptDaily ~= true and (string.find(tostring(id), 'Daily') ~= nil or q.Daily == true or q.Type == 'Daily') then
@@ -7114,6 +7244,24 @@ do
 		if not goTo(npc) then
 			return false
 		end
+		-- (v285, measured at Fisher: the talk opened from 13 studs away, the game's own window sent
+		-- "give quest 2", and no quest came - while by hand, standing next to him, it does. The bot
+		-- now steps right up to the NPC (about 4 studs) before talking.)
+		pcall(function()
+			for _ = 1, 2 do
+				local _, hN = char()
+				local np = npc:GetPivot().Position
+				local flat = hN and (hN.Position - np) * Vector3.new(1, 0, 1)
+				if not hN or flat.Magnitude <= 5.5 then
+					break
+				end
+				local spot = np + flat.Unit * 4
+				tweenTo(CFrame.new(spot.X, hN.Position.Y, spot.Z))
+				task.wait(0.2)
+			end
+			local _, hN = char()
+			G.FTVisitDist = hN and (hN.Position - npc:GetPivot().Position).Magnitude or -1
+		end)
 		-- The game ignores a new dialogue while the last one is still closing.
 		pcall(function()
 			local ui = LocalPlayer.PlayerGui:FindFirstChild('DialogueUI')
@@ -7159,36 +7307,342 @@ do
 		treeOf[npc.Name] = tree
 		local cmds = treeCommands(tree)
 		task.wait(0.3)
-		for _, c in ipairs(cmds.check) do
-			pcall(function()
-				DS:RunCommand(c)
+		-- (v281: every command sent is written down with what the game answered, in G.FTVisitLog)
+		-- (v284: the user gets Fisher's second quest by hand, while the bot - sending its own
+		-- commands and then letting the window play - did not. So where a giver has a quest we do
+		-- not have, the bot now sends nothing of its own for that visit: only the game's window
+		-- talks, exactly as by hand. If that fails twice at a giver, the old way is used again.)
+		local PFail = type(G.FTPassiveFail) == 'table' and G.FTPassiveFail or {}
+		G.FTPassiveFail = PFail
+		local passive = false
+		if settings.autoAcceptQuests and (PFail[npc.Name] or 0) < 2 then
+			for _, g in ipairs(cmds.give) do
+				if g.quest and eligible(g.quest) and (settings.acceptDaily == true or not string.find(g.cmd, 'Daily', 1, true)) then
+					passive = true
+				end
+			end
+		end
+		local function run(c)
+			if passive then
+				return nil
+			end
+			local res = 'no answer'
+			local ans
+			task.spawn(function()
+				local okR, a, b2 = pcall(function()
+					return DS:RunCommand(c):await()
+				end)
+				ans = b2
+				res = tostring(okR) .. ' ' .. tostring(a) .. ' ' .. tostring(b2)
 			end)
+			local tR = os.clock()
+			while res == 'no answer' and os.clock() - tR < 1.2 do
+				task.wait(0.05)
+			end
+			local VL = type(G.FTVisitLog) == 'table' and G.FTVisitLog or {}
+			G.FTVisitLog = VL
+			VL[#VL + 1] = ('%s %s [%s] %s (%s) -> %s'):format(os.date('%H:%M:%S'), npc.Name, tree.Name, c, why, res)
+			if #VL > 150 then
+				table.remove(VL, 1)
+			end
+			return ans
+		end
+		-- (v282, reported: "some quests giver have more dialogue lines and the script is not going
+		-- through all of them meaning its not getting the quests". Measured: Fisher and Henry answer
+		-- the bare "give quest 2" with nothing. So the talk is now gone through the way the game's
+		-- own dialogue window does it - from the first line, each check deciding the branch, each
+		-- line's own commands sent as that line comes up, and the answer picked that leads to a quest
+		-- we do not have. Only quest commands are sent (give / accept / start / check / finish /
+		-- turn in / complete); an answer that leads to no quest is never picked, so nothing is
+		-- bought and no travel is started by it.)
+		local function nodesOf(node, dir)
+			local list = {}
+			for _, sv in ipairs(node:GetChildren()) do
+				local f = sv:IsA('StringValue') and sv:FindFirstChild(dir)
+				for _, ov in ipairs(f and f:GetChildren() or {}) do
+					local tgt = ov:IsA('ObjectValue') and ov.Value and ov.Value.Parent
+					if tgt and tgt:IsA('Configuration') then
+						list[#list + 1] = tgt
+					end
+				end
+			end
+			return list
+		end
+		local function questCmds(node)
+			local ms = node:FindFirstChildWhichIsA('ModuleScript')
+			local list = {}
+			if ms then
+				local okM, mod = pcall(require, ms)
+				local f = okM and type(mod) == 'table' and mod.Run
+				local okc, consts = false, nil
+				if type(f) == 'function' then
+					okc, consts = pcall(debug.getconstants, f)
+				end
+				for _, c in ipairs(okc and consts or {}) do
+					if type(c) == 'string' and c ~= 'RunCommand' and (c:match('^Give') or c:match('^Accept') or c:match('^Start') or c:match('^Check')
+						or c:match('^Finish') or c:match('^Complete') or c:match('^TurnIn')) then
+						list[#list + 1] = c
+					end
+				end
+			end
+			return list
+		end
+		local function wanted(node)
+			local q = node:GetAttribute('GivesQuest')
+			return q ~= nil and eligible(q)
+		end
+		local function runNode(node)
+			local last
+			local gq = node:GetAttribute('GivesQuest')
+			if gq ~= nil and not (settings.autoAcceptQuests and eligible(gq)) then
+				return nil
+			end
+			for _, c in ipairs(questCmds(node)) do
+				if settings.acceptDaily == true or not string.find(c, 'Daily', 1, true) then
+					last = run(c)
+					task.wait(0.25)
+				end
+			end
+			return last
+		end
+		-- the commands hanging on a line: sent when that line comes up (as the game's window does)
+		local function lineCmds(node)
+			for _, inp in ipairs(nodesOf(node, 'Inputs')) do
+				if inp:GetAttribute('Type') ~= 'Condition' and inp:FindFirstChildWhichIsA('ModuleScript') and #nodesOf(inp, 'Inputs') == 0 then
+					runNode(inp)
+				end
+			end
+		end
+		local function leads(node, depth)
+			-- does going on from here reach a quest we can take?
+			local seen, layer = { [node] = true }, { node }
+			for _ = 1, depth do
+				local nextLayer = {}
+				for _, n in ipairs(layer) do
+					if wanted(n) then
+						return true
+					end
+					for _, inp in ipairs(nodesOf(n, 'Inputs')) do
+						if wanted(inp) and #nodesOf(inp, 'Inputs') == 0 then
+							return true
+						end
+					end
+					for _, o in ipairs(nodesOf(n, 'Outputs')) do
+						-- (v286: Henry's "You look worried" goes straight into the check that picks his quest line, so a
+					-- check right behind the answer itself is followed; a check further on is not)
+					if not seen[o] and o:GetAttribute('Type') ~= 'DialogueRoot' and (o:GetAttribute('Type') ~= 'Condition' or n == node) then
+							seen[o] = true
+							nextLayer[#nextLayer + 1] = o
+						end
+					end
+				end
+				layer = nextLayer
+				if #layer == 0 then
+					break
+				end
+			end
+			return false
+		end
+		local okWalk, errWalk = pcall(function()
+			local node
+			for _, ch in ipairs(tree:GetChildren()) do
+				if ch:GetAttribute('Type') == 'DialogueRoot' then
+					node = ch
+				end
+			end
+			local steps, been = 0, {}
+			while node and steps < 40 do
+				steps += 1
+				been[node] = (been[node] or 0) + 1
+				if been[node] > 2 then
+					break
+				end
+				local typ = node:GetAttribute('Type')
+				local outsN = nodesOf(node, 'Outputs')
+				local nextNode
+				if typ == 'Condition' then
+					local r = runNode(node)
+					for _, o in ipairs(outsN) do
+						if r ~= nil and o:GetAttribute('Priority') == r then
+							nextNode = o
+						end
+					end
+				else
+					if typ ~= 'DialogueRoot' then
+						lineCmds(node)
+						if typ ~= 'Prompt' and typ ~= 'Response' then
+							runNode(node)
+						end
+						task.wait(0.45)
+					end
+					local responses, others = {}, {}
+					for _, o in ipairs(outsN) do
+						if o:GetAttribute('Type') == 'Response' then
+							responses[#responses + 1] = o
+						else
+							others[#others + 1] = o
+						end
+					end
+					local function byPri(a, b)
+						return (tonumber(a:GetAttribute('Priority')) or 0) < (tonumber(b:GetAttribute('Priority')) or 0)
+					end
+					table.sort(responses, byPri)
+					table.sort(others, byPri)
+					if #responses > 0 then
+						for _, rsp in ipairs(responses) do
+							if not nextNode and settings.autoAcceptQuests and leads(rsp, 8) then
+								nextNode = rsp
+							end
+						end
+					else
+						nextNode = others[1]
+					end
+				end
+				node = nextNode
+			end
+			G.FTWalkSteps = (G.FTWalkSteps or 0) + steps
+		end)
+		if not okWalk then
+			G.FTWalkErr = tostring(errWalk)
+		end
+		task.wait(0.3)
+		for _, c in ipairs(cmds.check) do
+			run(c)
 			task.wait(0.2)
 		end
 		for _, c in ipairs(cmds.finish) do
-			pcall(function()
-				DS:RunCommand(c)
-			end)
+			run(c)
 			task.wait(0.2)
 		end
 		if settings.autoAcceptQuests then
 			for _, g in ipairs(cmds.give) do
 				if g.quest and eligible(g.quest) then
-					pcall(function()
-						DS:RunCommand(g.cmd)
-					end)
+					run(g.cmd)
 					setStatus('accepted quest ' .. tostring(g.quest))
 					task.wait(0.3)
+				elseif not g.quest and (settings.acceptDaily == true or not string.find(g.cmd, 'Daily', 1, true)) then
+					-- (v281, reported: "some quests giver have more dialogue lines and the script is not going
+					-- through all of them". A step that is not labelled with a quest - the Supplier's "Give
+					-- Box" and "Give Next" - was never sent, so that chain stood still. Now sent too; the
+					-- game decides whether it applies.)
+					run(g.cmd)
+					task.wait(0.3)
+				end
+			end
+		end
+		-- (v283: Fisher and Henry gave nothing for the accept command, sent the bot's way or line by
+		-- line. The game's own window was being shut 1-2 s after it opened - before it had typed out
+		-- the lines that come before the quest. So when a quest this giver has is still not ours, the
+		-- window is left to play: it moves on by itself after each line, and where it offers answers
+		-- the one that leads to the quest is clicked. Up to 25 s, and it stops the moment the quest
+		-- is ours.)
+		if settings.autoAcceptQuests then
+			local function stillWanted()
+				for _, g in ipairs(cmds.give) do
+					if g.quest and eligible(g.quest) and (settings.acceptDaily == true or not string.find(g.cmd, 'Daily', 1, true)) then
+						return g.quest
+					end
+				end
+				return nil
+			end
+			task.wait(0.4)
+			local wantQ = stillWanted(); G.FTLingerWhy = 'none'
+			local ui = LocalPlayer.PlayerGui:FindFirstChild('DialogueUI')
+			if wantQ and ui and ui.Enabled then
+				G.FTLinger = (G.FTLinger or 0) + 1
+				setStatus(('quest: %s — letting the talk play out for %s'):format(npc.Name, tostring(wantQ)))
+				local t0 = os.clock()
+				local clicked = {}
+				while os.clock() - t0 < 25 and ui.Enabled and stillWanted() do
+					-- answers on screen?
+					local frames = {}
+					for _, fr in ipairs(LocalPlayer.PlayerGui:GetDescendants()) do
+						if fr.Name == 'Response' and fr:IsA('Frame') and fr.Visible and fr:FindFirstChild('Button') and fr:FindFirstChild('Order') and not clicked[fr]
+							and not string.find(fr.Button.Text, 'This is a test answer', 1, true) and not fr:FindFirstAncestorWhichIsA('LuaSourceContainer') then -- (the game's own template answer is not one)
+							frames[#frames + 1] = fr
+						end
+					end
+					if #frames > 0 then
+						task.wait(0.4) -- (they come up one by one)
+						local pick, pickNode
+						for _, node in ipairs(tree:GetDescendants()) do
+							if not pick and node:IsA('Configuration') and node:GetAttribute('Type') == 'Response' and leads(node, 8) then
+								local txt = node:FindFirstChild('Text')
+								for _, fr in ipairs(frames) do
+									if txt and txt:IsA('StringValue') and #txt.Value > 0 and fr.Parent and string.find(fr.Button.Text, txt.Value, 1, true) then
+										pick = fr
+										pickNode = node
+									end
+								end
+							end
+						end
+						if not pick then
+							local tx = {}
+							for _, fr in ipairs(frames) do tx[#tx + 1] = string.sub(fr.Button.Text, 1, 40) end
+							G.FTLingerWhy = 'answers with no quest: ' .. table.concat(tx, ' | ')
+							break -- (no answer here leads to a quest: nothing is clicked)
+						end
+						clicked[pick] = true
+						local VL = type(G.FTVisitLog) == 'table' and G.FTVisitLog or {}
+						G.FTVisitLog = VL
+						VL[#VL + 1] = ('%s %s [%s] clicked answer: %s'):format(os.date('%H:%M:%S'), npc.Name, tree.Name, string.sub(pick.Button.Text, 1, 60))
+						-- (v287: firing the button's click did nothing - no command followed. The window's own
+						-- "answer chosen" steps are called instead: the answer's commands, then the lines behind it.)
+						local okC, errC = pcall(function()
+							local env = getsenv(LocalPlayer.PlayerGui.DialogueUI.DialogueHandler)
+							pcall(env.ClearResponses)
+							env.CommonNodeFunctions(pickNode)
+							env.LoadNodes(env.GetOutputNodes(pickNode), tree)
+						end)
+						if not okC then
+							VL[#VL + 1] = 'answer step failed: ' .. tostring(errC)
+							pcall(function()
+								firesignal(pick.Button.MouseButton1Click)
+							end)
+						end
+						task.wait(0.6)
+					end
+					task.wait(0.25)
+				end
+				local VL = type(G.FTVisitLog) == 'table' and G.FTVisitLog or {}
+				G.FTVisitLog = VL
+				VL[#VL + 1] = ('%s %s [%s] let it play %.1f s for %s -> %s'):format(os.date('%H:%M:%S'), npc.Name, tree.Name, os.clock() - t0, tostring(wantQ), (passive and 'window only: ' or '') .. (stillWanted() and 'still not ours' or 'GOT IT') .. ' / ' .. tostring(G.FTLingerWhy) .. ' / open at end: ' .. tostring(ui.Enabled))
+				if not stillWanted() then
+					G.FTLingerGot = (G.FTLingerGot or 0) + 1
+					PFail[npc.Name] = nil
+				elseif passive then
+					PFail[npc.Name] = (PFail[npc.Name] or 0) + 1
 				end
 			end
 		end
 		task.wait(0.3)
 		closeDialogue()
 		task.wait(0.5)
-		if questSig() == before then
+		local changed = questSig() ~= before
+		if not changed then
 			backoff[bk] = { n = (b and b.n or 0) + 1, t = os.clock() }
 		else
 			backoff[bk] = nil
+		end
+		-- (v275, reported: "quests arent exactly chaining into each other". The talk that hands a
+		-- quest in was opened before the hand-in, so it cannot offer the next quest of the chain, and
+		-- the NPC was then left alone for 10 minutes. After a hand-in the NPC is asked again at once.)
+		if changed and why == 'turn in' and settings.autoAcceptQuests then
+			G.FTChainAsk = (G.FTChainAsk or 0) + 1
+			local d0 = data()
+			local n0 = 0
+			for _ in pairs(d0 and d0.Quests or {}) do
+				n0 += 1
+			end
+			task.wait(0.6)
+			visit(name, 'next quest')
+			local n1 = 0
+			for _ in pairs(d0 and data().Quests or {}) do
+				n1 += 1
+			end
+			if n1 > n0 then
+				G.FTChainGot = (G.FTChainGot or 0) + 1
+			end
 		end
 		return true
 	end
@@ -7907,7 +8361,11 @@ do
 			local _
 			_, n, item = desc:match('[Bb]ring%s+(%a+)%s+(%d+)%s+([%a%s]+)')
 		end
-		if n and item then
+		if not n then
+			-- "Bring 30 Epic Essence." (Captain Rowan Final): no "to NPC" part, no quotes.
+			n, item = desc:match('[Bb]ring%s+(%d+)%s+(.-)%.?%s*$')
+		end
+		if n and item and item ~= '' then
 			return tonumber(n), (item:gsub('%s+$', ''))
 		end
 		return nil
@@ -7962,7 +8420,14 @@ do
 			G.FTReserve[ore] = math.max(G.FTReserve[ore] or 0, n)
 		end
 		if itemCount(item) >= n then
-			return q.Npc and visit(q.Npc, 'deliver') or false
+			-- (v290: "Line's Needs" names its NPC "Link" but the NPC is "Line": fall back to the
+			-- name after "to" in the objective text.)
+			local who = q.Npc
+			local toName = tostring(desc):match("%s[Tt]o%s+([%w%s'%-]-)%.?%s*$")
+			if (not who or not npcModel(who)) and toName and npcModel(toName) then
+				who = toName
+			end
+			return who and visit(who, 'deliver') or false
 		end
 		local sk = shopKey(item)
 		if sk and settings.questBuy then
@@ -8236,6 +8701,44 @@ do
 				return tostring(a) < tostring(b)
 			end)
 			local nowQ = os.clock()
+			-- (v290, asked: where do Warrior Skulls come from. SilasIsland3Quest1 wants 2 glowing skulls
+			-- lying in Frostspire Expanse on Island 3 - pickups, not drops - and the bot sat on it for half
+			-- an hour on Island 2 mining Basalt. A quest whose unfinished objective is ground pickups that
+			-- are not in this server is set aside for 10 minutes so the next one is worked on.)
+			do
+				local PK = G.FTPickupGone
+				if type(PK) ~= 'table' or nowQ - PK.at > 30 then
+					PK = { at = nowQ, gone = {} }
+					G.FTPickupGone = PK
+					for id, qd in pairs(d.Quests) do
+						local def = QuestData and QuestData[id]
+						for i, ob in ipairs(type(def) == 'table' and type(def.Objectives) == 'table' and def.Objectives or {}) do
+							local pr = type(qd) == 'table' and type(qd.Progress) == 'table' and qd.Progress[i]
+							local left = not pr or (tonumber(pr.currentProgress) or 0) < (tonumber(pr.requiredAmount) or 1)
+							if left and type(ob) == 'table' and type(ob.Pickups) == 'table' and #ob.Pickups > 0 then
+								local here = false
+								for _, pk in ipairs(ob.Pickups) do
+									if type(pk) == 'table' and pk.Name and workspace:FindFirstChild(pk.Name, true) then
+										here = true
+									end
+								end
+								if not here then
+									PK.gone[id] = tostring(ob.Area or ('island ' .. tostring(ob.Island)))
+								end
+							end
+						end
+					end
+				end
+				for id, area in pairs(PK.gone) do
+					if (stalled[id] or 0) < nowQ then
+						stalled[id] = nowQ + 600
+						if lockId == id then
+							setStatus(('quest %s: its items lie in %s, not here — doing another one'):format(tostring(id), area))
+							lockId = nil
+						end
+					end
+				end
+			end
 			if lockId and d.Quests[lockId] == nil then
 				setStatus('quest finished: ' .. tostring(lockId))
 				lockId = nil
@@ -8383,6 +8886,43 @@ do
 								end
 							end
 						elseif t == 'Mine' or (t == 'Collect' and (target == 'Ore' or not (ShopData and ShopData[target]))) then
+							-- (v280, reported with a screenshot: "mining the wrong rocks". The quest it had picked
+							-- wanted Light Crystal, whose only rock here is in the shut Goblin Cave - so no rock of
+							-- that kind was on the list and it mined whatever was nearest instead. A part whose rock
+							-- is not standing anywhere the bot may go is now "nothing to do right now": the quest
+							-- is set aside for a few minutes and the next one is worked on.)
+							local kinds
+							if t == 'Mine' and target ~= 'Any' and target ~= 'Rock' then
+								kinds = { [target] = true }
+							elseif t == 'Collect' and target ~= 'Ore' and next(Here.sources(target)) then
+								kinds = Here.sources(target)
+							end
+							local standing = true
+							if kinds then
+								local RA = G.FTRockAvail
+								if type(RA) ~= 'table' or os.clock() - RA.at > 3 then
+									RA = { at = os.clock(), has = {} }
+									G.FTRockAvail = RA
+									local rocksF = workspace:FindFirstChild('Rocks')
+									for _, zone in ipairs(rocksF and rocksF:GetChildren() or {}) do
+										local shut = (zone.Name == 'Island2GoblinCave' or string.find(zone.Name, 'Closed', 1, true) ~= nil) and not (type(G.FTZoneOpen) == 'table' and G.FTZoneOpen[zone.Name]) and settings.mineZone ~= zone.Name
+										if not shut then
+											for _, dsc in ipairs(zone:GetDescendants()) do
+												if dsc:IsA('Model') and (tonumber(dsc:GetAttribute('Health')) or 0) > 0 then
+													RA.has[dsc.Name] = true
+												end
+											end
+										end
+									end
+								end
+								standing = false
+								for name in pairs(kinds) do
+									if RA.has[name] and not tooStrong[name] then
+										standing = true
+									end
+								end
+							end
+							if standing then
 							QS.wantMine = true
 							engaged = true
 							if t == 'Mine' and target ~= 'Any' and target ~= 'Rock' then
@@ -8396,6 +8936,9 @@ do
 							end
 							if pri then
 								QS.storyMine = true
+							end
+							else
+								G.FTRockNone = (G.FTRockNone or 0) + 1
 							end
 						elseif t == 'Collect' and ShopData and ShopData[target] then
 							if settings.questBuy and buy(target) then
@@ -9251,6 +9794,7 @@ do
 	end
 	function Boss.on()
 		return settings.autoBoss or G.FTBossOnce == true or Boss.questWants() -- (v221: G.FTBossOnce = one kill asked for by hand)
+			or (settings.autoRaid and settings.raidFarming) -- (v297: out of Raid Tickets - Asura gives one per kill)
 	end
 	function Boss.step()
 		if not Boss.on() then
@@ -9645,12 +10189,15 @@ do
 			task.wait(1)
 			local g = LocalPlayer.PlayerGui:FindFirstChild('RaidRewards')
 			local left = math.floor(tonumber(settings.raidRetries) or 0)
-			if g and g.Enabled and not pressed and left > 0 and Raid.tickets() >= 1 then
+			local autoR = settings.autoRaid and not settings.raidFarming -- (v297: Auto raid retries while tickets last)
+			if g and g.Enabled and not pressed and (left > 0 or autoR) and Raid.tickets() >= 1 then
 				local b = g:FindFirstChild('Retry', true)
 				if b and b:IsA('GuiButton') then
 					task.wait(5) -- (let the rewards show first)
 					pressed = true
-					settings.raidRetries = left - 1
+					if not autoR then
+						settings.raidRetries = left - 1
+					end
 					save()
 					statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('raid: pressing Retry (%d retries left after this, %d tickets)'):format(left - 1, Raid.tickets())
 					for _ = 1, 3 do
@@ -9666,8 +10213,91 @@ do
 						end
 					end
 				end
+			elseif g and g.Enabled and not pressed and settings.autoRaid and (settings.raidFarming or Raid.tickets() < 1) then
+				-- (v298) out of tickets with Auto raid on: leave the raid for the island (Asura farm)
+				local b
+				for _, d in ipairs(g:GetDescendants()) do
+					if d:IsA('GuiButton') and (string.find(string.lower(d.Name), 'island', 1, true)
+						or (d:IsA('TextButton') and string.find(string.lower(d.Text), 'island', 1, true))) then
+						b = d
+						break
+					end
+					if d:IsA('TextLabel') and string.find(string.lower(d.Text), 'go to island', 1, true) then
+						local pb = d:FindFirstAncestorWhichIsA('GuiButton')
+						if pb then
+							b = pb
+							break
+						end
+					end
+				end
+				if b then
+					task.wait(5)
+					pressed = true
+					statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. 'raid: out of tickets — going back to the island'
+					for _ = 1, 3 do
+						pcall(function()
+							firesignal(b.Activated)
+						end)
+						pcall(function()
+							firesignal(b.MouseButton1Click)
+						end)
+						task.wait(1)
+						if not (g.Parent and g.Enabled) then
+							break
+						end
+					end
+				end
 			elseif not (g and g.Enabled) then
 				pressed = false
+			end
+		end
+	end)
+	-- (v297, asked for: "for auto raid, make it so, if tickets ran out farm asura until max tickets
+	-- again, make sure to do something on the side while waiting for asura spawns, then go back to
+	-- raids, once tickets max". Auto raid starts a raid at the gate whenever a ticket is left (and the
+	-- result screen's Retry is pressed while tickets last). At 0 tickets it farms Asura's Incarnate -
+	-- one ticket per kill - and mines between spawns (Auto mine is switched on for that if neither
+	-- mining nor mobs is on, and off again after). Back to raids at "Raid tickets to farm back to".)
+	task.spawn(function()
+		local lastStart = -1e9
+		while alive do
+			task.wait(2)
+			if not settings.autoRaid then
+				if settings.raidSideMine then
+					settings.autoMine, settings.raidSideMine = false, false
+					save()
+				end
+				continue
+			end
+			local t = Raid.tickets()
+			local maxT = math.max(1, math.floor(tonumber(settings.raidTicketMax) or 5))
+			if settings.raidFarming and t >= maxT then
+				settings.raidFarming = false
+				if settings.raidSideMine then
+					settings.autoMine, settings.raidSideMine = false, false
+				end
+				save()
+				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('raid: tickets back to %d — back to raids'):format(t)
+			elseif not settings.raidFarming and t < 1 then
+				settings.raidFarming = true
+				save()
+				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('raid: out of tickets — farming Asura until %d'):format(maxT)
+			end
+			if settings.raidFarming then
+				if not settings.autoMine and not settings.autoMobs then
+					settings.autoMine, settings.raidSideMine = true, true -- (something to do between spawns)
+					save()
+				end
+				if not G.FTBossFight then
+					G.FTRaidWhy = ('out of tickets (%d/%d): farming Asura, mining in between'):format(t, maxT)
+				end
+			elseif t >= 1 and type(G.FTRaidStart) ~= 'table' and not G.FTBossFight and os.clock() - lastStart > 90
+				and not (LocalPlayer.PlayerGui:FindFirstChild('RaidRewards') and LocalPlayer.PlayerGui.RaidRewards.Enabled) then
+				local prox = workspace:FindFirstChild('Proximity')
+				if prox and prox:FindFirstChild('RaidCreateParty') then
+					lastStart = os.clock()
+					G.FTRaidStart = { tier = tonumber(settings.raidTier) or 1 }
+				end
 			end
 		end
 	end)
@@ -9940,6 +10570,8 @@ local function mobNames()
 end
 
 bindToggle(FarmBox, 'FTAutoMine', 'autoMine', 'Auto mine', 'Tweens to the nearest rock and mines it. Rock types your pickaxe cannot damage are skipped.')
+bindToggle(FarmBox, 'FTMineOnlyPicked', 'mineOnlyPicked', 'Mine only the picked rocks', 'With rocks picked under "Mine these rocks first", nothing else is mined while none of them is standing.')
+bindToggle(FarmBox, 'FTIgnoreMobs', 'ignoreMobs', 'Ignore mobs while mining', 'Keeps mining when a mob comes up instead of fighting it. Attack markers are still dodged; low health and mobs that have killed you still pull it away.')
 bindToggle(FarmBox, 'FTMineMeteors', 'mineMeteors', 'Break event meteors', 'When an event drops meteors (Inferno, Prismatic, Fichillium, comet rocks) the bot goes to each one and breaks it with the pickaxe before anything else. They only last 90 seconds.')
 local zoneDD = bindDropdown(FarmBox, 'FTMineZone', 'mineZone', 'Mine in', zoneNames())
 local function rockNames()
@@ -10407,12 +11039,14 @@ MobBox:AddButton('Forget deadly mobs', function()
 	setStatus('deadly list cleared' .. (was ~= '' and (' (was: ' .. was .. ')') or ''))
 end)
 bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything' }, 'Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 25% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
-bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Block / parry', 'Attack only' }, 'Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Block / parry: stands and blocks. Attack only: never dodges or blocks, just stands in reach and swings. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)')
+bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Behind + dodge', 'Block / parry', 'Attack only', 'Face tank' }, "Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Behind + dodge: the same, but always comes back in at the mob's back. Block / parry: stands behind the mob and blocks. Attack only: stands behind the mob and swings, never dodges or blocks. Face tank: walks straight up to the mob's face and swings, never moves round it, dodges or blocks (stuns will land). The island boss is always parried in Attack only / Face tank. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)")
 bindSlider(MobBox, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
 bindToggle(MobBox, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
 bindToggle(MobBox, 'FTAutoBoss', 'autoBoss', 'Auto boss (this island)', 'UNTESTED. Goes to this island\'s boss gate (Island 4: Asura\'s Incarnate), opens a party, starts it when the lobby opens and fights the boss. Boss lobbies are free (no ticket). Ignores the max mob health slider. Tries once right away, then each time the gate countdown runs out; gives up for 30 minutes after 3 starts in a row that do not go through.')
 bindSlider(MobBox, 'FTRaidTier', 'raidTier', 'Raid tier', 1, 15, 'The Tower of Hell tier the button below starts.')
 bindSlider(MobBox, 'FTRaidRetries', 'raidRetries', 'Raid retries left (1 ticket each)', 0, 10, 'When a raid ends, the Retry button is pressed this many more times. Each press starts another raid and spends one Raid Ticket; the number counts down by itself. 0 = never press it.')
+bindToggle(MobBox, 'FTAutoRaid', 'autoRaid', 'Auto raid (spends Raid Tickets)', 'Starts a Tower of Hell raid at the tier above whenever you have a Raid Ticket, and presses Retry while tickets last. Out of tickets: farms Asura\'s Incarnate (1 ticket per kill) and mines between spawns until you are back to the number below, then raids again.')
+bindSlider(MobBox, 'FTRaidTicketMax', 'raidTicketMax', 'Raid tickets to farm back to', 1, 20, 'With Auto raid on and no tickets left, Asura is farmed until you have this many again.')
 MobBox:AddButton('Start ONE raid (spends 1 Raid Ticket)', function()
 	G.FTRaidStart = { tier = tonumber(settings.raidTier) or 1 }
 end)
@@ -11640,7 +12274,7 @@ local function mainLoop(myGen)
 				-- Possessed Monk Panda five times and died next to it each time)
 				local _, _, hh = char()
 				local frac = hh and hh.MaxHealth > 0 and hh.Health / hh.MaxHealth or 0
-				local sp = frac >= 0.6 and not lowHp() and specialTargets()[1] or nil
+				local sp = frac >= 0.6 and not lowHp() and not (settings.ignoreMobs and not settings.autoMobs) and specialTargets()[1] or nil
 				if sp then
 					setStatus(('hunting %s %s (%.0f studs)'):format(sp.mut, sp.m.Name, sp.d))
 					fightOnce(sp)
