@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v298'
+local BUILD = 'forge-tools-v311'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -4726,6 +4726,13 @@ end
 local Block = {}
 do
 	local blockUntil = 0
+	-- (v303, measured standing still with auto block off: a press less than ~0.16 s after our own
+	-- let-go never comes up - 0.04-0.12 s after letting go failed 6 of 6 even with the guard up 0.5 s
+	-- before, 0.26-0.30 s worked. So every let-go is timed, and a press waits out that gap.)
+	function Block.stop(tc)
+		Block.relAt = os.clock()
+		pcall(tc.StopBlock, tc)
+	end
 	if type(G.FTBlockConns) == 'table' then
 		for _, c in ipairs(G.FTBlockConns) do
 			pcall(function()
@@ -4868,6 +4875,7 @@ do
 	pcall(function()
 		blockConns[#blockConns + 1] = workspace:WaitForChild('Debris', 5).ChildAdded:Connect(function(x)
 			if x.Name == 'Parry' or x.Name == 'BlockHit' then
+				Block.fxAt = os.clock()
 				if x.Name == 'Parry' then
 					PStats.parry += 1
 				else
@@ -4912,6 +4920,24 @@ do
 		local c, _, hum = char()
 		if c and hum and c ~= hpChar then
 			hpChar = c
+			-- (v305: press-to-guard time learned from every press - the early let-go ends the run loop
+			-- before the guard shows, so the loop itself no longer sees most of them)
+			pcall(function()
+				local st0 = c:WaitForChild('Status', 5)
+				blockConns[#blockConns + 1] = st0.ChildAdded:Connect(function(x)
+					local pa = Block.pressedAt
+					if x.Name == 'Blocking' and pa and os.clock() - pa < 0.6 and pa ~= Block.latFor then
+						Block.latFor = pa
+						Block.upAt = os.clock()
+						local l = G.FTBlockLat
+						l[#l + 1] = math.floor((os.clock() - pa) * 1000 + 0.5) / 1000
+						while #l > 40 do
+							table.remove(l, 1)
+						end
+						PStats.lat = Block.lat(0.5)
+					end
+				end)
+			end)
 			if hpConn then
 				hpConn:Disconnect()
 			end
@@ -4977,7 +5003,7 @@ do
 		-- press again - unless the last press was under 0.15 s ago, which is the same moment.)
 		local nowB = os.clock()
 		if tc.isBlocking and nowB - (Block.pressedAt or 0) >= 0.15 then
-			pcall(tc.StopBlock, tc)
+			Block.stop(tc)
 		end
 		if not tc.isBlocking then
 			pcall(tc.StartBlock, tc)
@@ -4998,7 +5024,7 @@ do
 			end
 			stopping = false
 			if tc.isBlocking then
-				pcall(tc.StopBlock, tc)
+				Block.stop(tc)
 			end
 		end)
 	end
@@ -5062,6 +5088,31 @@ do
 		if not Block.dueAt or due < Block.dueAt or os.clock() > Block.dueAt then
 			Block.dueAt = due
 		end
+	end
+	-- (v299, traced standing at a Mountain Ape: our guard shows up 0.13-0.27 s after StartBlock - the
+	-- round trip to the server - but a press with no guard after 0.12 s was taken as refused, let go
+	-- and pressed again, which started the wait over: 26 of 28 hits landed 0.03-0.16 s after that
+	-- second press, the guard coming up just after them. So the real press-to-guard time is learned
+	-- (every press that comes up), presses wait that long before counting as refused, and go out that
+	-- much earlier.)
+	G.FTBlockLat = type(G.FTBlockLat) == 'table' and G.FTBlockLat or {}
+	function Block.lat(q)
+		local l = G.FTBlockLat
+		if #l < 3 then
+			local okP, ping = pcall(function()
+				return LocalPlayer:GetNetworkPing()
+			end)
+			local v = (okP and tonumber(ping) or 0.1) * 1.1 + 0.03
+			return math.clamp(v, 0.08, 0.4)
+		end
+		-- (v306, the user: "what if the ping is different". Only the last 15 presses count, so a ping
+		-- change is followed within about 15 attacks.)
+		local sorted = {}
+		for i = math.max(1, #l - 14), #l do
+			sorted[#sorted + 1] = l[i]
+		end
+		table.sort(sorted)
+		return math.clamp(sorted[math.clamp(math.ceil(#sorted * q), 1, #sorted)], 0.05, 0.45)
 	end
 	-- the shine itself
 	local function onShine(m)
@@ -5265,6 +5316,9 @@ do
 			rec.seen += 1
 			Block.lastKey[m] = { aid = aid, key = key, t = now }
 			Block.expect = (rec.n >= 1 and rec.n / rec.seen >= 0.4) and (now + rec.gap) or nil
+			-- (v307: one per mob - with two mobs in combos the second overwrote the first's)
+			Block.expectBy = Block.expectBy or setmetatable({}, { __mode = 'k' })
+			Block.expectBy[m] = Block.expect
 		end)
 		while Block.cues[1] and now - Block.cues[1].t > 1 do
 			table.remove(Block.cues, 1)
@@ -5298,6 +5352,70 @@ do
 					while Block.hits[1] and Block.hits[1] < t - 0.06 do
 						table.remove(Block.hits, 1)
 					end
+					-- (v303: the parry has landed - let go now, not 0.1 s later, so the next press is free
+					-- sooner. The guard stays up on the server ~0.28 s after the let-go, which still covers a
+					-- second mob hitting just behind.)
+					local fx = Block.fxAt
+					if fx and t - fx < 0.3 and G.FTEarlyRelease ~= false then
+						while Block.hits[1] and Block.hits[1] > fx - 0.15 and Block.hits[1] < fx + 0.12 do
+							table.remove(Block.hits, 1)
+						end
+					end
+					-- (v304: the let-go reaches the server as late as the press did, so the guard is still up
+					-- there for a hit landing up to ~one round trip after we let go. Letting go that early - just
+					-- before the hit, from our side - frees the next press in time for a combo follow-up 0.46 s
+					-- behind, which a let-go after the hit could never be.)
+					if G.FTEarlyRel ~= false and lastPress > 0 then
+						-- (v310: on a steady connection 0.05 s - the 0.08 s miss blamed on the margin in v305 was
+						-- really a guard that never came up from a too-short hold (v308). Traced with 0.12 s: the next
+						-- press missed a 0.30 s-behind second mob by 3 ms.)
+						local steady0 = Block.lat(0.9) - Block.lat(0.25) < 0.05
+						local margin = tonumber(G.FTRelMargin) or 0.12 -- (v311: back to 0.12 - with 0.05, holds of 0.12-0.16 s left no guard 1 time in 10 even on a steady connection; 7 hits either way)
+						-- (v308, traced on a jumpy connection - press-to-guard 0.31 s typical, 0.55 s one time in
+						-- ten: let-goes 0.12-0.16 s after the press left no guard at all 1 time in 4, against ~2% on
+						-- a steady one. So the let-go goes by the quicker presses and never comes sooner than
+						-- 0.2 s after the press.)
+						local cut = t + Block.lat(0.25) - margin
+						-- (v309, traced on a steady connection: 5 of 7 hits were a second mob shining 0.30 s after the
+						-- first - a 0.2 s hold left the next press 0.04 s too late. A held guard past its parry window
+						-- is worth nothing here (heavy hits go through it, light ones 22 -> 20), so with a steady
+						-- connection the hold is cut to 0.15 s; a jumpy one keeps 0.2 s.)
+						local steady = Block.lat(0.9) - Block.lat(0.25) < 0.05
+						local minHold = tonumber(G.FTMinHold) or (steady and 0.15 or 0.2)
+						if t - lastPress < math.max(minHold, Block.lat(0.5) * (steady and 0.5 or 0.7)) then
+							cut = -math.huge
+						end
+						local lim = lastPress + Block.lat(0.9) + 0.27
+						local relGap = tonumber(G.FTRelGap) or 0.16
+						while Block.hits[1] and Block.hits[1] <= cut and Block.hits[1] >= lastPress + 0.1 and Block.hits[1] <= lim do
+							-- (v306, traced with two Apes 0.23 s apart: let go early for the first, the second could
+							-- not get a fresh guard in time - 110 a hit. If a let-go now leaves the next hit no time
+							-- for a fresh press, the guard we have stays up for it instead.)
+							local H2 = Block.hits[2]
+							if H2 and H2 > cut and t + relGap + Block.lat(0.75) + 0.03 > H2 then
+								PStats.keptFor2 = (PStats.keptFor2 or 0) + 1
+								break
+							end
+							-- (v307, traced with two Apes both in combos: 5 of 6 hits were one Ape's follow-up,
+							-- shining 0.06-0.12 s after we let go early for the other one - too soon for a fresh
+							-- guard. A follow-up some mob is expected to throw that soon keeps the guard up.)
+							local keep = false
+							if G.FTKeepForExpect ~= false then
+								local g0 = 0.34
+								for _, P in pairs(Block.expectBy or {}) do
+									if P and P > t - 0.08 and t + relGap > P + g0 - Block.lat(0.75) - 0.03 then
+										keep = true
+									end
+								end
+							end
+							if keep then
+								PStats.keptForExpect = (PStats.keptForExpect or 0) + 1
+								break
+							end
+							table.remove(Block.hits, 1)
+							PStats.earlyRel = (PStats.earlyRel or 0) + 1
+						end
+					end
 					local H = Block.hits[1]
 					if not H then
 						break
@@ -5316,6 +5434,16 @@ do
 						blkSeen = t
 						if not blkWas then
 							blkUpAt = t
+							if lastPress > 0 and t - lastPress < 0.6 and Block.latFor ~= lastPress then
+								Block.latFor = lastPress
+								local l = G.FTBlockLat
+								l[#l + 1] = math.floor((t - lastPress) * 1000 + 0.5) / 1000
+								while #l > 40 do
+									table.remove(l, 1)
+								end
+								PStats.lat = Block.lat(0.5)
+								Block.upAt = t
+							end
 						end
 					end
 					blkWas = blockUp
@@ -5324,14 +5452,27 @@ do
 					-- same hop Hit & run uses; the fight loop walks straight back in.)
 					-- (v202: also when the block cannot come up in time because the last one came up under 0.26 s
 					-- ago - two mobs hitting a quarter of a second apart, traced on the Onis: 16% a hit.)
-					local cov0 = lastPress > 0 and H <= lastPress + 0.29 and (parrying or t - lastPress < 0.12)
+					local cov0 = lastPress > 0 and H <= lastPress + Block.lat(0.9) + 0.27 and (parrying or t - lastPress < Block.lat(0.9) + 0.04)
 					-- (v203: 5 of 23 steps at 0.16 s still took the hit. A swing pressed so late that it cannot be
 					-- over in time - it shows for at least 0.61 s after the press - is stepped out of at 0.26 s.)
 					-- (v264, traced on floor 61-65: 5 of 6 stuns began with a hit landing 0.03-0.10 s after our
 					-- own guard went DOWN - it was dropped to raise a fresh parry for that hit, but a guard that
 					-- came up under 0.4 s ago cannot be re-raised in time. So in that case the guard we have
 					-- stays up through the hit: a plain block instead of an open hit.)
-					local holdThrough = G.FTHoldThrough ~= false and blockUp and not attacking and blkUpAt + 0.40 > H
+					-- (v301, traced at the Mountain Ape: after the parry the guard is let go, but the game's
+					-- "Blocking" stays on for another ~0.25 s - the same round trip. The combo follow-up shone in
+					-- that time, the leftover Blocking was taken for a guard of ours just raised, and "hold it
+					-- through" pressed nothing until it went: 8 of 8 hits taken. Only a guard we really hold counts.)
+					-- (v302, measured standing still: once our guard has come up, a fresh press is ignored until
+					-- ~0.3 s after that - let go and pressed 0.03-0.13 s later never came up, 0.16 s+ did. The
+					-- Ape's follow-up hits 0.81 s after its first shine, a fresh guard could not be up before
+					-- ~0.87 s. So when a let-go-and-press cannot be up in time, the guard we hold stays up: a plain
+					-- block instead of a full hit.)
+					-- (v306: what stops a fresh guard is the ~0.17 s after a let-go, not the time since the last
+					-- guard came up - measured. A guard we hold, or have just pressed and is on its way, stays.)
+					local noFresh = t + (tonumber(G.FTRelGap) or 0.16) + Block.lat(0.75) > H - 0.02
+					local ours = tc.isBlocking and (blockUp or (lastPress > 0 and t - lastPress < Block.lat(0.9) + 0.05))
+					local holdThrough = G.FTHoldThrough ~= false and ours and not attacking and (blkUpAt + 0.40 > H or noFresh)
 					if holdThrough and Block.heldFor ~= H then
 						Block.heldFor = H
 						PStats.heldThrough = (PStats.heldThrough or 0) + 1
@@ -5354,37 +5495,46 @@ do
 					end
 					-- is the next hit inside the window of the press we already made?
 					-- (v197: a press shows up as Blocking 0.05-0.11s later; one that has not by 0.13s was refused)
-					local covered = lastPress > 0 and H <= lastPress + 0.29 and (parrying or t - lastPress < (confirmed and 0.16 or 0.12))
+					local latHi = Block.lat(0.9)
+					local pressLead = math.clamp(Block.lat(0.75) + 0.10, 0.26, 0.5)
+					local covered = lastPress > 0 and H <= lastPress + latHi + 0.27 and (parrying or confirmed or t - lastPress < latHi + 0.04)
 					-- (v197, measured over 57 presses: a block asked for in the very frame our swing ends, or
 					-- within 0.05s of the old block ending, is silently refused - 6 of 6 - while 0.05s after the
 					-- swing and 0.09s after a block it always came up. So the old block is let go early, and
 					-- the press waits those few hundredths unless the hit is too close to wait.)
-					local urgent = t >= H - 0.10
+					-- (v300, traced at the Mountain Ape with v299: all 5 hits still taken in 60 s were its combo
+					-- follow-up, shining 0.47 s after the first; the press waited out the "settle" time after the
+					-- old guard and went out 0.26 s after the shine, the guard landing 0.2 s after the hit. Those
+					-- settle times were measured when slow guards were wrongly called refused. Inside the press
+					-- window now nothing waits.)
+					local urgent = t >= H - (G.FTSettleOld and 0.10 or pressLead)
 					-- (v206, traced in fights: the block only cuts a swing short in its first 0.3 s - 7 of 7 up to
 					-- 0.32 s after the swing was sent, 0 of 3 from 0.39 s on, where the block stays refused until
 					-- the swing is over. So a swing that is still young is cut a little early, while it still can be.)
 					local locked = attacking and t - (Block.swingAt or 0) >= 0.30
 					if holdThrough then
 						-- (guard stays up)
-					elseif not covered and tc.isBlocking and t >= H - 0.42 and not attacking then
-						pcall(tc.StopBlock, tc) -- (let go of the old / refused block; pressed again once it is down)
+					elseif not covered and tc.isBlocking and t >= H - (pressLead + 0.16) and not attacking then
+						Block.stop(tc) -- (let go of the old / refused block; pressed again once it is down)
 						if lastPress > 0 and not confirmed then
 							PStats.refused = (PStats.refused or 0) + 1
 						end
 						lastPress = 0
-					elseif not covered and t >= H - ((attacking and not locked) and 0.29 or 0.26) then
+					elseif not covered and t >= H - ((attacking and not locked) and (pressLead + 0.03) or pressLead) then
 						-- (v205, tested directly: a block asked for DURING our swing cuts the swing short and comes up
 						-- with its parry 0.06 s later - 5 of 5, asked 0.07-0.32 s into the swing. A swing asked for
 						-- during a block is refused and the block stays. So the press no longer waits for the swing.)
 						if attacking and (locked or G.FTSwingCancel == false) then
 							PStats.waitedSwing = (PStats.waitedSwing or 0) + 1 -- (our swing is still out: next frame)
 						elseif tc.isBlocking then
-							pcall(tc.StopBlock, tc)
+							Block.stop(tc)
 							lastPress = 0
 						-- (v198, traced: a press 0.08 s after the old block went down was refused 3 of 3, and the ones
 						-- that came up were all 0.33 s or more after the old block came UP)
 						elseif not urgent and ((not attacking and t - atkSeen < 0.05) or t - blkSeen < 0.10 or t - blkUpAt < 0.34) then
 							PStats.settled = (PStats.settled or 0) + 1 -- (too soon after our swing / block: next frame)
+						elseif t - (Block.relAt or 0) < (tonumber(G.FTRelGap) or 0.16) then
+							PStats.relWait = (PStats.relWait or 0) + 1 -- (v303: too soon after our let-go, it would be ignored)
 						elseif t < H - 0.03 then
 							pcall(tc.StartBlock, tc)
 							lastPress, confirmed = t, false
@@ -5396,8 +5546,34 @@ do
 					task.wait()
 				end
 			end)
-			if tc and tc.isBlocking then
-				pcall(tc.StopBlock, tc)
+			-- (v302: a combo follow-up expected soon - keep the guard up for it instead of letting go
+			-- just before its shine, which leaves no time for a fresh guard)
+			local P = Block.expect
+			local nowE = os.clock()
+			if G.FTEarlyRel ~= false then
+				-- (v307: with the early let-go, only a follow-up too close for a fresh guard is held for)
+				P = nil
+				if G.FTKeepForExpect ~= false then
+					for _, Pm in pairs(Block.expectBy or {}) do
+						if Pm and Pm > nowE - 0.08 and nowE + (tonumber(G.FTRelGap) or 0.16) > Pm + 0.34 - Block.lat(0.75) - 0.03 and (not P or Pm > P) then
+							P = Pm
+						end
+					end
+				end
+			end
+			if tc and tc.isBlocking and P and P > nowE - 0.08 and P - nowE < 0.7 and G.FTHoldCombo ~= false then
+				PStats.heldCombo2 = (PStats.heldCombo2 or 0) + 1
+				task.defer(function() -- (deferred: Block.running is cleared just below)
+					local untilT = P + 0.55
+					while os.clock() < untilT and not Block.running and alive do
+						task.wait()
+					end
+					if not Block.running and tc.isBlocking then
+						Block.stop(tc)
+					end
+				end)
+			elseif tc and tc.isBlocking then
+				Block.stop(tc)
 			end
 			table.clear(Block.hits)
 			if Block.hitMob then
@@ -5612,6 +5788,9 @@ end
 local dodgeParams = RaycastParams.new()
 dodgeParams.FilterType = Enum.RaycastFilterType.Exclude
 local function dodgeOnce(fromPos, distOverride)
+	if G.FTNoDodge then
+		return false -- (v299, asked for while testing parries: no stepping out at all)
+	end
 	local c, hrp = char()
 	if not hrp then
 		return false
@@ -5685,7 +5864,7 @@ local function dodgeFrom(fromPos, distOverride)
 		local k = tostring(okL and ln or '?')
 		by[k] = (by[k] or 0) + 1
 	end
-	if combatStyle() == 'Attack only' then
+	if combatStyle() == 'Attack only' or G.FTNoDodge then
 		return false -- (v236, asked for: no dodging, no blocking, just stand in reach and swing)
 	end
 	if dodgeOnce(fromPos, distOverride) then
