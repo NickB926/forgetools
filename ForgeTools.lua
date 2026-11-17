@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v311'
+local BUILD = 'forge-tools-v313'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -9817,18 +9817,43 @@ do
 		if hrp and (hrp.Position - pos).Magnitude > 250 then
 			-- The cage is in the Abyss lobby far off the map: use the game's own teleport there
 			-- (same as the Events page "Abyss" button), not a long walk.
-			setStatus('abyss: teleporting to the Abyss lobby')
-			pcall(function()
-				service('AbyssService'):Enter():await()
-			end)
+			-- (v312, the user: "auto abyss still flying me over there, instead of using the teleport, it
+			-- needs multiple checks in case i was in combat and got back out of it". Enter was asked once;
+			-- when the game said no (in combat) it fell through to a 12,856 stud glide. Now it asks again
+			-- every few seconds for up to 45 s and never glides out there: if it is still refused, it
+			-- tries again on the next round.)
+			local arrived, tries = false, 0
 			local t0 = os.clock()
-			while os.clock() - t0 < 8 do
-				task.wait(0.5)
-				local _, h2 = char()
-				if h2 and (h2.Position - pos).Magnitude < 250 then
+			local from = hrp.Position
+			while settings.autoAbyss and alive and os.clock() - t0 < 45 and not Abyss.inRun() do
+				tries += 1
+				setStatus(('abyss: teleporting to the Abyss lobby (try %d)'):format(tries))
+				local okE, rE, vE = pcall(function()
+					return service('AbyssService'):Enter():await()
+				end)
+				G.FTAbyssEnter = { ok = okE, res = tostring(rE) .. ' ' .. tostring(vE), at = os.time(), tries = tries }
+				local t1 = os.clock()
+				while os.clock() - t1 < 4 do
+					task.wait(0.25)
+					local _, h2 = char()
+					-- (v313, seen live: the lobby drop point is 313 studs from the cage, so "within 250" never
+					-- came true and it kept asking. Arrived = jumped a long way, or the cage is close.)
+					if h2 and ((h2.Position - pos).Magnitude < 700 or (h2.Position - from).Magnitude > 1000) then
+						arrived = true
+						break
+					end
+				end
+				if arrived then
 					break
 				end
+				setStatus(('abyss: teleport refused (in combat?) - asking again (try %d)'):format(tries))
+				task.wait(1)
 			end
+			if not arrived then
+				lastTry = os.clock() - 10 -- (next round in ~5 s, not 15)
+				return true
+			end
+			task.wait(1)
 		end
 		setStatus('abyss: walking to the cage')
 		if not tweenTo(CFrame.new(pos + Vector3.new(0, 2, 4))) then
