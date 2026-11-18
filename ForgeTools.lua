@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v320'
+local BUILD = 'forge-tools-v326'
 local G = getgenv()
 local compile = loadstring or load
 
@@ -85,6 +85,7 @@ local defaults = {
 	skipLucky = false,
 	autoSell = false,
 	autoSellGear = false,
+	autoRecycle = false,
 	forgeWhenFull = false,
 	forgeAlternate = false,
 	autoEnhance = false,
@@ -1684,7 +1685,7 @@ function Nav.hop(dest, opts)
 	while alive and os.clock() - t0 < 8 do
 		local _, h = char()
 		if h and (h.Position - far.pos).Magnitude < 60 then
-			task.wait(1) -- (the arrival effect)
+			task.wait(0.4) -- (the arrival effect; v324: was 1 s)
 			G.FTHops = (G.FTHops or 0) + 1
 			return true
 		end
@@ -1719,7 +1720,8 @@ local function tweenTo(cf, opts)
 		-- straight trip; the long glide below does 1,000 studs in about 16 s; and measured: a stone
 		-- refuses a teleport asked for in the first seconds after arriving at it.)
 		if settings.useWaypoints == true then
-			pcall(Nav.hop, trip.dest, opts)
+			local okH, hopped = pcall(Nav.hop, trip.dest, opts)
+			trip.hopped = okH and hopped == true
 		end
 	end
 	G.FTTrips = G.FTTrips or {}
@@ -1735,7 +1737,12 @@ local function tweenTo(cf, opts)
 		-- (v221, the user on island 3: "going through too many walls seems to backtrack you back to the
 		-- spawn ... just walk through the areas like you did before". Measured there: 340 studs glided,
 		-- 330 snapped back, over and over for 4 minutes. So no first-choice glide on island 3.)
-		if hf0 and ((trip.dest - hf0.Position).Magnitude > 300 or Door.hits(hf0.Position, trip.dest, 8)) and not (opts and opts.noFly) then
+		-- (v324, the user: "when using waypoint warp after its teleported, theres a delay before it paths to
+		-- the next location". Measured: Holy Tree stone -> Spirit Cave, 260 studs across and 160 down - the
+		-- walk planner found no direct path, then planned "via known spots" in bursts: 36 s from the warp to
+		-- the rock. Right after a warp, anything over 100 studs is glided in one go.)
+		local farAfterHop = trip.hopped and hf0 and (trip.dest - hf0.Position).Magnitude > 100
+		if hf0 and (farAfterHop or (trip.dest - hf0.Position).Magnitude > 300 or Door.hits(hf0.Position, trip.dest, 8)) and not (opts and opts.noFly) then
 			Nav.flyAt = os.clock()
 			local okF, res, off = pcall(Nav.fly, trip.dest, opts, true)
 			G.FTFlyLast = ('%s first-choice glide: %s %s'):format(os.date('%H:%M:%S'), tostring(okF), tostring(res))
@@ -2482,32 +2489,69 @@ local function rockList()
 	-- the next best kind is the one with the most health below the picked ones (huge > large >
 	-- medium > small), and kinds bigger than the picked ones come last.
 	local sel = type(settings.mineRocks) == 'table' and next(settings.mineRocks) and settings.mineRocks or nil
+	-- (v322, reported "i had selected mine only picked rocks and it just ceases". Rocks spawn as a random
+	-- kind at each spot - island 4's Spirit Cave has 36 spots and only 3 Spirit Rocks up at a time - so
+	-- the zones a picked kind spawns in are learned by seeing it. That memory used to live only until a
+	-- rejoin; with none of the picked rocks up right then nothing was left to mine and it stood still.
+	-- Now it is kept in the settings file, per rock kind.)
+	if sel then
+		settings.pickedZones = type(settings.pickedZones) == 'table' and settings.pickedZones or {}
+		if not settings.pickedZones['Spirit Rock'] then
+			settings.pickedZones['Spirit Rock'] = { I4_SpiritCave = true } -- (seen there, 2026-11-17)
+		end
+		local learned = false
+		for _, zone in ipairs(rocks:GetChildren()) do
+			for _, sp in ipairs(zone:GetChildren()) do
+				local m = sp:FindFirstChildWhichIsA('Model')
+				if m and sel[m.Name] then
+					local zt = settings.pickedZones[m.Name]
+					if type(zt) ~= 'table' then
+						zt = {}
+						settings.pickedZones[m.Name] = zt
+					end
+					if not zt[zone.Name] then
+						zt[zone.Name] = true
+						learned = true
+					end
+				end
+			end
+		end
+		if learned then
+			save()
+		end
+	end
 	-- (v293, asked: Spirit Rocks only. With "mine only the picked rocks" on, no other kind is mined
 	-- when none of the picked ones is standing - it waits for them instead. Quest rocks still win.)
 	if sel and settings.mineOnlyPicked and not G.FTQuestRock and not G.FTQuestRocks then
 		-- (v294, asked: "shit stopped mining" - every Spirit Rock was mined out and it stood still.
 		-- Zones where a picked rock has stood are remembered; while none is up, it mines the other
 		-- rocks in those zones only, so it stays where the picked ones spawn. No zone known yet: waits.)
-		G.FTPickedZones = G.FTPickedZones or {}
+		G.FTPickedZones = {}
+		for name in pairs(sel) do
+			for zn in pairs(type(settings.pickedZones[name]) == 'table' and settings.pickedZones[name] or {}) do
+				G.FTPickedZones[zn] = true
+			end
+		end
 		local anyPicked = false
 		for _, e in ipairs(list) do
 			if sel[e.m.Name] then
 				anyPicked = true
-				G.FTPickedZones[e.zone] = true
 			end
 		end
-		for _, zone in ipairs(rocks:GetChildren()) do
-			for _, sp in ipairs(zone:GetChildren()) do
-				local m = sp:FindFirstChildWhichIsA('Model')
-				if m and sel[m.Name] then
-					G.FTPickedZones[zone.Name] = true
-				end
+		local kept = {}
+		for _, e in ipairs(list) do
+			if sel[e.m.Name] or (not anyPicked and G.FTPickedZones[e.zone]) then
+				kept[#kept + 1] = e
 			end
 		end
-		for i = #list, 1, -1 do
-			if not sel[list[i].m.Name] and (anyPicked or not G.FTPickedZones[list[i].zone]) then
-				table.remove(list, i)
-			end
+		-- (nothing at all left - no zone known for the picked kinds yet, or every rock there is mined or
+		-- taken: mine the nearest rocks rather than stand still. The picked kinds still come first the
+		-- moment one is up.)
+		if #kept > 0 then
+			list = kept
+			G.FTPickedFallback = nil
+		else
+			G.FTPickedFallback = os.clock()
 		end
 	end
 	if sel and not G.FTQuestRock and not G.FTQuestRocks then
@@ -2544,8 +2588,23 @@ local function rockList()
 		for i, name in ipairs(order) do
 			tier[name] = i
 		end
+		-- (v323, reported: "it really likes to go away from the spirit cave even though i got spirit rock and
+		-- sakura crystal selected". With no Spirit Rock up, the next kind by size was Glowy Rock (18k, just
+		-- under the Spirit Rock's 20k) in the Holy Cave, 100+ studs up, wherever it was; the cave's own Soul
+		-- Boulders and Thunder Cores are bigger, so they came last. Now: picked kinds first, then any rock
+		-- in a zone where a picked kind spawns (nearest first), then the size order elsewhere.)
+		local homeZones = {}
+		for name in pairs(sel) do
+			for zn in pairs(type(settings.pickedZones) == 'table' and type(settings.pickedZones[name]) == 'table' and settings.pickedZones[name] or {}) do
+				homeZones[zn] = true
+			end
+		end
 		for _, e in ipairs(list) do
-			e.score += (tier[e.m.Name] or 0) * 100000
+			if sel[e.m.Name] then
+				e.score -= 100000
+			elseif not homeZones[e.zone] then
+				e.score += (tier[e.m.Name] or 0) * 100000
+			end
 		end
 	end
 	-- Marked rocks (the game's "RockMutation" attribute: Galaxy = Galactic, Blessed, Prismatic...)
@@ -2651,20 +2710,21 @@ local function mineOnce()
 			table.remove(log, 1)
 		end
 	end
-	local function handleThreat()
-		local th = threatNow()
-		if not th then
+	-- (v291, asked: "mine spirit rocks ignore mobs". With ignoreMobs on, a mob near the rock is not
+	-- fought: mining goes on. Kinds that have killed us and low health still pull us away, and
+	-- attack markers / projectiles are still stepped out of by the hazard loop.)
+	local function ignored(th)
+		if not settings.ignoreMobs then
 			return false
 		end
-		-- (v291, asked: "mine spirit rocks ignore mobs". With ignoreMobs on, a mob near the rock is not
-		-- fought: mining goes on. Kinds that have killed us and low health still pull us away, and
-		-- attack markers / projectiles are still stepped out of by the hazard loop.)
-		if settings.ignoreMobs then
-			local _, _, hm = char()
-			local pctI = hm and hm.MaxHealth > 0 and hm.Health / hm.MaxHealth * 100 or 100
-			if not Deadly.avoid(th.m) and pctI >= math.max(40, tonumber(settings.retreatHp) or 0) then
-				return false
-			end
+		local _, _, hm = char()
+		local pctI = hm and hm.MaxHealth > 0 and hm.Health / hm.MaxHealth * 100 or 100
+		return not Deadly.avoid(th.m) and pctI >= math.max(40, tonumber(settings.retreatHp) or 0)
+	end
+	local function handleThreat()
+		local th = threatNow()
+		if not th or ignored(th) then
+			return false
 		end
 		why('threat ' .. tostring(th.m and th.m.Name) .. (' %.0f studs from us'):format(th.d or -1))
 		-- (measured: 10 of 14 rocks were left this way, each for one spider, and the next rock was 100-200
@@ -2707,7 +2767,14 @@ local function mineOnce()
 		return takenNow
 	end
 	local okGo, whyGo = tweenTo(standNear(target.hb, 2), { alt = alt, abort = function()
-		return not (settings.autoMine or G.FTQuestWantsOre) or not target.m.Parent or threatNow() ~= nil or takenByOther()
+		if not (settings.autoMine or G.FTQuestWantsOre) or not target.m.Parent or takenByOther() then
+			return true
+		end
+		-- (v321, reported "stops mining sometimes": with Ignore mobs on, a mob within 30 studs of the rock
+		-- called the trip off 26 studs short, the mob was then ignored, and "knocked far away" ended the
+		-- mining - 15 times in 4 s, standing still until the mob wandered off.)
+		local th = threatNow()
+		return th ~= nil and not ignored(th)
 	end, onRelay = function()
 		setStatus(('mining %s (%.0f studs) — long route, walking via known spots'):format(target.m.Name, target.d))
 	end })
@@ -2796,6 +2863,16 @@ local function mineOnce()
 		end
 		if tooStrong[target.m.Name] then
 			break -- (just learned this type needs more damage than the pickaxe has)
+		end
+		do
+			-- (v321: a mob's hits stun us and the swings do nothing meanwhile - measured 1.5 s stuns from a
+			-- Spirit Golem. That is not the rock's fault: stunned time does not count toward "no damage".)
+			local cS = LocalPlayer.Character
+			local stS = cS and cS:FindFirstChild('Status')
+			if stS and stS:FindFirstChild('Stun') then
+				lastChange = math.max(lastChange, os.clock() - 1)
+				G.FTMineStunned = (G.FTMineStunned or 0) + 1
+			end
 		end
 		if hp ~= lastHp then
 			lastHp, lastChange = hp, os.clock()
@@ -6508,6 +6585,12 @@ end
 
 local function fightOnce(forced)
 	local function allowed()
+		-- (v320: in a raid, Auto kill mobs switched off ends the fight at once - a fight already under
+		-- way used to run on for ~9 s on the raid's own "want mobs" flag)
+		if forced == nil and not settings.autoMobs and game.PlaceId == 84980181568016
+			and not (settings.autoAbyss and workspace:GetAttribute('AbyssRun') == true) then
+			return false
+		end
 		return forced ~= nil or settings.autoMobs or QS.wantMobs
 	end
 	if not (LocalPlayer.Backpack:FindFirstChild('Weapon') or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('Weapon'))) then
@@ -8540,6 +8623,84 @@ do
 		return sold > 0
 	end
 
+	-- Auto recycle (v326, asked for: "if ur auto forging, go recycle the shit that was forged"):
+	-- spare gear goes back into ores instead of being sold. Same picks as auto sell gear (never
+	-- worn, the best of each slot, favorites, pickaxes). The game charges gold equal to the items'
+	-- sell price and gives back half the ores (InventoryService.RecycleBasket, the Recycle screen).
+	local recycleAt = 0
+	function Quest.recycleNeeded()
+		if not settings.autoRecycle or os.clock() < recycleAt then
+			return false
+		end
+		return #gearToSell() >= 1
+	end
+	function Quest.recycleGear()
+		if #gearToSell() == 0 then
+			return false
+		end
+		recycleAt = os.clock() + 120
+		local IS = service('InventoryService')
+		local okE, Equip = pcall(function()
+			return require(RS.Shared.Data.Equipments)
+		end)
+		if not IS or not okE or not Equip then
+			setStatus("auto recycle: the game's inventory service was not found")
+			return false
+		end
+		local names, short = {}, 0
+		local function run()
+			local now = gearToSell()
+			table.sort(now, function(a, b)
+				return itemScore(a) < itemScore(b)
+			end)
+			local gold = tonumber((data() or {}).Gold) or 0
+			local basket, cost = {}, 0
+			names, short = {}, 0
+			for _, e in ipairs(now) do
+				local okP, p = pcall(Equip.CalculatePrice, Equip, e)
+				p = okP and tonumber(p) or 0
+				if cost + p <= gold then
+					basket[e.GUID] = true
+					cost += p
+					names[#names + 1] = tostring(e.Type)
+				else
+					short += 1
+				end
+			end
+			if #names == 0 then
+				return 0, 0
+			end
+			local before = #(data().Inventory.Equipments or {})
+			setStatus(('recycling %d spare gear (%s gold)'):format(#names, tostring(math.floor(cost))))
+			pcall(function()
+				IS:RecycleBasket(basket)
+			end)
+			local t0 = os.clock()
+			while os.clock() - t0 < 3 and #(data().Inventory.Equipments or {}) == before do
+				task.wait(0.1)
+			end
+			return before - #(data().Inventory.Equipments or {}), cost
+		end
+		-- from wherever we are first; at Marbles (who has the Recycle screen) only if that did not go through
+		local done, cost = run()
+		if done <= 0 and #names > 0 then
+			local npc = npcModel('Marbles')
+			if npc and goTo(npc) then
+				done, cost = run()
+				closeDialogue()
+			end
+		end
+		if done > 0 then
+			recycleAt = 0
+			setStatus(('recycled %d spare gear for %s gold (%s)'):format(done, tostring(math.floor(cost)), table.concat(names, ', '):sub(1, 80)))
+		elseif #names == 0 and short > 0 then
+			setStatus(('auto recycle: not enough gold for %d spare item(s) - trying again in 2 min'):format(short))
+		else
+			setStatus('auto recycle: the game did not take the items - trying again in 2 min')
+		end
+		return done > 0
+	end
+
 	-- "Bring X to NPC" quests (Lost Guitar, Lost Cat): pick up the NPC's item (a Functionals prop
 	-- named NPC..Item, e.g. BardGuitar) and then talk to the NPC.
 	local extraAt = {}
@@ -10132,26 +10293,65 @@ do
 			G.FTCutsceneConn:Disconnect()
 		end
 		local pg = LocalPlayer:FindFirstChildOfClass('PlayerGui')
-		G.FTCutsceneConn = pg and pg.DescendantAdded:Connect(function(d)
-			if not alive or d.Name ~= 'Skip' or not d:IsA('GuiButton') or not d:FindFirstAncestor('BossCutscene') then
+		-- (v325, reported "skip cutscene broke": the game's Skip button (ReplicatedStorage.Assets.Effects.
+		-- AsuraMorph.Assets.BossCutscene.Frame.Skip) starts hidden and is shown a moment later. The old code
+		-- pressed it for 3.5 s from when it was added, so a late-shown button got every press while hidden -
+		-- the 11:40 fight played the whole cutscene. Now the screen is watched for as long as it is up and
+		-- the button pressed whenever it is showing.)
+		local watching = setmetatable({}, { __mode = 'k' })
+		local function watchCutscene(gui)
+			if watching[gui] then
 				return
 			end
-			task.wait(0.3)
-			for _ = 1, 8 do
-				if not alive or not d.Parent then
-					break
+			watching[gui] = true
+			task.spawn(function()
+				local t0, presses, wasShown = os.clock(), 0, false
+				while alive and gui.Parent and os.clock() - t0 < 60 do
+					local btn = gui:FindFirstChild('Skip', true)
+					local shown = btn ~= nil and btn:IsA('GuiButton') and btn.Visible
+					if shown then
+						local q = btn.Parent
+						while q and q ~= gui do
+							if q:IsA('GuiObject') and not q.Visible then
+								shown = false
+								break
+							end
+							q = q.Parent
+						end
+					end
+					if shown and (not gui:IsA('ScreenGui') or gui.Enabled) then
+						wasShown = true
+						presses += 1
+						pcall(function()
+							firesignal(btn.Activated)
+						end)
+						pcall(function()
+							firesignal(btn.MouseButton1Click)
+						end)
+						task.wait(0.4)
+					else
+						task.wait(0.15)
+					end
 				end
-				pcall(function()
-					firesignal(d.Activated)
-				end)
-				pcall(function()
-					firesignal(d.MouseButton1Click)
-				end)
-				task.wait(0.4)
+				watching[gui] = nil
+				G.FTCutsceneSkips = (G.FTCutsceneSkips or 0) + 1
+				statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: cutscene %s after %.0f s (%d skip presses%s)'):format(
+					gui.Parent and 'still up' or 'gone', os.clock() - t0, presses, wasShown and '' or ', Skip button never showed')
+			end)
+		end
+		G.FTCutsceneConn = pg and pg.DescendantAdded:Connect(function(d)
+			if not alive then
+				return
 			end
-			G.FTCutsceneSkips = (G.FTCutsceneSkips or 0) + 1
-			statusLog[#statusLog + 1] = os.date('%H:%M:%S ') .. ('boss: cutscene skip pressed (button %s)'):format(d.Parent and 'still there' or 'gone')
+			local gui = d.Name == 'BossCutscene' and d or d:FindFirstAncestor('BossCutscene')
+			if gui then
+				watchCutscene(gui)
+			end
 		end)
+		local now0 = pg and pg:FindFirstChild('BossCutscene')
+		if now0 then
+			watchCutscene(now0)
+		end
 	end)
 	function Boss.gate()
 		local prox = workspace:FindFirstChild('Proximity')
@@ -10915,11 +11115,51 @@ local Window = Library:CreateWindow({
 		end
 	end,
 })
-local Tab = Window:AddTab('Main', 'pickaxe')
-local FarmBox = Tab:AddLeftGroupbox('Mining & selling')
-local ForgeBox = Tab:AddRightGroupbox('Forge')
-local MobBox = Tab:AddLeftGroupbox('Mobs')
-local InfoBox = Tab:AddRightGroupbox('Status')
+-- (v326, asked for: options split over tabs instead of one long Main page; every box starts folded)
+local UI = {}
+do
+	local home = Window:AddTab('Home', 'home')
+	UI.status = home:AddLeftGroupbox('Status')
+	UI.travel = home:AddLeftGroupbox('Travel')
+	UI.move = home:AddRightGroupbox('Movement')
+	UI.menus = home:AddRightGroupbox('Game menus')
+	UI.script = home:AddRightGroupbox('Script')
+	local mine = Window:AddTab('Mining', 'pickaxe')
+	UI.mine = mine:AddLeftGroupbox('Mining')
+	UI.potions = mine:AddLeftGroupbox('Potions')
+	UI.rocks = mine:AddRightGroupbox('Which rocks')
+	local sell = Window:AddTab('Selling', 'coins')
+	UI.sellOres = sell:AddLeftGroupbox('Ores')
+	UI.sellGear = sell:AddLeftGroupbox('Gear')
+	UI.sellRunes = sell:AddRightGroupbox('Runes')
+	local forge = Window:AddTab('Forge', 'anvil')
+	UI.forge = forge:AddLeftGroupbox('Forging')
+	UI.recycle = forge:AddLeftGroupbox('Recycle')
+	UI.forgeOres = forge:AddRightGroupbox('Ores and targets')
+	UI.enhance = forge:AddRightGroupbox('Enhance & equip')
+	local combat = Window:AddTab('Combat', 'sword')
+	UI.mobs = combat:AddLeftGroupbox('Mobs')
+	UI.health = combat:AddLeftGroupbox('Health')
+	UI.defense = combat:AddRightGroupbox('Block & dodge')
+	UI.combatMisc = combat:AddRightGroupbox('Tools')
+	local abyss = Window:AddTab('Abyss & raids', 'skull')
+	UI.abyss = abyss:AddLeftGroupbox('Abyss')
+	UI.boss = abyss:AddLeftGroupbox('Boss')
+	UI.raids = abyss:AddRightGroupbox('Raids')
+	local quests = Window:AddTab('Quests', 'scroll')
+	UI.quests = quests:AddLeftGroupbox('Quests')
+	UI.rewards = quests:AddRightGroupbox('Rewards')
+	UI.shop = quests:AddRightGroupbox('Shop')
+	local race = Window:AddTab('Race & runes', 'dna')
+	UI.race = race:AddLeftGroupbox('Race reroll')
+	UI.swap = race:AddLeftGroupbox('Race swap')
+	UI.runes = race:AddRightGroupbox('Runes')
+	task.defer(function()
+		pcall(function()
+			home:Show()
+		end)
+	end)
+end
 
 -- Every feature toggle starts OFF each time the script loads (sliders / dropdowns keep their values)
 -- EXCEPT right after a teleport (Abyss in/out, island travel): then they carry over.
@@ -11004,11 +11244,11 @@ local function mobNames()
 	return out
 end
 
-bindToggle(FarmBox, 'FTAutoMine', 'autoMine', 'Auto mine', 'Tweens to the nearest rock and mines it. Rock types your pickaxe cannot damage are skipped.')
-bindToggle(FarmBox, 'FTMineOnlyPicked', 'mineOnlyPicked', 'Mine only the picked rocks', 'With rocks picked under "Mine these rocks first", nothing else is mined while none of them is standing.')
-bindToggle(FarmBox, 'FTIgnoreMobs', 'ignoreMobs', 'Ignore mobs while mining', 'Keeps mining when a mob comes up instead of fighting it. Attack markers are still dodged; low health and mobs that have killed you still pull it away.')
-bindToggle(FarmBox, 'FTMineMeteors', 'mineMeteors', 'Break event meteors', 'When an event drops meteors (Inferno, Prismatic, Fichillium, comet rocks) the bot goes to each one and breaks it with the pickaxe before anything else. They only last 90 seconds.')
-local zoneDD = bindDropdown(FarmBox, 'FTMineZone', 'mineZone', 'Mine in', zoneNames())
+bindToggle(UI.mine, 'FTAutoMine', 'autoMine', 'Auto mine', 'Tweens to the nearest rock and mines it. Rock types your pickaxe cannot damage are skipped.')
+bindToggle(UI.rocks, 'FTMineOnlyPicked', 'mineOnlyPicked', 'Mine only the picked rocks', 'With rocks picked under "Mine these rocks first", nothing else is mined while none of them is standing.')
+bindToggle(UI.mine, 'FTIgnoreMobs', 'ignoreMobs', 'Ignore mobs while mining', 'Keeps mining when a mob comes up instead of fighting it. Attack markers are still dodged; low health and mobs that have killed you still pull it away.')
+bindToggle(UI.mine, 'FTMineMeteors', 'mineMeteors', 'Break event meteors', 'When an event drops meteors (Inferno, Prismatic, Fichillium, comet rocks) the bot goes to each one and breaks it with the pickaxe before anything else. They only last 90 seconds.')
+local zoneDD = bindDropdown(UI.rocks, 'FTMineZone', 'mineZone', 'Mine in', zoneNames())
 local function rockNames()
 	local hp, out = {}, {}
 	local rocks = workspace:FindFirstChild('Rocks')
@@ -11059,7 +11299,7 @@ pcall(function()
 				def[#def + 1] = labelOf[id]
 			end
 		end
-		FarmBox:AddDropdown('FTMineMutations', { Text = 'Marked rocks first', Values = labels, Multi = true, Default = def, AllowNull = true,
+		UI.rocks:AddDropdown('FTMineMutations', { Text = 'Marked rocks first', Values = labels, Multi = true, Default = def, AllowNull = true,
 			Tooltip = 'Rocks carrying one of these marks (Galactic, Blessed, Prismatic...) are mined before anything else, whatever kind of rock they are and wherever they are on the map. Nothing picked = off.' }):OnChanged(function(v)
 			local out = {}
 			for label, on in pairs(type(v) == 'table' and v or {}) do
@@ -11071,7 +11311,7 @@ pcall(function()
 			save()
 		end)
 	end)
-	rockDD = FarmBox:AddDropdown('FTMineRocks', { Text = 'Mine these rocks first', Values = rockNames(), Multi = true, Default = settings.mineRocks, AllowNull = true,
+	rockDD = UI.rocks:AddDropdown('FTMineRocks', { Text = 'Mine these rocks first', Values = rockNames(), Multi = true, Default = settings.mineRocks, AllowNull = true,
 		Tooltip = 'Works with Auto mine. Picked rocks are mined before anything else, however far. When none of them is up, it takes the next best kind: the one with the most health below your pick (huge > large > medium > small). Nothing picked = nearest rock, as before. Listed from most health to least.' })
 	rockDD:OnChanged(function(v)
 		local out = {}
@@ -11085,11 +11325,11 @@ pcall(function()
 		save()
 	end)
 end)
-bindToggle(FarmBox, 'FTSkipLucky', 'skipLucky', 'Skip Lucky Blocks', 'Lucky Blocks have 10,000 HP.')
-bindToggle(FarmBox, 'FTAutoSellRunes', 'autoSellRunes', 'Auto sell runes', 'Sells runes from wherever you are (raids too), as they come in. Only Common, Uncommon and Rare runes up to the tier below, and never a kind picked under "Runes to keep", an Epic or rarer rune, or a favorited one.')
-bindToggle(FarmBox, 'FTRuneSellEpic', 'runeSellEpic', 'Also sell Epic and rarer runes', 'Off: only Common, Uncommon and Rare runes are sold. On: Epic and rarer runes are sold too, unless their kind is picked under "Runes to keep". Starts off every time the script loads.')
-bindSlider(FarmBox, 'FTRuneKeepTier', 'runeKeepTier', 'Keep those kinds from tier', 1, 3, 'The kinds picked under "Runes to keep" are only kept at this tier or higher: at 3, their tier I and II copies are sold like any other rune.')
-bindSlider(FarmBox, 'FTRuneSellTier', 'runeSellTier', 'Sell runes up to tier', 1, 5, 'Tier 1 = Frost Speck, Rage Mark, Ward Patch and the like. Runes of a higher tier than this are kept.')
+bindToggle(UI.rocks, 'FTSkipLucky', 'skipLucky', 'Skip Lucky Blocks', 'Lucky Blocks have 10,000 HP.')
+bindToggle(UI.sellRunes, 'FTAutoSellRunes', 'autoSellRunes', 'Auto sell runes', 'Sells runes from wherever you are (raids too), as they come in. Only Common, Uncommon and Rare runes up to the tier below, and never a kind picked under "Runes to keep", an Epic or rarer rune, or a favorited one.')
+bindToggle(UI.sellRunes, 'FTRuneSellEpic', 'runeSellEpic', 'Also sell Epic and rarer runes', 'Off: only Common, Uncommon and Rare runes are sold. On: Epic and rarer runes are sold too, unless their kind is picked under "Runes to keep". Starts off every time the script loads.')
+bindSlider(UI.sellRunes, 'FTRuneKeepTier', 'runeKeepTier', 'Keep those kinds from tier', 1, 3, 'The kinds picked under "Runes to keep" are only kept at this tier or higher: at 3, their tier I and II copies are sold like any other rune.')
+bindSlider(UI.sellRunes, 'FTRuneSellTier', 'runeSellTier', 'Sell runes up to tier', 1, 5, 'Tier 1 = Frost Speck, Rage Mark, Ward Patch and the like. Runes of a higher tier than this are kept.')
 pcall(function()
 	local names, seen = {}, {}
 	pcall(function()
@@ -11110,7 +11350,7 @@ pcall(function()
 		end
 	end
 	table.sort(names)
-	local dd = FarmBox:AddDropdown('FTRuneKeep', { Text = 'Runes to keep', Values = names, Multi = true, Default = settings.runeKeep, AllowNull = true,
+	local dd = UI.sellRunes:AddDropdown('FTRuneKeep', { Text = 'Runes to keep', Values = names, Multi = true, Default = settings.runeKeep, AllowNull = true,
 		Tooltip = 'These kinds are never sold, whatever their tier. Every other rune below Epic (and within the tier above) is sold - all copies of it.' })
 	dd:OnChanged(function(v)
 		local out = {}
@@ -11123,18 +11363,18 @@ pcall(function()
 		save()
 	end)
 end)
-bindToggle(FarmBox, 'FTAutoLuckPotion', 'autoLuckPotion', 'Auto luck potions (buy + drink)', 'Keeps a Luck Potion running: drinks them up to the 1 hour cap (never past it). Only buys more (10, the most the shop lets you hold) once you have none of that potion left.')
-bindToggle(FarmBox, 'FTAutoMinerPotion', 'autoMinerPotion', 'Auto miner potions (buy + drink)', 'Keeps a Miner Potion running: drinks them up to the 15 minute cap (3 potions - more would be wasted). Only buys more (10, the most the shop lets you hold) once you have none of that potion left.')
-bindToggle(FarmBox, 'FTAutoSell', 'autoSell', 'Auto sell ores', 'Sells your ores at Greedy Cey when the bag reaches the % below.')
-bindSlider(FarmBox, 'FTSellAt', 'sellAt', 'Sell when bag is % full', 20, 100)
-bindToggle(FarmBox, 'FTAutoSellGear', 'autoSellGear', 'Auto sell spare gear', 'Sells weapons and armor at Marbles once 3+ spares pile up. Never sells what you are wearing, the best item of each slot (weapon / helmet / chestplate / leggings), favorited items or pickaxes.')
-FarmBox:AddButton('Sell ores now', function()
+bindToggle(UI.potions, 'FTAutoLuckPotion', 'autoLuckPotion', 'Auto luck potions (buy + drink)', 'Keeps a Luck Potion running: drinks them up to the 1 hour cap (never past it). Only buys more (10, the most the shop lets you hold) once you have none of that potion left.')
+bindToggle(UI.potions, 'FTAutoMinerPotion', 'autoMinerPotion', 'Auto miner potions (buy + drink)', 'Keeps a Miner Potion running: drinks them up to the 15 minute cap (3 potions - more would be wasted). Only buys more (10, the most the shop lets you hold) once you have none of that potion left.')
+bindToggle(UI.sellOres, 'FTAutoSell', 'autoSell', 'Auto sell ores', 'Sells your ores at Greedy Cey when the bag reaches the % below.')
+bindSlider(UI.sellOres, 'FTSellAt', 'sellAt', 'Sell when bag is % full', 20, 100)
+bindToggle(UI.sellGear, 'FTAutoSellGear', 'autoSellGear', 'Auto sell spare gear', 'Sells weapons and armor at Marbles once 3+ spares pile up. Never sells what you are wearing, the best item of each slot (weapon / helmet / chestplate / leggings), favorited items or pickaxes.')
+UI.sellOres:AddButton('Sell ores now', function()
 	sellOres()
 end)
 -- The ore craft menu, from anywhere (the game has an "Anywhere" station of its own: opening
 -- with no station uses it). The game's code must run at its own thread identity - at ours it
 -- stops half way ("Cannot require a non-RobloxScript module") with the player left frozen.
-FarmBox:AddButton('Open / close craft menu', function()
+UI.menus:AddButton('Open / close craft menu', function()
 	task.spawn(function()
 		pcall(function()
 			local setid = setthreadidentity or setidentity
@@ -11230,15 +11470,15 @@ local function menuTab(tab)
 		end)
 	end)
 end
-FarmBox:AddButton('Open / close bag', function()
+UI.menus:AddButton('Open / close bag', function()
 	menuTab('Stash')
 end)
-FarmBox:AddButton('Open / close equipment', function()
+UI.menus:AddButton('Open / close equipment', function()
 	menuTab('Tools')
 end)
 
-bindToggle(ForgeBox, 'FTAutoForge', 'autoForge', 'Auto forge', 'When you have enough ores: tweens to the forge, puts them in and plays every minigame perfectly.')
-bindToggle(ForgeBox, 'FTForgeWhenFull', 'forgeWhenFull', 'Only forge when the stash is full', 'With Auto forge on: keeps mining until the stash is full, then forges until the stash is used up before mining again.')
+bindToggle(UI.forge, 'FTAutoForge', 'autoForge', 'Auto forge', 'When you have enough ores: tweens to the forge, puts them in and plays every minigame perfectly.')
+bindToggle(UI.forge, 'FTForgeWhenFull', 'forgeWhenFull', 'Only forge when the stash is full', 'With Auto forge on: keeps mining until the stash is full, then forges until the stash is used up before mining again.')
 -- The Forge box, kept short: what to make, how to pick the ores, which ores, how many.
 do
 	local MODES = { 'Traits (30% each)', 'Best stats', 'Most plentiful' }
@@ -11259,7 +11499,7 @@ do
 		settings.forgeBest = settings.forgeMode ~= MODES[3]
 	end
 	applyForge()
-	ForgeBox:AddDropdown('FTForgeWhat', { Text = 'Make', Values = { 'Weapon', 'Armor', 'Alternate' }, Default = settings.forgeWhat, AllowNull = false,
+	UI.forge:AddDropdown('FTForgeWhat', { Text = 'Make', Values = { 'Weapon', 'Armor', 'Alternate' }, Default = settings.forgeWhat, AllowNull = false,
 		Tooltip = 'Alternate = a weapon, then an armor piece, and so on.' }):OnChanged(function(v)
 		if type(v) == 'string' then
 			settings.forgeWhat = v
@@ -11267,7 +11507,7 @@ do
 			save()
 		end
 	end)
-	ForgeBox:AddDropdown('FTForgeMode', { Text = 'Ore pick', Values = MODES, Default = settings.forgeMode, AllowNull = false,
+	UI.forgeOres:AddDropdown('FTForgeMode', { Text = 'Ore pick', Values = MODES, Default = settings.forgeMode, AllowNull = false,
 		Tooltip = 'Traits: up to three trait ores at 30% or more each, so the item gets all their traits at full strength (an ore gives traits from 10% of the mix, full at 30%). Best stats: your strongest ores and the ore count with the best expected item. Most plentiful: uses up whatever you have most of.' }):OnChanged(function(v)
 		if type(v) == 'string' then
 			settings.forgeMode = v
@@ -11296,7 +11536,7 @@ do
 		table.sort(names)
 		return names
 	end
-	local onlyDD = ForgeBox:AddDropdown('FTForgeOnly', { Text = 'Ores to use', Values = oreChoices(), Multi = true, Default = settings.forgeOnlyOres, AllowNull = true,
+	local onlyDD = UI.forgeOres:AddDropdown('FTForgeOnly', { Text = 'Ores to use', Values = oreChoices(), Multi = true, Default = settings.forgeOnlyOres, AllowNull = true,
 		Tooltip = 'Pick ores and the forge uses only those. Nothing picked = any ore you have. The list is the ores in your stash; press "Refresh ore list" after mining new kinds.' })
 	onlyDD:OnChanged(function(v)
 		local out = {}
@@ -11308,7 +11548,7 @@ do
 		settings.forgeOnlyOres = out
 		save()
 	end)
-	ForgeBox:AddButton('Refresh ore list', function()
+	UI.forgeOres:AddButton('Refresh ore list', function()
 		pcall(function()
 			onlyDD:SetValues(oreChoices())
 		end)
@@ -11345,7 +11585,7 @@ do
 	if not labelOf[settings.forgePiece] then
 		settings.forgePiece = 'Any'
 	end
-	ForgeBox:AddDropdown('FTForgePiece', { Text = 'Piece target', Values = labels, Default = labelOf[settings.forgePiece] or 'Any', AllowNull = false,
+	UI.forgeOres:AddDropdown('FTForgePiece', { Text = 'Piece target', Values = labels, Default = labelOf[settings.forgePiece] or 'Any', AllowNull = false,
 		Tooltip = 'Pick a piece (e.g. Medium Leggings) and every forge uses the ore count that gives it the best chance, shown next to each name with that chance. It also decides weapon or armor while set. It is a chance, not a guarantee: for a guarantee use molds below. "Any" = off.' }):OnChanged(function(v)
 		if type(v) == 'string' then
 			settings.forgePiece = byLabel[v] or 'Any'
@@ -11388,7 +11628,7 @@ do
 			end
 		end
 	end)
-	ForgeBox:AddDropdown('FTForgeMold', { Text = 'Mold target', Values = labels, Default = labelOf[settings.forgeMold] or 'None', AllowNull = false,
+	UI.forgeOres:AddDropdown('FTForgeMold', { Text = 'Mold target', Values = labels, Default = labelOf[settings.forgeMold] or 'None', AllowNull = false,
 		Tooltip = 'Aims the forge at one item with molds. Only used when you own the full number of molds that guarantees that item (fewer is mostly wasted: half the molds is a quarter of the chance) and when "Make" is its type; the forge then waits for the minimum ore count of that item. Otherwise it forges normally and no molds are spent.' }):OnChanged(function(v)
 		if type(v) == 'string' then
 			settings.forgeMold = byLabel[v] or 'None'
@@ -11396,10 +11636,10 @@ do
 		end
 	end)
 end
-bindSlider(ForgeBox, 'FTForgeOres', 'forgeOres', 'Ores per forge (max)', 3, 60, 'The most ores one item may use. Left at 3, the smart picks treat it as no limit.')
-bindSlider(ForgeBox, 'FTForgeMinOres', 'forgeMinOres', 'Ores per forge (min)', 3, 60, 'The fewest ores one item may use. Few ores only ever make the small pieces (helmets, daggers): raise this for chestplates, leggings and big weapons. Trait mode with rare ores you only own 2 of otherwise settles on 6-ore items.')
-bindSlider(FarmBox, 'FTForgeKeep', 'forgeKeep', 'Keep of each ore (auto sell)', 0, 20, 'With auto forge on, auto sell leaves this many of each ore for forging.')
-bindToggle(FarmBox, 'FTKeepTraitOres', 'keepTraitOres', 'Keep ores that give traits', 'Ores that give an item a trait are never sold (auto sell and Sell ores now skip them). They can still be used for forging.')
+bindSlider(UI.forgeOres, 'FTForgeOres', 'forgeOres', 'Ores per forge (max)', 3, 60, 'The most ores one item may use. Left at 3, the smart picks treat it as no limit.')
+bindSlider(UI.forgeOres, 'FTForgeMinOres', 'forgeMinOres', 'Ores per forge (min)', 3, 60, 'The fewest ores one item may use. Few ores only ever make the small pieces (helmets, daggers): raise this for chestplates, leggings and big weapons. Trait mode with rare ores you only own 2 of otherwise settles on 6-ore items.')
+bindSlider(UI.sellOres, 'FTForgeKeep', 'forgeKeep', 'Keep of each ore (auto sell)', 0, 20, 'With auto forge on, auto sell leaves this many of each ore for forging.')
+bindToggle(UI.sellOres, 'FTKeepTraitOres', 'keepTraitOres', 'Keep ores that give traits', 'Ores that give an item a trait are never sold (auto sell and Sell ores now skip them). They can still be used for forging.')
 do
 	local oreList = {}
 	for name in pairs(ORE_NAMES) do
@@ -11409,7 +11649,7 @@ do
 	if type(settings.keepOres) ~= 'table' then
 		settings.keepOres = {}
 	end
-	local keepDD = FarmBox:AddDropdown('FTKeepOres', { Text = 'Save these ores (never sell / forge)', Values = oreList, Multi = true, Searchable = true, Default = settings.keepOres, AllowNull = true, Tooltip = 'Picked ores are kept: auto sell and auto forge leave them alone (e.g. Galgite, Heavenite).' })
+	local keepDD = UI.sellOres:AddDropdown('FTKeepOres', { Text = 'Save these ores (never sell / forge)', Values = oreList, Multi = true, Searchable = true, Default = settings.keepOres, AllowNull = true, Tooltip = 'Picked ores are kept: auto sell and auto forge leave them alone (e.g. Galgite, Heavenite).' })
 	keepDD:OnChanged(function(v)
 		local out = {}
 		for k, on in pairs(type(v) == 'table' and v or {}) do
@@ -11421,11 +11661,11 @@ do
 		save()
 	end)
 end
-ForgeBox:AddButton('Forge now', function()
+UI.forge:AddButton('Forge now', function()
 	forgeOnce()
 end)
 
-bindToggle(MobBox, 'FTAutoMobs', 'autoMobs', 'Auto kill mobs', 'Tweens to the nearest mob and fights it with your Weapon.')
+bindToggle(UI.mobs, 'FTAutoMobs', 'autoMobs', 'Auto kill mobs', 'Tweens to the nearest mob and fights it with your Weapon.')
 pcall(function()
 	local names = {}
 	pcall(function()
@@ -11440,7 +11680,7 @@ pcall(function()
 	if type(settings.huntSpecial) ~= 'table' then
 		settings.huntSpecial = {}
 	end
-	MobBox:AddDropdown('FTHuntSpecial', { Text = 'Hunt special enemies', Values = names, Multi = true, Default = (function() local d = {} for k, on in pairs(settings.huntSpecial) do if on == true then d[#d + 1] = k end end return d end)(), AllowNull = true,
+	UI.mobs:AddDropdown('FTHuntSpecial', { Text = 'Hunt special enemies', Values = names, Multi = true, Default = (function() local d = {} for k, on in pairs(settings.huntSpecial) do if on == true then d[#d + 1] = k end end return d end)(), AllowNull = true,
 		Tooltip = 'Enemies with one of these modifiers (Heaven, Hell, Lucky...) are fought first, wherever they are on the map, before quests and farming. Works without "Auto kill mobs". Nothing picked = off.' }):OnChanged(function(v)
 		local out = {}
 		for k, on in pairs(type(v) == 'table' and v or {}) do
@@ -11452,56 +11692,56 @@ pcall(function()
 		save()
 	end)
 end)
-local mobDD = bindDropdown(MobBox, 'FTMobFilter', 'mobFilter', 'Target', mobNames())
-bindSlider(MobBox, 'FTKiteHp', 'kiteHp', 'Back off below % health', 0, 90, 'Below this the fight stops and it keeps its distance from every mob until health is back at the heal-to value (at least 25% above this). Works in raids too. 0 = off.')
-bindSlider(MobBox, 'FTRetreatHp', 'retreatHp', 'Retreat to spawn below % health', 0, 90, 'Below this it stops to heal (health comes back about 1% a second). 0 = never stop to heal, keep working.')
-bindSlider(MobBox, 'FTHealTo', 'healTo', 'Back to work at % health', 5, 100, 'How far it heals before it carries on. Lower = less standing around, more risk.')
+local mobDD = bindDropdown(UI.mobs, 'FTMobFilter', 'mobFilter', 'Target', mobNames())
+bindSlider(UI.health, 'FTKiteHp', 'kiteHp', 'Back off below % health', 0, 90, 'Below this the fight stops and it keeps its distance from every mob until health is back at the heal-to value (at least 25% above this). Works in raids too. 0 = off.')
+bindSlider(UI.health, 'FTRetreatHp', 'retreatHp', 'Retreat to spawn below % health', 0, 90, 'Below this it stops to heal (health comes back about 1% a second). 0 = never stop to heal, keep working.')
+bindSlider(UI.health, 'FTHealTo', 'healTo', 'Back to work at % health', 5, 100, 'How far it heals before it carries on. Lower = less standing around, more risk.')
 -- The slider used to stop at 2000, which silently hid every bigger mob (island 3: Elite Orc,
 -- Crystal Golem, Yeti, Demonic / Prismarine Spider...). Left at that old maximum = no limit.
 if tonumber(settings.maxMobHp) == 2000 then
 	settings.maxMobHp = 0
 end
-bindSlider(MobBox, 'FTMaxMobHp', 'maxMobHp', 'Only fight mobs with max HP up to', 0, 20000, '0 = any mob. Mobs above this are ignored completely (not fought, not in quests).')
+bindSlider(UI.mobs, 'FTMaxMobHp', 'maxMobHp', 'Only fight mobs with max HP up to', 0, 20000, '0 = any mob. Mobs above this are ignored completely (not fought, not in quests).')
 -- (a safety setting, not a feature toggle: it keeps its saved value across loads, default on)
 settings.fleeDeadly = settings.fleeDeadly ~= false
-MobBox:AddToggle('FTFleeDeadly', { Text = 'Avoid mobs that killed me', Default = settings.fleeDeadly, Tooltip = 'Any mob type that kills you, or takes about half your health in one hit, goes on a list. The script then never fights that type, skips rocks near it and moves away when one comes close. Turn off (or use the button below) once your gear is better.' }):OnChanged(function(v)
+UI.mobs:AddToggle('FTFleeDeadly', { Text = 'Avoid mobs that killed me', Default = settings.fleeDeadly, Tooltip = 'Any mob type that kills you, or takes about half your health in one hit, goes on a list. The script then never fights that type, skips rocks near it and moves away when one comes close. Turn off (or use the button below) once your gear is better.' }):OnChanged(function(v)
 	settings.fleeDeadly = v == true
 	save()
 end)
-MobBox:AddButton('Forget deadly mobs', function()
+UI.mobs:AddButton('Forget deadly mobs', function()
 	local was = table.concat(Deadly.list(), ', ')
 	Deadly.clear()
 	setStatus('deadly list cleared' .. (was ~= '' and (' (was: ' .. was .. ')') or ''))
 end)
-bindDropdown(MobBox, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything', 'Low health only' }, 'Low health only: no stepping out of attacks, markers or shots - parries only - except the back-off below "Back off below % health". Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 25% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
-bindDropdown(MobBox, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Behind + dodge', 'Block / parry', 'Attack only', 'Face tank' }, "Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Behind + dodge: the same, but always comes back in at the mob's back. Block / parry: stands behind the mob and blocks. Attack only: stands behind the mob and swings, never dodges or blocks. Face tank: walks straight up to the mob's face and swings, never moves round it, dodges or blocks (stuns will land). The island boss is always parried in Attack only / Face tank. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)")
-bindSlider(MobBox, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
-bindToggle(MobBox, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
-bindToggle(MobBox, 'FTAutoBoss', 'autoBoss', 'Auto boss (this island)', 'UNTESTED. Goes to this island\'s boss gate (Island 4: Asura\'s Incarnate), opens a party, starts it when the lobby opens and fights the boss. Boss lobbies are free (no ticket). Ignores the max mob health slider. Tries once right away, then each time the gate countdown runs out; gives up for 30 minutes after 3 starts in a row that do not go through.')
-bindSlider(MobBox, 'FTRaidTier', 'raidTier', 'Raid tier', 1, 15, 'The Tower of Hell tier the button below starts.')
-bindSlider(MobBox, 'FTRaidRetries', 'raidRetries', 'Raid retries left (1 ticket each)', 0, 10, 'When a raid ends, the Retry button is pressed this many more times. Each press starts another raid and spends one Raid Ticket; the number counts down by itself. 0 = never press it.')
-bindToggle(MobBox, 'FTAutoRaid', 'autoRaid', 'Auto raid (spends Raid Tickets)', 'Starts a Tower of Hell raid at the tier above whenever you have a Raid Ticket, and presses Retry while tickets last. Out of tickets: farms Asura\'s Incarnate (1 ticket per kill) and mines between spawns until you are back to the number below, then raids again.')
-bindSlider(MobBox, 'FTRaidTicketMax', 'raidTicketMax', 'Raid tickets to farm back to', 1, 20, 'With Auto raid on and no tickets left, Asura is farmed until you have this many again.')
-MobBox:AddButton('Start ONE raid (spends 1 Raid Ticket)', function()
+bindDropdown(UI.defense, 'FTDodgeWhat', 'dodgeWhat', 'Dodge', { 'Only threats', 'Everything', 'Low health only' }, 'Low health only: no stepping out of attacks, markers or shots - parries only - except the back-off below "Back off below % health". Only threats: a mob\'s attacks are only dodged once that kind has hurt you for real - one hit of 25% of your health or more, or damage faster than you heal it back (both measured as you fight). When you drop under 45% health, or lose 12% more than you heal within 8 seconds, everything is dodged until you are back over 85%. Everything: every attack is dodged, as before.')
+bindDropdown(UI.defense, 'FTCombatStyle', 'combatStyle', 'Combat style', { 'Hit & run', 'Behind + dodge', 'Block / parry', 'Attack only', 'Face tank' }, "Hit & run: steps out of reach right before each attack lands, then comes back in to hit. Behind + dodge: the same, but always comes back in at the mob's back. Block / parry: stands behind the mob and blocks. Attack only: stands behind the mob and swings, never dodges or blocks. Face tank: walks straight up to the mob's face and swings, never moves round it, dodges or blocks (stuns will land). The island boss is always parried in Attack only / Face tank. (Floating over mobs was tested: their attacks reach straight up, so it is not offered.)")
+bindSlider(UI.defense, 'FTDodgeDist', 'dodgeDist', 'Dodge distance (studs)', 8, 30, 'How far it steps away from an incoming attack.')
+bindToggle(UI.abyss, 'FTAutoAbyss', 'autoAbyss', 'Auto Abyss', 'Goes to the Abyss cage, starts a run, picks a card each floor (see below) and fights every floor. Re-enters when you come back.')
+bindToggle(UI.boss, 'FTAutoBoss', 'autoBoss', 'Auto boss (this island)', 'UNTESTED. Goes to this island\'s boss gate (Island 4: Asura\'s Incarnate), opens a party, starts it when the lobby opens and fights the boss. Boss lobbies are free (no ticket). Ignores the max mob health slider. Tries once right away, then each time the gate countdown runs out; gives up for 30 minutes after 3 starts in a row that do not go through.')
+bindSlider(UI.raids, 'FTRaidTier', 'raidTier', 'Raid tier', 1, 15, 'The Tower of Hell tier the button below starts.')
+bindSlider(UI.raids, 'FTRaidRetries', 'raidRetries', 'Raid retries left (1 ticket each)', 0, 10, 'When a raid ends, the Retry button is pressed this many more times. Each press starts another raid and spends one Raid Ticket; the number counts down by itself. 0 = never press it.')
+bindToggle(UI.raids, 'FTAutoRaid', 'autoRaid', 'Auto raid (spends Raid Tickets)', 'Starts a Tower of Hell raid at the tier above whenever you have a Raid Ticket, and presses Retry while tickets last. Out of tickets: farms Asura\'s Incarnate (1 ticket per kill) and mines between spawns until you are back to the number below, then raids again.')
+bindSlider(UI.raids, 'FTRaidTicketMax', 'raidTicketMax', 'Raid tickets to farm back to', 1, 20, 'With Auto raid on and no tickets left, Asura is farmed until you have this many again.')
+UI.raids:AddButton('Start ONE raid (spends 1 Raid Ticket)', function()
 	G.FTRaidStart = { tier = tonumber(settings.raidTier) or 1 }
 end)
-MobBox:AddButton('Weapon DPS test (dummies)', function()
+UI.combatMisc:AddButton('Weapon DPS test (dummies)', function()
 	G.FTDpsTest = true
 end)
-bindToggle(MobBox, 'FTAutoCards', 'autoCards', 'Auto pick abyss cards', 'Picks a card for you after each floor, even when you play the Abyss yourself.')
-bindDropdown(MobBox, 'FTCardFocus', 'cardFocus', 'Card priority', { 'Best overall', 'Damage', 'Survival', 'Loot' }, 'Best overall: rarest card (Abyssal > Fusion > Epic > Rare > Common). Damage / Survival / Loot: that kind of card first, then rarity.')
-bindToggle(MobBox, 'FTAutoBlock', 'autoBlock', 'Auto block (F)', 'Blocks right before a mob\'s attack lands, then goes back to swinging.')
+bindToggle(UI.abyss, 'FTAutoCards', 'autoCards', 'Auto pick abyss cards', 'Picks a card for you after each floor, even when you play the Abyss yourself.')
+bindDropdown(UI.abyss, 'FTCardFocus', 'cardFocus', 'Card priority', { 'Best overall', 'Damage', 'Survival', 'Loot' }, 'Best overall: rarest card (Abyssal > Fusion > Epic > Rare > Common). Damage / Survival / Loot: that kind of card first, then rarity.')
+bindToggle(UI.defense, 'FTAutoBlock', 'autoBlock', 'Auto block (F)', 'Blocks right before a mob\'s attack lands, then goes back to swinging.')
 if (tonumber(settings.parryShineLead) or 0) == 8 then
 	settings.parryShineLead = 0 -- (v190-v191 default: before the shine, which only ever gave a plain block)
 end
-bindSlider(MobBox, 'FTParryShineLead', 'parryShineLead', 'Parry delay (x10 ms after the shine)', 0, 30, 'The block is pressed when the parry shine appears on the mob. 0 = that instant, which measured as a real parry. Raise it only if you see plain blocks (stamina lost, some damage) instead of the orange parry.')
-bindSlider(MobBox, 'FTSwitchMins', 'switchMins', 'With auto mine on, switch every (min)', 1, 15, 'Mobs and mining take turns so you still get ores to forge with.')
-local QuestBox = Tab:AddRightGroupbox('Quests')
+bindSlider(UI.defense, 'FTParryShineLead', 'parryShineLead', 'Parry delay (x10 ms after the shine)', 0, 30, 'The block is pressed when the parry shine appears on the mob. 0 = that instant, which measured as a real parry. Raise it only if you see plain blocks (stamina lost, some damage) instead of the orange parry.')
+bindSlider(UI.mobs, 'FTSwitchMins', 'switchMins', 'With auto mine on, switch every (min)', 1, 15, 'Mobs and mining take turns so you still get ores to forge with.')
+local QuestBox = UI.quests
 
 -- Race reroll: spends spins on the current race slot until the race is at least the rarity picked.
 -- A button, not a toggle: every roll replaces your race and cannot be undone.
 do
-	local RaceBox = Tab:AddLeftGroupbox('Race reroll')
+	local RaceBox = UI.race
 	local ORDER = { 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Mythic', 'Relic', 'Exotic', 'Divine' }
 	local rank = {}
 	for i, n in ipairs(ORDER) do
@@ -11769,7 +12009,7 @@ do
 		G.FTSettings = settings -- (for live tests)
 		G.FTBest = Best
 		G.FTMold = Mold
-		local SwapBox = Tab:AddLeftGroupbox('Race swap')
+		local SwapBox = UI.swap
 		bindDropdown(SwapBox, 'FTRaceMine', 'raceMine', 'Race while mining', vals, 'Switches to this race (one of your slots) whenever the bot is mining. Free and instant.')
 		bindDropdown(SwapBox, 'FTRaceFight', 'raceFight', 'Race while fighting', vals, 'Switches to this race whenever the bot is fighting or dodging a mob, and back to the mining one afterwards.')
 		SwapBox:AddButton('Switch to next race slot', function()
@@ -11836,7 +12076,7 @@ end
 -- happens on a button press. The lists follow the inventory by themselves and the choice stays
 -- put after an attach, so several runes can go on one piece press after press.
 do
-	local RuneBox = Tab:AddRightGroupbox('Runes')
+	local RuneBox = UI.runes
 	local gearMap, runeMap = {}, {} -- label -> gear id / label -> rune kind
 	local runeGuid = {} -- rune kind -> one GUID of it
 	local gearId, runeKind
@@ -12100,8 +12340,8 @@ task.spawn(function()
 	end
 end)
 bindToggle(QuestBox, 'FTQuestBuy', 'questBuy', 'Buy quest items with gold', 'For "Purchase X" objectives (e.g. Bronze Pickaxe). In-game gold only, then equips the better pickaxe.')
-bindToggle(QuestBox, 'FTAutoPickaxe', 'autoPickaxe', 'Auto buy best pickaxe', 'Buys the best pickaxe sold on your current island that you can afford and do not own (gold only, skips locked ones), then equips it.')
-QuestBox:AddButton('Buy best pickaxe now', function()
+bindToggle(UI.shop, 'FTAutoPickaxe', 'autoPickaxe', 'Auto buy best pickaxe', 'Buys the best pickaxe sold on your current island that you can afford and do not own (gold only, skips locked ones), then equips it.')
+UI.shop:AddButton('Buy best pickaxe now', function()
 	task.spawn(function()
 		local ok, bought = pcall(Quest.buyBestPickaxe)
 		if ok and not bought then
@@ -12109,13 +12349,13 @@ QuestBox:AddButton('Buy best pickaxe now', function()
 		end
 	end)
 end)
-bindToggle(QuestBox, 'FTClaimBoard', 'claimBoard', 'Claim quest board rewards', 'Claims finished Daily / Weekly / Monthly board quests.')
+bindToggle(UI.rewards, 'FTClaimBoard', 'claimBoard', 'Claim quest board rewards', 'Claims finished Daily / Weekly / Monthly board quests.')
 bindSlider(QuestBox, 'FTQuestRange', 'questRange', 'Look for new quests within (studs)', 200, 5000, 'NPCs farther than this are not visited just to check for quests (quest turn-ins and talk objectives still go anywhere).')
-bindToggle(QuestBox, 'FTAutoMail', 'autoMail', 'Auto claim mail & rewards', 'Every minute: claims all mail, level rewards, index (codex) rewards, and free seasonal-event rewards (event quests, milestones, altar daily).')
-bindToggle(QuestBox, 'FTAutoOffer', 'autoOffer', 'Auto offer altar shards', 'Twilight War altar: spends your side\'s shards on offers (x10 while you can, then x1) and takes the free daily gifts.')
-bindToggle(QuestBox, 'FTAutoDaily', 'autoDaily', 'Auto claim daily login', 'Claims the daily login reward when it is ready.')
-bindToggle(QuestBox, 'FTAutoCodes', 'autoCodes', 'Auto redeem codes', 'Reads the working codes from theforge.gg every 15 minutes and redeems any you have not used. A tracker can be hours behind the game\'s Discord: a brand new code can also go in PlayerTools/forgecodes.txt (one per line).')
-bindToggle(ForgeBox, 'FTAutoEnhance', 'autoEnhance', 'Auto enhance equipped gear', 'Spends essences and gold to enhance the weapon and armor you are wearing, one level at a time. A failed enhance drops the item a level and can cost a rune slot; use the chance slider below to only take safer rolls. Never uses medallions.')
+bindToggle(UI.rewards, 'FTAutoMail', 'autoMail', 'Auto claim mail & rewards', 'Every minute: claims all mail, level rewards, index (codex) rewards, and free seasonal-event rewards (event quests, milestones, altar daily).')
+bindToggle(UI.rewards, 'FTAutoOffer', 'autoOffer', 'Auto offer altar shards', 'Twilight War altar: spends your side\'s shards on offers (x10 while you can, then x1) and takes the free daily gifts.')
+bindToggle(UI.rewards, 'FTAutoDaily', 'autoDaily', 'Auto claim daily login', 'Claims the daily login reward when it is ready.')
+bindToggle(UI.rewards, 'FTAutoCodes', 'autoCodes', 'Auto redeem codes', 'Reads the working codes from theforge.gg every 15 minutes and redeems any you have not used. A tracker can be hours behind the game\'s Discord: a brand new code can also go in PlayerTools/forgecodes.txt (one per line).')
+bindToggle(UI.enhance, 'FTAutoEnhance', 'autoEnhance', 'Auto enhance equipped gear', 'Spends essences and gold to enhance the weapon and armor you are wearing, one level at a time. A failed enhance drops the item a level and can cost a rune slot; use the chance slider below to only take safer rolls. Never uses medallions.')
 -- The limit used to default to 100%, which stopped every item at +3 (+3 -> +4 is a 70% roll).
 -- No limit by default now; whatever was saved before (the slider could not go under 50) is
 -- cleared once.
@@ -12124,10 +12364,12 @@ if not settings.enhanceNoLimitV2 then
 	settings.enhanceMinChance = 0
 	save()
 end
-bindSlider(ForgeBox, 'FTEnhanceMinChance', 'enhanceMinChance', 'Only enhance at this chance or better (%)', 0, 100, '0 = no limit: keeps trying whatever the odds. At 100 an enhance can never fail, which stops at +3.')
-bindSlider(ForgeBox, 'FTEnhanceMaxLevel', 'enhanceMaxLevel', 'Stop enhancing at +', 1, 9, 'Items already at this level are left alone.')
-bindToggle(ForgeBox, 'FTAutoEquip', 'autoEquip', 'Auto equip better gear', 'After forging, equips the item if its slot is empty or its base stats beat what you have on. Enhancement levels are ignored, so a better new piece replaces an upgraded old one.')
-MobBox:AddButton('Refresh lists', function()
+bindSlider(UI.enhance, 'FTEnhanceMinChance', 'enhanceMinChance', 'Only enhance at this chance or better (%)', 0, 100, '0 = no limit: keeps trying whatever the odds. At 100 an enhance can never fail, which stops at +3.')
+bindSlider(UI.enhance, 'FTEnhanceMaxLevel', 'enhanceMaxLevel', 'Stop enhancing at +', 1, 9, 'Items already at this level are left alone.')
+bindToggle(UI.enhance, 'FTAutoEquip', 'autoEquip', 'Auto equip better gear', 'After forging, equips the item if its slot is empty or its base stats beat what you have on. Enhancement levels are ignored, so a better new piece replaces an upgraded old one.')
+bindToggle(UI.recycle, 'FTAutoRecycle', 'autoRecycle', 'Auto recycle forged gear', 'Spare gear (the same picks as auto sell gear: never what you wear, the best item of each slot, favorited items or pickaxes) is recycled for ores instead of sold. Costs gold equal to the items\' sell price and gives back half the ores that went in. Runs before auto sell gear.')
+UI.recycle:AddLabel('Costs gold (the items\' sell price). Gives back half the ores.', true)
+UI.mobs:AddButton('Refresh lists', function()
 	pcall(function()
 		mobDD:SetValues(mobNames())
 	end)
@@ -12155,8 +12397,8 @@ do
 		return out
 	end
 	local list = islandList()
-	local dd = InfoBox:AddDropdown('FTIsland', { Text = 'Travel to island', Values = list, Default = list[2] or list[1], AllowNull = false })
-	InfoBox:AddButton('Travel', function()
+	local dd = UI.travel:AddDropdown('FTIsland', { Text = 'Travel to island', Values = list, Default = list[2] or list[1], AllowNull = false })
+	UI.travel:AddButton('Travel', function()
 		local v = dd.Value
 		if type(v) == 'table' then
 			v = next(v)
@@ -12185,12 +12427,12 @@ do
 	end)
 end
 
-statusLabel = InfoBox:AddLabel('Status: idle')
-local statsLabel = InfoBox:AddLabel('')
-bindToggle(InfoBox, 'FTNoBlur', 'noBlur', 'No blur', 'Keeps the game\'s blur effects (forge / menus / dialogue) switched off.')
-bindSlider(InfoBox, 'FTTweenSpeed', 'tweenSpeed', 'Tween speed (studs/s)', 20, 120, 'Too fast can get you snapped back.')
-bindSlider(InfoBox, 'FTWalkSpeed', 'walkSpeed', 'Walk speed while pathing (0 = game default)', 0, 150, 'Speed used when the script walks around walls. The game walks at 13 and runs at 24.')
-InfoBox:AddToggle('FTAutoload', { Text = 'Autoload on this account', Default = settings.autoload == true }):OnChanged(function(v)
+statusLabel = UI.status:AddLabel('Status: idle')
+local statsLabel = UI.status:AddLabel('')
+bindToggle(UI.script, 'FTNoBlur', 'noBlur', 'No blur', 'Keeps the game\'s blur effects (forge / menus / dialogue) switched off.')
+bindSlider(UI.move, 'FTTweenSpeed', 'tweenSpeed', 'Tween speed (studs/s)', 20, 120, 'Too fast can get you snapped back.')
+bindSlider(UI.move, 'FTWalkSpeed', 'walkSpeed', 'Walk speed while pathing (0 = game default)', 0, 150, 'Speed used when the script walks around walls. The game walks at 13 and runs at 24.')
+UI.script:AddToggle('FTAutoload', { Text = 'Autoload on this account', Default = settings.autoload == true }):OnChanged(function(v)
 	settings.autoload = v == true
 	save()
 end)
@@ -12756,6 +12998,8 @@ local function mainLoop(myGen)
 				forgeOnce()
 			elseif sellNeeded() then
 				sellOres()
+			elseif Quest.recycleNeeded() then
+				Quest.recycleGear()
 			elseif Quest.gearSellNeeded() then
 				Quest.sellGear()
 			elseif G.FTCamp and type(G.FTCampStay) == 'table' and G.FTCampStay[tostring(G.FTCampFor)] and not (farm == 'mine' and craftWant() and craftRockUp()) then

@@ -2566,7 +2566,7 @@ local function makeGroupbox(sideParent, title)
 		Title = title,
 		Holder = holder,
 		Container = container,
-		Collapsed = false,
+		Collapsed = true, -- every box starts folded (asked for 2026-11-18)
 	}
 
 	function box:_relayout()
