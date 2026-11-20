@@ -2608,6 +2608,7 @@ local function makeGroupbox(sideParent, title)
 	end
 
 	headBtn.MouseButton1Click:Connect(function()
+		box._userSet = true
 		box:SetCollapsed(not box.Collapsed)
 	end)
 
@@ -3623,11 +3624,24 @@ function Library:CreateWindow(info)
 			layoutCols()
 		end
 
+		-- Boxes start folded, except a tab's only box: that one stays open (asked for 2026-11-18).
+		-- When a second box arrives, the first folds again unless the user clicked it.
+		local tabBoxes = {}
+		local function addBox(side, title)
+			local b = makeGroupbox(side, title)
+			tabBoxes[#tabBoxes + 1] = b
+			if #tabBoxes == 1 then
+				b:SetCollapsed(false)
+			elseif #tabBoxes == 2 and not tabBoxes[1]._userSet then
+				tabBoxes[1]:SetCollapsed(true)
+			end
+			return b
+		end
 		function tab:AddLeftGroupbox(title)
-			return makeGroupbox(left, title)
+			return addBox(left, title)
 		end
 		function tab:AddRightGroupbox(title)
-			return makeGroupbox(right, title)
+			return addBox(right, title)
 		end
 
 		btn.MouseButton1Click:Connect(function()

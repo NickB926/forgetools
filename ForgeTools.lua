@@ -8,9 +8,32 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v326'
+local BUILD = 'forge-tools-v329'
 local G = getgenv()
 local compile = loadstring or load
+-- (v328) load trace: every startup step and, for the first 2 minutes, memory every 0.5 s go to
+-- PlayerTools/_ft_boot.txt, so a game crash while loading shows where it was.
+do
+	local T0, lines = os.clock(), {}
+	local function flush()
+		pcall(writefile, 'PlayerTools/_ft_boot.txt', table.concat(lines, '\n'))
+	end
+	G.FTBoot = function(s)
+		lines[#lines + 1] = ('%6.2f %s'):format(os.clock() - T0, tostring(s))
+		flush()
+	end
+	G.FTBoot(('start %s, %s, game time %.0f s'):format(BUILD, os.date('%Y-%m-%d %H:%M:%S'), workspace.DistributedGameTime))
+	task.spawn(function()
+		local Stats = game:GetService('Stats')
+		for _ = 1, 240 do
+			task.wait(0.5)
+			local okM, mb = pcall(function()
+				return Stats:GetTotalMemoryUsageMb()
+			end)
+			G.FTBoot(('mem lua %.0f MB, total %s MB, status %s'):format(gcinfo() / 1024, okM and ('%.0f'):format(mb) or '?', tostring(G.FTStatus):sub(1, 60)))
+		end
+	end)
+end
 
 if not game:IsLoaded() then
 	game.Loaded:Wait()
@@ -4104,6 +4127,7 @@ local function forgeOnce()
 		end)
 		setStatus('forged a ' .. tostring(made))
 		forgeFails = 0
+		G.FTForgeDoneAt = os.clock() -- (v329) auto recycle waits for the cooling / water step to finish
 		if settings.forgeAlternate then
 			forgeAlt = (itemType == 'Weapon') and 'Armor' or 'Weapon'
 		end
@@ -8632,6 +8656,16 @@ do
 		if not settings.autoRecycle or os.clock() < recycleAt then
 			return false
 		end
+		-- (v329) never while the forge is still going: recycling the new item during the game's
+		-- cooling (dip in water) step left the character stuck there. Wait until the forge is closed
+		-- and 10 s have passed since the item came out.
+		if os.clock() - (G.FTForgeDoneAt or -1e9) < 10 then
+			return false
+		end
+		local FC = controller('ForgeController')
+		if FC and FC.ForgeActive then
+			return false
+		end
 		return #gearToSell() >= 1
 	end
 	function Quest.recycleGear()
@@ -8671,7 +8705,8 @@ do
 				return 0, 0
 			end
 			local before = #(data().Inventory.Equipments or {})
-			setStatus(('recycling %d spare gear (%s gold)'):format(#names, tostring(math.floor(cost))))
+			local gold0 = tonumber((data() or {}).Gold) or 0
+			setStatus(('recycling %d spare gear'):format(#names))
 			pcall(function()
 				IS:RecycleBasket(basket)
 			end)
@@ -8679,7 +8714,9 @@ do
 			while os.clock() - t0 < 3 and #(data().Inventory.Equipments or {}) == before do
 				task.wait(0.1)
 			end
-			return before - #(data().Inventory.Equipments or {}), cost
+			task.wait(0.4)
+			-- (the game's price lookup gives nothing at our thread identity: report the gold that really went)
+			return before - #(data().Inventory.Equipments or {}), gold0 - (tonumber((data() or {}).Gold) or gold0)
 		end
 		-- from wherever we are first; at Marbles (who has the Recycle screen) only if that did not go through
 		local done, cost = run()
@@ -11093,6 +11130,7 @@ end
 ---------------------------------------------------------------------------
 -- GUI
 ---------------------------------------------------------------------------
+G.FTBoot('building the window')
 local Library
 do
 	G.Library = nil
@@ -11102,6 +11140,7 @@ do
 	Library.Animations.Dropdown = false
 	G.SB2ForgeToolsLibrary = Library
 end
+G.FTBoot('library loaded')
 local Window = Library:CreateWindow({
 	Title = 'Forge Tools',
 	Footer = BUILD .. '  ·  ' .. LocalPlayer.Name,
@@ -12440,6 +12479,7 @@ end)
 ---------------------------------------------------------------------------
 -- Main loop: forge > sell > mobs > mine
 ---------------------------------------------------------------------------
+G.FTBoot('window built, starting the loops')
 local token = {}
 local lastQuestStep = 0
 G.SB2ForgeToolsToken = token
