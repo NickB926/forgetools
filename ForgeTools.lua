@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v329'
+local BUILD = 'forge-tools-v330'
 local G = getgenv()
 local compile = loadstring or load
 -- (v328) load trace: every startup step and, for the first 2 minutes, memory every 0.5 s go to
@@ -2051,8 +2051,28 @@ local function equip(toolName)
 	return c:FindFirstChild(toolName)
 end
 
+-- (v330, the 10k ping in the Abyss: the game's ToolController:ToolActivated calls itself again
+-- every 0.1 s for as long as its holdingM1 flag is on - meant for holding the mouse down. That flag
+-- is only cleared when the game sees the mouse come back up, and it can miss that (released over
+-- our window, alt-tab), so it stays on. Then every swing below started one more chain that never
+-- ends: measured 25+ ToolActivated calls a second on a test account, growing through a long Abyss
+-- run until the server's queue was full and the ping stuck. The flag is cleared whenever the
+-- mouse is not really down.)
+local UISwing = game:GetService('UserInputService')
+local function clearStuckHold(TC)
+	if TC and TC.holdingM1 then
+		local okM, down = pcall(function()
+			return UISwing:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+		end)
+		if not (okM and down) then
+			TC.holdingM1 = false
+			G.FTHoldCleared = (G.FTHoldCleared or 0) + 1
+		end
+	end
+end
 local function swing(tool)
 	local TC = controller('ToolController')
+	clearStuckHold(TC)
 	if TC and tool then
 		task.spawn(function()
 			pcall(function()
@@ -12477,6 +12497,157 @@ UI.script:AddToggle('FTAutoload', { Text = 'Autoload on this account', Default =
 end)
 
 ---------------------------------------------------------------------------
+-- Ping watchdog (v330, asked for: a friend's ping climbs to 10k+ and stays there, only in the Abyss,
+-- only with the script and Auto mobs on - his FPS stays fine, so something is clogging the line).
+-- Every server call (FireServer / InvokeServer) is counted per second, ours and the game's. When
+-- the ping goes over 2 s: the last 30 s of calls, the build, the status and every setting are added
+-- to PlayerTools/forgetools_pingreport.txt, and the script's own server calls are held back (the
+-- bot just stands there) until the ping is under 0.6 s for 3 s - at most 60 s, then it carries on
+-- and does not hold again for 2 min (so a laggy server never stalls it for good). StopBlock always
+-- goes through so the guard is never left up.
+---------------------------------------------------------------------------
+do
+	local Stats = game:GetService('Stats')
+	local NET = { sec = {}, cur = {}, hold = false, dropped = 0, lastReport = -1e9, frames = 0, fps = 0 }
+	G.FTNet = NET
+	local REPORT_PATH = 'PlayerTools/forgetools_pingreport.txt'
+	if not G.FTNetHooked and type(hookmetamethod) == 'function' and type(getnamecallmethod) == 'function' then
+		-- installed once per game session: it reads G.FTNet each call, so reloads swap the state
+		-- instead of stacking hooks (unload sets G.FTNet = nil and the hook just passes calls on)
+		local cc = type(checkcaller) == 'function' and checkcaller or function()
+			return false
+		end
+		local wrap = type(newcclosure) == 'function' and newcclosure or function(f)
+			return f
+		end
+		local okH = pcall(function()
+			local old
+			old = hookmetamethod(game, '__namecall', wrap(function(self, ...)
+				local st = G.FTNet
+				if st then
+					local m = getnamecallmethod()
+					if m == 'FireServer' or m == 'InvokeServer' then
+						local mine = cc()
+						local okN, nm = pcall(function()
+							return self.Name
+						end)
+						nm = okN and tostring(nm) or '?'
+						local k = (mine and 'script ' or 'game ') .. m .. ' ' .. nm
+						st.cur[k] = (st.cur[k] or 0) + 1
+						if mine and st.hold and nm ~= 'StopBlock' then
+							st.dropped += 1
+							return nil
+						end
+					end
+				end
+				return old(self, ...)
+			end))
+		end)
+		G.FTNetHooked = okH or nil
+	end
+	local function ping()
+		local ok, v = pcall(function()
+			return Stats.Network.ServerStatsItem['Data Ping']:GetValue()
+		end)
+		return ok and tonumber(v) or 0
+	end
+	local function writeReport(p)
+		local tot = {}
+		for _, s in ipairs(NET.sec) do
+			for k, v in pairs(s) do
+				tot[k] = (tot[k] or 0) + v
+			end
+		end
+		local arr = {}
+		for k, v in pairs(tot) do
+			arr[#arr + 1] = { k, v }
+		end
+		table.sort(arr, function(a, b)
+			return a[2] > b[2]
+		end)
+		local set = {}
+		for k, v in pairs(settings) do
+			if type(v) ~= 'table' and v ~= false then
+				set[#set + 1] = k .. '=' .. tostring(v)
+			end
+		end
+		table.sort(set)
+		local secs = math.max(1, #NET.sec)
+		local L = {
+			('==== %s  %s  place %s  ping %d ms  upload %.1f KB/s  download %.1f KB/s  fps %d'):format(
+				os.date('%Y-%m-%d %H:%M:%S'), BUILD, tostring(game.PlaceId), p,
+				tonumber(Stats.DataSendKbps) or -1, tonumber(Stats.DataReceiveKbps) or -1, NET.fps),
+			'status: ' .. tostring(_statusText),
+			('server calls over the last %d s (per second in brackets):'):format(secs),
+		}
+		for i = 1, math.min(20, #arr) do
+			L[#L + 1] = ('  %5d (%.1f/s)  %s'):format(arr[i][2], arr[i][2] / secs, arr[i][1])
+		end
+		if #arr == 0 then
+			L[#L + 1] = '  (none counted' .. (G.FTNetHooked and ')' or ' - this executor has no hookmetamethod)')
+		end
+		L[#L + 1] = 'last status lines:'
+		for i = math.max(1, #statusLog - 12), #statusLog do
+			L[#L + 1] = '  ' .. tostring(statusLog[i])
+		end
+		L[#L + 1] = 'settings: ' .. table.concat(set, ' ')
+		pcall(function()
+			local prev = isfile(REPORT_PATH) and readfile(REPORT_PATH) or ''
+			if #prev > 60000 then
+				prev = prev:sub(-40000)
+			end
+			writefile(REPORT_PATH, prev .. table.concat(L, '\n') .. '\n\n')
+		end)
+	end
+	track(RunService.Heartbeat:Connect(function()
+		NET.frames += 1
+	end))
+	-- real left clicks reaching the game (an auto clicker shows up here): every one makes the game
+	-- send ToolActivated, and keeps sending it every 0.1 s while the button is held
+	track(game:GetService('UserInputService').InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 then
+			NET.cur['input left clicks'] = (NET.cur['input left clicks'] or 0) + 1
+		end
+	end))
+	task.spawn(function()
+		local holdAt, coolUntil, okSince = 0, 0, nil
+		while alive do
+			task.wait(1)
+			NET.fps, NET.frames = NET.frames, 0
+			table.insert(NET.sec, 1, NET.cur)
+			NET.cur = {}
+			NET.sec[31] = nil
+			local p = ping()
+			NET.ping = p
+			pcall(clearStuckHold, controller('ToolController'))
+			if p > 2000 then
+				if os.clock() - NET.lastReport > 60 then
+					NET.lastReport = os.clock()
+					writeReport(p)
+				end
+				if not NET.hold and os.clock() > coolUntil then
+					NET.hold, holdAt, okSince, NET.dropped = true, os.clock(), nil, 0
+				end
+			end
+			if NET.hold then
+				okSince = p < 600 and (okSince or os.clock()) or nil
+				local tooLong = os.clock() - holdAt > 60
+				if (okSince and os.clock() - okSince >= 3) or tooLong then
+					NET.hold = false
+					if tooLong then
+						coolUntil = os.clock() + 120
+					end
+					setStatus(('ping back to %d ms - carrying on (%d server calls were held; see forgetools_pingreport.txt)'):format(p, NET.dropped))
+				else
+					setStatus(('ping %d ms - holding the script\'s server calls until it comes down (%d held)'):format(p, NET.dropped))
+				end
+			end
+		end
+	end)
+end
+UI.script:AddLabel('Ping watchdog: over 2 s ping, it writes what was being sent to PlayerTools/forgetools_pingreport.txt and pauses the script\'s server calls until ping recovers.', true)
+
+---------------------------------------------------------------------------
 -- Main loop: forge > sell > mobs > mine
 ---------------------------------------------------------------------------
 G.FTBoot('window built, starting the loops')
@@ -13495,6 +13666,7 @@ G.SB2ForgeToolsUnload = function(fromWindow)
 		LocalPlayer.Character:FindFirstChildOfClass('Humanoid'):SetStateEnabled(Enum.HumanoidStateType.Climbing, true)
 	end)
 	alive = false
+	G.FTNet = nil -- the ping watchdog's hook passes everything through again
 	G.SB2ForgeToolsToken = nil
 	G.SB2ForgeToolsLoaded = nil
 	G.SB2ForgeToolsUnload = nil
