@@ -8,7 +8,7 @@
 	Needs workspace/PlayerTools/AtaraxiaLibrary.lua. Autoload: autoexec/03_forgetools.lua.
 ]]
 
-local BUILD = 'forge-tools-v330'
+local BUILD = 'forge-tools-v331'
 local G = getgenv()
 local compile = loadstring or load
 -- (v328) load trace: every startup step and, for the first 2 minutes, memory every 0.5 s go to
@@ -10049,6 +10049,13 @@ do
 		local deck = G.FTAbyssDeck
 		if type(deck) == 'table' and tonumber(card.Max) and (tonumber(deck[card.Id]) or 0) >= tonumber(card.Max) then
 			return -900
+		end
+		-- (v331, asked for: "proritise golden tide when picking auto cards". Taken over everything
+		-- else, Greed included, unless it is already maxed out. Matched by id or name so either
+		-- "GoldenTide" or "Golden Tide" counts.)
+		local key = string.lower(tostring(card.Id or '') .. ' ' .. tostring(card.Name or '')):gsub('[%s_%-]', '')
+		if key:find('goldentide') then
+			return 2000
 		end
 		local greed = card.Id == 'Greed'
 		if greed then
